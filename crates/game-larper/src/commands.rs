@@ -242,26 +242,27 @@ fn spawn_refresh(
     });
 }
 
-fn select_index(session: &Arc<Mutex<Session>>, log: &Log, index: usize, _play: bool) {
+fn select_index(session: &Arc<Mutex<Session>>, log: &Log, index: usize) {
     let Ok(mut session) = session.lock() else {
         return;
     };
-    let visible = game_larper_core::search(&session.games, &session.query, DEFAULT_SEARCH_LIMIT);
-    let Some(game_index) = visible.get(index).copied() else {
+    let Some(game) = visible(&session)
+        .get(index)
+        .and_then(|&index| session.games.get(index))
+        .cloned()
+    else {
         return;
     };
-    let id = session.games[game_index].id.clone();
-    let name = session.games[game_index].name.clone();
-    session.selected = Some(id.clone());
-    session.config.last_selected_discord_application_id = Some(id);
+    if session.selected.as_deref() == Some(game.id.as_str()) {
+        return;
+    }
+    session.selected = Some(game.id.clone());
+    session.config.last_selected_discord_application_id = Some(game.id.clone());
     session.art_pending = true;
     if let Err(error) = ConfigStore::new(session.paths.config()).save(&session.config) {
         log.info(format!("Config save failed: {error}"));
     } else {
-        log.info(format!(
-            "Selected game: {} {name}",
-            session.games[game_index].id
-        ));
+        log.info(format!("Selected game: {} {}", game.id, game.name));
     }
 }
 
@@ -435,6 +436,43 @@ fn toast(session: &mut Session, message: impl AsRef<str>) {
     session.toast_until = Some(Instant::now() + Duration::from_secs(4));
 }
 
+fn selected_game(session: &Session) -> Option<&GameDefinition> {
+    session
+        .selected
+        .as_ref()
+        .and_then(|id| session.games.iter().find(|game| &game.id == id))
+}
+
+struct Controls {
+    play: bool,
+    pause: bool,
+    stop: bool,
+    play_label: &'static str,
+}
+
+fn controls(session: &Session) -> Controls {
+    let queue_running = matches!(
+        session.queue.activity(),
+        QueueActivity::Running { .. }
+            | QueueActivity::Paused { .. }
+            | QueueActivity::Transition { .. }
+    );
+    let state = session.clock.state();
+    Controls {
+        play: selected_game(session).is_some()
+            && !session.busy
+            && state != SessionState::Playing
+            && !queue_running,
+        pause: !session.busy && state == SessionState::Playing,
+        stop: !session.busy && (state != SessionState::Stopped || queue_running),
+        play_label: if state == SessionState::Paused {
+            "Resume"
+        } else {
+            "Play"
+        },
+    }
+}
+
 fn displayed_time(session: &Session, now: Instant) -> String {
     if matches!(
         session.queue.activity(),
@@ -581,7 +619,42 @@ fn detail_line(game: &GameDefinition) -> String {
     }
 }
 
+/// Result indexes for the current query.
+fn visible(session: &Session) -> Vec<usize> {
+    game_larper_core::search(&session.games, &session.query, DEFAULT_SEARCH_LIMIT)
+}
+
+fn hit_rows(session: &Session, shown: &[usize]) -> Vec<Hit> {
+    shown
+        .iter()
+        .filter_map(|&index| session.games.get(index))
+        .map(|game| Hit {
+            id: game.id.clone().into(),
+            name: game.name.clone().into(),
+            detail: detail_line(game).into(),
+            art: cached_art(&game.id),
+            selected: session.selected.as_deref() == Some(game.id.as_str()),
+        })
+        .collect()
+}
+
+/// The status line under the search field.
+fn catalog_line(session: &Session) -> String {
+    if session.refreshing {
+        "Refreshing the game list…".into()
+    } else if session.games.is_empty() {
+        "Game database unavailable. Use Settings to retry.".into()
+    } else if session.offline {
+        "Offline: using the cached game database".into()
+    } else {
+        format!("{} supported games", group_digits(session.games.len()))
+    }
+}
+
 fn database_detail(session: &Session) -> String {
+    if session.refreshing {
+        return "Refreshing…".into();
+    }
     if session.games.is_empty() {
         return "Not downloaded yet".into();
     }
@@ -598,9 +671,10 @@ fn database_detail(session: &Session) -> String {
             }
         });
     let games = format!("{} games", group_digits(session.games.len()));
-    match updated {
-        Some(updated) => format!("{games} · {updated}"),
-        None => games,
+    match (updated, session.offline) {
+        (Some(updated), false) => format!("{games} · {updated}"),
+        (Some(updated), true) => format!("{games} · offline, {updated}"),
+        (None, _) => games,
     }
 }
 
@@ -614,13 +688,6 @@ fn group_digits(value: usize) -> String {
         grouped.push(digit);
     }
     grouped
-}
-
-fn supported_count(games: &[GameDefinition]) -> usize {
-    games
-        .iter()
-        .filter(|game| game.supported_path().is_some())
-        .count()
 }
 
 fn format_unix(millis: i64) -> String {

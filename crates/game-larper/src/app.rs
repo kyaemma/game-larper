@@ -53,11 +53,13 @@ struct Session {
     clock: SessionClock,
     queue: QueueMachine,
     host: Arc<Mutex<RunnerHost>>,
-    catalog_note: String,
     toast: String,
     toast_until: Option<Instant>,
     busy: bool,
     catalog_updated: Option<SystemTime>,
+    refreshing: bool,
+    manual_refresh: bool,
+    offline: bool,
     art_generation: u64,
     art_pending: bool,
     restored: bool,
@@ -92,7 +94,7 @@ pub fn run(
         &panel,
         &session.lock().unwrap_or_else(|p| p.into_inner()).config,
     );
-    render(&ui, &panel, &tray, &hits, &rows, &session);
+    render(&ui, &panel, &tray, &session);
 
     let wake: Arc<dyn Fn() + Send + Sync> = {
         let rx = rx.clone();
@@ -125,16 +127,12 @@ pub fn run(
                 for message in batch {
                     apply_message(&session, &log, &tx, &ui, message);
                 }
-                MODELS.with(|models| {
-                    if let Some(models) = models.borrow().as_ref() {
-                        render(&ui, &panel, &tray, &models.hits, &models.rows, &session);
-                    }
-                });
+                render(&ui, &panel, &tray, &session);
             });
         }) as Arc<dyn Fn() + Send + Sync>
     };
 
-    wire(&ui, &panel, &tray, &dock, &session, &log, &tx, &wake, &hits);
+    wire(&ui, &panel, &tray, &dock, &session, &log, &tx, &wake);
     platform::watch_activation({
         let ui_weak = ui.as_weak();
         move || {
@@ -157,17 +155,12 @@ pub fn run(
         ui.show()?;
         style_main(&ui);
     }
-    if session
-        .lock()
-        .unwrap_or_else(|p| p.into_inner())
-        .catalog_note
-        .contains("stale")
-        || session
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .games
-            .is_empty()
-    {
+    let first_download = {
+        let mut session = session.lock().unwrap_or_else(|p| p.into_inner());
+        session.refreshing = session.games.is_empty();
+        session.refreshing
+    };
+    if first_download {
         spawn_refresh(tx.clone(), paths.clone(), log.clone(), wake.clone());
     }
 
@@ -197,11 +190,7 @@ pub fn run(
                 apply_message(&session, &log, &tx, &ui, message);
             }
             tick(&session, &log, &tx, &wake);
-            MODELS.with(|models| {
-                if let Some(models) = models.borrow().as_ref() {
-                    render(&ui, &panel, &tray, &models.hits, &models.rows, &session);
-                }
-            });
+            render(&ui, &panel, &tray, &session);
         });
     }
 
@@ -263,20 +252,6 @@ fn load_session(paths: &AppPaths, log: &Log) -> Session {
     }
     let games = games.unwrap_or_default();
     let updated = current.last_updated().or_else(|| legacy.last_updated());
-    let stale = updated.is_none_or(|time| {
-        SystemTime::now().duration_since(time).unwrap_or_default()
-            > Duration::from_secs(24 * 60 * 60)
-    });
-    let note = if games.is_empty() {
-        "Game database unavailable. Refresh it in Settings.".into()
-    } else if stale {
-        format!(
-            "{} supported games · refresh pending",
-            supported_count(&games)
-        )
-    } else {
-        format!("{} supported games", supported_count(&games))
-    };
     let now_ms = unix_time_ms(SystemTime::now());
     let (queue, queue_warnings) = if config.preserve_queue {
         load_queue(&paths.queue(), now_ms, DEFAULT_TRANSITION_GAP).unwrap_or_else(|error| {
@@ -315,11 +290,13 @@ fn load_session(paths: &AppPaths, log: &Log) -> Session {
         clock: SessionClock::new(),
         queue,
         host: Arc::new(Mutex::new(RunnerHost::new(paths.runtime()))),
-        catalog_note: note,
         toast: String::new(),
         toast_until: None,
         busy: false,
         catalog_updated: updated,
+        refreshing: false,
+        manual_refresh: false,
+        offline: false,
         art_generation: 1,
         art_pending: true,
         restored: false,
@@ -337,40 +314,26 @@ fn wire(
     log: &Arc<Log>,
     tx: &mpsc::Sender<Msg>,
     wake: &Arc<dyn Fn() + Send + Sync>,
-    hits: &Rc<VecModel<Hit>>,
 ) {
     ui.on_query_edited({
         let session = session.clone();
-        let ui = ui.as_weak();
-        let panel = panel.as_weak();
-        let tray = tray.as_weak();
-        let hits = hits.clone();
+        let wake = wake.clone();
         move |text| {
             if let Ok(mut session) = session.lock() {
                 session.query = text.to_string();
                 session.art_pending = true;
             }
-            if let (Some(ui), Some(panel), Some(tray)) =
-                (ui.upgrade(), panel.upgrade(), tray.upgrade())
-            {
-                render(
-                    &ui,
-                    &panel,
-                    &tray,
-                    &hits,
-                    &Rc::new(VecModel::from(Vec::new())),
-                    &session,
-                );
-            }
+            wake();
         }
     });
-    // The queue model is owned by render(); query edits still go through the full render below.
-    let _ = hits;
-
     ui.on_choose({
         let session = session.clone();
         let log = log.clone();
-        move |index| select_index(&session, &log, index as usize, false)
+        let wake = wake.clone();
+        move |index| {
+            select_index(&session, &log, index as usize);
+            wake();
+        }
     });
     ui.on_activate({
         let session = session.clone();
@@ -378,31 +341,64 @@ fn wire(
         let tx = tx.clone();
         let wake = wake.clone();
         move |index| {
-            select_index(&session, &log, index as usize, false);
+            select_index(&session, &log, index as usize);
             begin_play(&session, &log, &tx, &wake);
+            wake();
         }
     });
-    ui.on_play({
+    let play = {
         let session = session.clone();
         let log = log.clone();
         let tx = tx.clone();
         let wake = wake.clone();
-        move || begin_play(&session, &log, &tx, &wake)
-    });
-    ui.on_pause({
+        move || {
+            begin_play(&session, &log, &tx, &wake);
+            wake();
+        }
+    };
+    let pause = {
         let session = session.clone();
         let log = log.clone();
         let tx = tx.clone();
         let wake = wake.clone();
-        move || begin_pause(&session, &log, &tx, &wake)
-    });
-    ui.on_stop({
+        move || {
+            begin_pause(&session, &log, &tx, &wake);
+            wake();
+        }
+    };
+    let stop = {
         let session = session.clone();
         let log = log.clone();
         let tx = tx.clone();
         let wake = wake.clone();
-        move || begin_stop(&session, &log, &tx, &wake, true)
-    });
+        move || {
+            begin_stop(&session, &log, &tx, &wake, true);
+            wake();
+        }
+    };
+    let queue_resume = {
+        let session = session.clone();
+        let log = log.clone();
+        let tx = tx.clone();
+        let wake = wake.clone();
+        move || {
+            let action = session
+                .lock()
+                .ok()
+                .map(|mut session| session.queue.resume(Instant::now()));
+            if let Some(action) = action {
+                dispatch_queue_action(&session, &log, &tx, &wake, action);
+            }
+            wake();
+        }
+    };
+    ui.on_play(play.clone());
+    ui.on_pause(pause.clone());
+    ui.on_stop(stop.clone());
+    tray.on_play(play);
+    tray.on_pause(pause);
+    tray.on_stop(stop);
+
     let open_queue = {
         let dock = dock.clone();
         let panel = panel.as_weak();
@@ -467,10 +463,18 @@ fn wire(
         let log = log.clone();
         let wake = wake.clone();
         move || {
-            let paths = session.lock().map(|session| session.paths.clone()).ok();
+            let paths = session.lock().ok().and_then(|mut session| {
+                if session.refreshing {
+                    return None;
+                }
+                session.refreshing = true;
+                session.manual_refresh = true;
+                Some(session.paths.clone())
+            });
             if let Some(paths) = paths {
                 spawn_refresh(tx.clone(), paths, log.clone(), wake.clone());
             }
+            wake();
         }
     });
     panel.on_clear_images({
@@ -599,22 +603,7 @@ fn wire(
             wake();
         }
     });
-    panel.on_queue_resume({
-        let session = session.clone();
-        let log = log.clone();
-        let tx = tx.clone();
-        let wake = wake.clone();
-        move || {
-            let action = session
-                .lock()
-                .ok()
-                .map(|mut session| session.queue.resume(Instant::now()));
-            if let Some(action) = action {
-                dispatch_queue_action(&session, &log, &tx, &wake, action);
-            }
-            wake();
-        }
-    });
+    panel.on_queue_resume(queue_resume);
     panel.on_queue_skip({
         let session = session.clone();
         let log = log.clone();
@@ -700,27 +689,6 @@ fn wire(
             }
         }
     });
-    tray.on_play({
-        let session = session.clone();
-        let log = log.clone();
-        let tx = tx.clone();
-        let wake = wake.clone();
-        move || begin_play(&session, &log, &tx, &wake)
-    });
-    tray.on_pause({
-        let session = session.clone();
-        let log = log.clone();
-        let tx = tx.clone();
-        let wake = wake.clone();
-        move || begin_pause(&session, &log, &tx, &wake)
-    });
-    tray.on_stop({
-        let session = session.clone();
-        let log = log.clone();
-        let tx = tx.clone();
-        let wake = wake.clone();
-        move || begin_stop(&session, &log, &tx, &wake, true)
-    });
     tray.on_open_queue({
         let ui = ui.as_weak();
         move || {
@@ -748,31 +716,25 @@ fn wire(
     });
 }
 
-fn render(
-    ui: &MainWindow,
-    panel: &SidePanel,
-    tray: &TrayIcon,
-    hits: &VecModel<Hit>,
-    rows: &VecModel<QueueRow>,
-    session: &Arc<Mutex<Session>>,
-) {
-    let Ok(session) = session.lock() else { return };
+fn render(ui: &MainWindow, panel: &SidePanel, tray: &TrayIcon, session: &Arc<Mutex<Session>>) {
+    let Ok(session) = session.lock() else {
+        return;
+    };
     let now = Instant::now();
-    let visible: Vec<usize> =
-        game_larper_core::search(&session.games, &session.query, DEFAULT_SEARCH_LIMIT);
-    let mut models = Vec::with_capacity(visible.len());
-    for index in visible {
-        let game = &session.games[index];
-        models.push(Hit {
-            id: game.id.clone().into(),
-            name: game.name.clone().into(),
-            detail: detail_line(game).into(),
-            art: cached_art(&game.id),
-            selected: session.selected.as_deref() == Some(game.id.as_str()),
-        });
-    }
-    hits.set_vec(models);
-    ui.set_catalog_status(session.catalog_note.clone().into());
+    let shown = visible(&session);
+    MODELS.with(|models| {
+        if let Some(models) = models.borrow().as_ref() {
+            sync_model(&models.hits, hit_rows(&session, &shown));
+            sync_model(&models.rows, queue_rows(&session, now));
+        }
+    });
+    render_main(ui, &session, now);
+    render_panel(panel, &session, now);
+    render_tray(tray, &session, now);
+}
+
+fn render_main(ui: &MainWindow, session: &Session, now: Instant) {
+    ui.set_catalog_status(catalog_line(session).into());
     ui.set_empty_message(if session.games.is_empty() {
         "No supported games yet. Open Settings and refresh the database.".into()
     } else if session.query.trim().is_empty() {
@@ -781,26 +743,15 @@ fn render(
         "No games match that.".into()
     });
     ui.set_queue_count(format!("Queue ({})", session.queue.items().len()).into());
-    let selected = session
-        .selected
-        .as_ref()
-        .and_then(|id| session.games.iter().find(|game| &game.id == id));
-    let queue_running = matches!(
-        session.queue.activity(),
-        QueueActivity::Running { .. }
-            | QueueActivity::Paused { .. }
-            | QueueActivity::Transition { .. }
-    );
-    let state = session.clock.state();
-    let (label, color) = match state {
+    let (label, color) = match session.clock.state() {
         SessionState::Playing => ("Playing", ThemeColor::Success),
         SessionState::Paused => ("Paused", ThemeColor::Warning),
         SessionState::Stopped => ("Stopped", ThemeColor::Muted),
     };
     ui.set_session_state(label.into());
     ui.set_session_color(color.into());
-    ui.set_session_time(displayed_time(&session, now).into());
-    if let Some(game) = selected {
+    ui.set_session_time(displayed_time(session, now).into());
+    if let Some(game) = selected_game(session) {
         ui.set_session_name(game.name.clone().into());
         ui.set_session_detail(detail_line(game).into());
         ui.set_session_art(cached_art(&game.id));
@@ -809,42 +760,43 @@ fn render(
         ui.set_session_detail("Search, then press Play.".into());
         ui.set_session_art(slint::Image::default());
     }
-    let play_enabled =
-        selected.is_some() && !session.busy && state != SessionState::Playing && !queue_running;
-    let pause_enabled = !session.busy && state == SessionState::Playing;
-    let stop_enabled = !session.busy && (state != SessionState::Stopped || queue_running);
-    ui.set_play_enabled(play_enabled);
-    ui.set_pause_enabled(pause_enabled);
-    ui.set_stop_enabled(stop_enabled);
-    ui.set_play_label(
-        if state == SessionState::Paused {
-            "Resume"
-        } else {
-            "Play"
-        }
-        .into(),
-    );
+    let controls = controls(session);
+    ui.set_play_enabled(controls.play);
+    ui.set_pause_enabled(controls.pause);
+    ui.set_stop_enabled(controls.stop);
+    ui.set_play_label(controls.play_label.into());
     ui.set_toast(if session.toast_until.is_some_and(|until| now < until) {
         session.toast.clone().into()
     } else {
         SharedString::default()
     });
-    sync_model(rows, queue_rows(&session, now));
-    let (queue_phase, queue_text) = queue_state(&session);
-    panel.set_queue_state(queue_phase.into());
-    panel.set_queue_status(queue_text.into());
-    panel.set_queue_summary(queue_summary(&session, now).into());
+}
+
+fn render_panel(panel: &SidePanel, session: &Session, now: Instant) {
+    let (state, status) = queue_state(session);
+    panel.set_queue_state(state.into());
+    panel.set_queue_status(status.into());
+    panel.set_queue_summary(queue_summary(session, now).into());
     panel.set_schedule_armed(matches!(
         session.queue.activity(),
         QueueActivity::Scheduled { .. }
     ));
+    let selected = selected_game(session);
     panel.set_has_selection(selected.is_some());
     if let Some(game) = selected {
         panel.set_selected_name(game.name.clone().into());
         panel.set_selected_art(cached_art(&game.id));
     }
-    panel.set_database_detail(database_detail(&session).into());
+    panel.set_database_detail(database_detail(session).into());
+}
 
+fn render_tray(tray: &TrayIcon, session: &Session, now: Instant) {
+    let selected = selected_game(session);
+    let label = match session.clock.state() {
+        SessionState::Playing => "Playing",
+        SessionState::Paused => "Paused",
+        SessionState::Stopped => "Stopped",
+    };
     tray.set_status_tip(if let Some(game) = selected {
         format!("Game Larper · {} · {label}", game.name).into()
     } else {
@@ -856,18 +808,12 @@ fn render(
             .unwrap_or_else(|| "No game selected".into())
             .into(),
     );
-    tray.set_status_line(format!("{label} · {}", displayed_time(&session, now)).into());
-    tray.set_play_label(
-        if state == SessionState::Paused {
-            "Resume"
-        } else {
-            "Play"
-        }
-        .into(),
-    );
-    tray.set_play_enabled(play_enabled);
-    tray.set_pause_enabled(pause_enabled);
-    tray.set_stop_enabled(stop_enabled);
+    tray.set_status_line(format!("{label} · {}", displayed_time(session, now)).into());
+    let controls = controls(session);
+    tray.set_play_label(controls.play_label.into());
+    tray.set_play_enabled(controls.play);
+    tray.set_pause_enabled(controls.pause);
+    tray.set_stop_enabled(controls.stop);
     tray.set_queue_line(format!("Queue ({})", session.queue.items().len()).into());
 }
 
@@ -944,40 +890,46 @@ fn apply_message(
         return;
     };
     match message {
-        Msg::Catalog(result) => match result {
-            Ok(games) => {
-                let count = supported_count(&games);
-                session.games = games
-                    .into_iter()
-                    .filter(|game| game.supported_path().is_some())
-                    .collect();
-                session.catalog_updated = Some(SystemTime::now());
-                session.catalog_note = format!("{count} supported games");
-                log.info(format!("Catalog refreshed: {count} supported games"));
-                if session
-                    .selected
-                    .as_ref()
-                    .is_some_and(|id| !session.games.iter().any(|game| &game.id == id))
-                {
-                    session.selected = None;
-                    session.config.last_selected_discord_application_id = None;
-                    let _ = ConfigStore::new(session.paths.config()).save(&session.config);
+        Msg::Catalog(result) => {
+            let manual = std::mem::take(&mut session.manual_refresh);
+            session.refreshing = false;
+            match result {
+                Ok(games) => {
+                    session.games = games
+                        .into_iter()
+                        .filter(|game| game.supported_path().is_some())
+                        .collect();
+                    let count = session.games.len();
+                    session.offline = false;
+                    session.catalog_updated = Some(SystemTime::now());
+                    log.info(format!("Catalog refreshed: {count} supported games"));
+                    if session
+                        .selected
+                        .as_ref()
+                        .is_some_and(|id| !session.games.iter().any(|game| &game.id == id))
+                    {
+                        session.selected = None;
+                        session.config.last_selected_discord_application_id = None;
+                        let _ = ConfigStore::new(session.paths.config()).save(&session.config);
+                    }
+                    session.art_pending = true;
+                    if manual {
+                        toast(
+                            &mut session,
+                            format!("Game list updated · {} games", group_digits(count)),
+                        );
+                    }
                 }
-                session.art_pending = true;
+                Err(error) => {
+                    log.info(format!("Metadata refresh failed: {error}"));
+                    session.offline = !session.games.is_empty();
+                    toast(
+                        &mut session,
+                        "Refresh failed. The last good database is still here.",
+                    );
+                }
             }
-            Err(error) => {
-                log.info(format!("Metadata refresh failed: {error}"));
-                session.catalog_note = if session.games.is_empty() {
-                    "Game database unavailable. Use Settings to retry.".into()
-                } else {
-                    "Offline: using the cached game database".into()
-                };
-                toast(
-                    &mut session,
-                    "Refresh failed. The last good database is still here.",
-                );
-            }
-        },
+        }
         Msg::Art {
             id,
             generation,
