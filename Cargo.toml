@@ -1,0 +1,25 @@
+[workspace]
+resolver = "3"
+members = [
+    "crates/game-larper-core",
+    "crates/game-larper-runner",
+]
+
+[workspace.package]
+edition = "2024"
+version = "0.1.0"
+publish = false
+rust-version = "1.98"
+
+[workspace.dependencies]
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+windows-sys = "0.59"
+
+[workspace.lints.rust]
+unsafe_op_in_unsafe_fn = "deny"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+opt-level = 3
