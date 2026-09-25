@@ -1,4 +1,5 @@
-use std::collections::HashMap;
+use std::cell::RefCell;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::{Arc, Mutex, mpsc};
@@ -20,21 +21,35 @@ use crate::platform;
 
 slint::include_modules!();
 
+type Wake = Arc<dyn Fn() + Send + Sync>;
+
+/// Rows whose artwork may hold back a new result list.
+const REVEAL_ROWS: usize = 10;
+/// Typing pause before artwork is fetched.
+const ART_DEBOUNCE: Duration = Duration::from_millis(110);
+/// Longest wait for artwork before rows show with the placeholder.
+const REVEAL_WAIT: Duration = Duration::from_millis(260);
+/// Keeps the startup loader from flashing for a single frame.
+const LOADING_MIN: Duration = Duration::from_millis(280);
+
 struct Models {
     hits: Rc<VecModel<Hit>>,
     rows: Rc<VecModel<QueueRow>>,
 }
 
 thread_local! {
-    static MODELS: std::cell::RefCell<Option<Models>> = const { std::cell::RefCell::new(None) };
-    static ART: std::cell::RefCell<HashMap<String, slint::Image>> = std::cell::RefCell::new(HashMap::new());
+    static MODELS: RefCell<Option<Models>> = const { RefCell::new(None) };
+    static ART: RefCell<HashMap<String, slint::Image>> = RefCell::new(HashMap::new());
 }
 
 enum Msg {
+    Loaded {
+        games: Vec<GameDefinition>,
+        updated: Option<SystemTime>,
+    },
     Catalog(Result<Vec<GameDefinition>, String>),
     Art {
         id: String,
-        generation: u64,
         path: Option<PathBuf>,
     },
     Launch(Result<LaunchReport, String>),
@@ -42,6 +57,28 @@ enum Msg {
     Exited {
         generation: u64,
     },
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum Results {
+    Idle,
+    Pending,
+    Ready,
+    Empty,
+}
+
+/// A result list waiting for its first rows of artwork.
+struct Reveal {
+    shown: Vec<usize>,
+    waiting: HashSet<String>,
+    deadline: Instant,
+}
+
+/// Artwork a query wants: the first rows gate the reveal, the rest load quietly.
+#[derive(Default)]
+struct ArtPlan {
+    first: Vec<GameDefinition>,
+    rest: Vec<GameDefinition>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -55,7 +92,16 @@ struct Session {
     paths: AppPaths,
     config: AppConfig,
     games: Vec<GameDefinition>,
+    loaded: bool,
+    started: Instant,
+    catalog_updated: Option<SystemTime>,
+    refreshing: bool,
+    manual_refresh: bool,
+    offline: bool,
     query: String,
+    shown: Vec<usize>,
+    results: Results,
+    reveal: Option<Reveal>,
     selected: Option<String>,
     clock: SessionClock,
     queue: QueueMachine,
@@ -64,12 +110,8 @@ struct Session {
     toast_kind: ToastKind,
     toast_until: Option<Instant>,
     busy: bool,
-    catalog_updated: Option<SystemTime>,
-    refreshing: bool,
-    manual_refresh: bool,
-    offline: bool,
-    art_generation: u64,
-    art_pending: bool,
+    art_inflight: HashSet<String>,
+    art_failed: HashSet<String>,
     restored: bool,
     quitting: bool,
 }
@@ -91,20 +133,17 @@ pub fn run(
     let rows = Rc::new(VecModel::from(Vec::<QueueRow>::new()));
     ui.set_hits(ModelRc::from(hits.clone()));
     panel.set_queue_rows(ModelRc::from(rows.clone()));
-    MODELS.with(|slot| {
-        *slot.borrow_mut() = Some(Models {
-            hits: hits.clone(),
-            rows: rows.clone(),
-        });
-    });
+    MODELS.with(|slot| *slot.borrow_mut() = Some(Models { hits, rows }));
     panel.set_version_label(env!("CARGO_PKG_VERSION").into());
     sync_settings_from_config(
         &panel,
         &session.lock().unwrap_or_else(|p| p.into_inner()).config,
     );
-    render(&ui, &panel, &tray, &session);
 
-    let wake: Arc<dyn Fn() + Send + Sync> = {
+    // Drains worker results on the UI thread, then renders. Wake itself is handed to the
+    // drain through a slot, because some results start more work.
+    let wake_slot: Arc<Mutex<Option<Wake>>> = Arc::new(Mutex::new(None));
+    let wake: Wake = {
         let rx = rx.clone();
         let session = session.clone();
         let ui_weak = ui.as_weak();
@@ -112,6 +151,7 @@ pub fn run(
         let tray_weak = tray.as_weak();
         let log = log.clone();
         let tx = tx.clone();
+        let wake_slot = wake_slot.clone();
         Arc::new(move || {
             let ui_weak = ui_weak.clone();
             let panel_weak = panel_weak.clone();
@@ -120,25 +160,24 @@ pub fn run(
             let rx = rx.clone();
             let log = log.clone();
             let tx = tx.clone();
+            let wake_slot = wake_slot.clone();
             let _ = slint::invoke_from_event_loop(move || {
                 let (Some(ui), Some(panel), Some(tray)) =
                     (ui_weak.upgrade(), panel_weak.upgrade(), tray_weak.upgrade())
                 else {
                     return;
                 };
-                let mut batch = Vec::new();
-                if let Ok(rx) = rx.lock() {
-                    while let Ok(message) = rx.try_recv() {
-                        batch.push(message);
-                    }
-                }
-                for message in batch {
-                    apply_message(&session, &log, &tx, &ui, message);
-                }
+                let Some(wake) = wake_slot.lock().ok().and_then(|slot| slot.clone()) else {
+                    return;
+                };
+                drain(&rx, &session, &log, &tx, &wake);
                 render(&ui, &panel, &tray, &session);
             });
-        }) as Arc<dyn Fn() + Send + Sync>
+        })
     };
+    if let Ok(mut slot) = wake_slot.lock() {
+        *slot = Some(wake.clone());
+    }
 
     wire(&ui, &panel, &tray, &dock, &session, &log, &tx, &wake);
     platform::watch_activation({
@@ -153,6 +192,7 @@ pub fn run(
         }
     });
 
+    render(&ui, &panel, &tray, &session);
     let minimized = start_minimized_flag
         || session
             .lock()
@@ -163,14 +203,7 @@ pub fn run(
         ui.show()?;
         style_main(&ui);
     }
-    let first_download = {
-        let mut session = session.lock().unwrap_or_else(|p| p.into_inner());
-        session.refreshing = session.games.is_empty();
-        session.refreshing
-    };
-    if first_download {
-        spawn_refresh(tx.clone(), paths.clone(), log.clone(), wake.clone());
-    }
+    spawn_load(tx.clone(), paths.clone(), log.clone(), wake.clone());
 
     let timer = Timer::default();
     {
@@ -188,15 +221,7 @@ pub fn run(
             else {
                 return;
             };
-            let mut batch = Vec::new();
-            if let Ok(rx) = rx.lock() {
-                while let Ok(message) = rx.try_recv() {
-                    batch.push(message);
-                }
-            }
-            for message in batch {
-                apply_message(&session, &log, &tx, &ui, message);
-            }
+            drain(&rx, &session, &log, &tx, &wake);
             tick(&session, &log, &tx, &wake);
             render(&ui, &panel, &tray, &session);
         });
@@ -247,19 +272,12 @@ pub fn run(
     Ok(())
 }
 
+/// Config and queue load at once. The catalog is large, so it loads on a worker.
 fn load_session(paths: &AppPaths, log: &Log) -> Session {
     let (config, warnings) = ConfigStore::new(paths.config()).load();
     for warning in warnings {
         log.info(warning);
     }
-    let current = CatalogCache::new(paths.catalog());
-    let legacy = CatalogCache::new(paths.legacy_catalog());
-    let (games, warning) = load_catalog_with_legacy(&current, &legacy);
-    if let Some(warning) = warning {
-        log.info(warning);
-    }
-    let games = games.unwrap_or_default();
-    let updated = current.last_updated().or_else(|| legacy.last_updated());
     let now_ms = unix_time_ms(SystemTime::now());
     let (queue, queue_warnings) = if config.preserve_queue {
         load_queue(&paths.queue(), now_ms, DEFAULT_TRANSITION_GAP).unwrap_or_else(|error| {
@@ -274,27 +292,21 @@ fn load_session(paths: &AppPaths, log: &Log) -> Session {
     for warning in queue_warnings {
         log.info(warning);
     }
-    let selected = if config.restore_last_selected_game {
-        config
-            .last_selected_discord_application_id
-            .clone()
-            .filter(|id| {
-                games
-                    .iter()
-                    .any(|game| game.id == *id && game.supported_path().is_some())
-            })
-    } else {
-        None
-    };
     Session {
         paths: paths.clone(),
         config,
-        games: games
-            .into_iter()
-            .filter(|game| game.supported_path().is_some())
-            .collect(),
+        games: Vec::new(),
+        loaded: false,
+        started: Instant::now(),
+        catalog_updated: None,
+        refreshing: false,
+        manual_refresh: false,
+        offline: false,
         query: String::new(),
-        selected,
+        shown: Vec::new(),
+        results: Results::Idle,
+        reveal: None,
+        selected: None,
         clock: SessionClock::new(),
         queue,
         host: Arc::new(Mutex::new(RunnerHost::new(paths.runtime()))),
@@ -302,14 +314,47 @@ fn load_session(paths: &AppPaths, log: &Log) -> Session {
         toast_kind: ToastKind::Info,
         toast_until: None,
         busy: false,
-        catalog_updated: updated,
-        refreshing: false,
-        manual_refresh: false,
-        offline: false,
-        art_generation: 1,
-        art_pending: true,
+        art_inflight: HashSet::new(),
+        art_failed: HashSet::new(),
         restored: false,
         quitting: false,
+    }
+}
+
+fn spawn_load(tx: mpsc::Sender<Msg>, paths: AppPaths, log: Arc<Log>, wake: Wake) {
+    std::thread::spawn(move || {
+        let current = CatalogCache::new(paths.catalog());
+        let legacy = CatalogCache::new(paths.legacy_catalog());
+        let (games, warning) = load_catalog_with_legacy(&current, &legacy);
+        if let Some(warning) = warning {
+            log.info(warning);
+        }
+        let games = games
+            .unwrap_or_default()
+            .into_iter()
+            .filter(|game| game.supported_path().is_some())
+            .collect();
+        let updated = current.last_updated().or_else(|| legacy.last_updated());
+        let _ = tx.send(Msg::Loaded { games, updated });
+        wake();
+    });
+}
+
+fn drain(
+    rx: &Mutex<mpsc::Receiver<Msg>>,
+    session: &Arc<Mutex<Session>>,
+    log: &Arc<Log>,
+    tx: &mpsc::Sender<Msg>,
+    wake: &Wake,
+) {
+    let mut batch = Vec::new();
+    if let Ok(rx) = rx.lock() {
+        while let Ok(message) = rx.try_recv() {
+            batch.push(message);
+        }
+    }
+    for message in batch {
+        apply_message(session, log, tx, wake, message);
     }
 }
 
@@ -322,15 +367,28 @@ fn wire(
     session: &Arc<Mutex<Session>>,
     log: &Arc<Log>,
     tx: &mpsc::Sender<Msg>,
-    wake: &Arc<dyn Fn() + Send + Sync>,
+    wake: &Wake,
 ) {
+    let debounce = Rc::new(Timer::default());
     ui.on_query_edited({
         let session = session.clone();
+        let tx = tx.clone();
         let wake = wake.clone();
         move |text| {
-            if let Ok(mut session) = session.lock() {
+            let plan = session.lock().ok().map(|mut session| {
                 session.query = text.to_string();
-                session.art_pending = true;
+                plan_results(&mut session)
+            });
+            match plan {
+                Some(plan) if !plan.first.is_empty() || !plan.rest.is_empty() => {
+                    let session = session.clone();
+                    let tx = tx.clone();
+                    let wake = wake.clone();
+                    debounce.start(TimerMode::SingleShot, ART_DEBOUNCE, move || {
+                        start_art(&session, &tx, &wake, plan.first.clone(), plan.rest.clone());
+                    });
+                }
+                _ => debounce.stop(),
             }
             wake();
         }
@@ -338,13 +396,14 @@ fn wire(
     ui.on_step({
         let session = session.clone();
         let log = log.clone();
+        let tx = tx.clone();
         let wake = wake.clone();
         move |delta| {
             let next = session.lock().ok().and_then(|session| {
-                let shown = visible(&session);
-                let last = shown.len().checked_sub(1)?;
+                let last = session.shown.len().checked_sub(1)?;
                 let current = session.selected.as_ref().and_then(|id| {
-                    shown
+                    session
+                        .shown
                         .iter()
                         .position(|&index| session.games.get(index).is_some_and(|g| &g.id == id))
                 });
@@ -355,7 +414,7 @@ fn wire(
                 })
             });
             if let Some(index) = next {
-                select_index(&session, &log, index);
+                select_index(&session, &log, &tx, &wake, index);
             }
             wake();
         }
@@ -363,9 +422,10 @@ fn wire(
     ui.on_choose({
         let session = session.clone();
         let log = log.clone();
+        let tx = tx.clone();
         let wake = wake.clone();
         move |index| {
-            select_index(&session, &log, index as usize);
+            select_index(&session, &log, &tx, &wake, index as usize);
             wake();
         }
     });
@@ -375,7 +435,7 @@ fn wire(
         let tx = tx.clone();
         let wake = wake.clone();
         move |index| {
-            select_index(&session, &log, index as usize);
+            select_index(&session, &log, &tx, &wake, index as usize);
             begin_play(&session, &log, &tx, &wake);
             wake();
         }
@@ -446,17 +506,6 @@ fn wire(
             dock.open(Mode::Queue);
         }
     };
-    ui.on_toggle_queue({
-        let dock = dock.clone();
-        let open_queue = open_queue.clone();
-        move || {
-            if dock.mode() == Some(Mode::Queue) {
-                dock.close();
-            } else {
-                open_queue();
-            }
-        }
-    });
     let open_settings = {
         let dock = dock.clone();
         let panel = panel.as_weak();
@@ -468,6 +517,17 @@ fn wire(
             dock.open(Mode::Settings);
         }
     };
+    ui.on_toggle_queue({
+        let dock = dock.clone();
+        let open_queue = open_queue.clone();
+        move || {
+            if dock.mode() == Some(Mode::Queue) {
+                dock.close();
+            } else {
+                open_queue();
+            }
+        }
+    });
     ui.on_open_settings({
         let dock = dock.clone();
         let open_settings = open_settings.clone();
@@ -479,48 +539,14 @@ fn wire(
             }
         }
     });
-    panel.on_save_settings({
-        let session = session.clone();
-        let panel = panel.as_weak();
-        let dock = dock.clone();
-        let log = log.clone();
-        let wake = wake.clone();
-        move || {
-            if save_settings(&session, &panel, &log) {
-                dock.close();
-            }
-            wake();
-        }
-    });
-    let refresh = {
-        let session = session.clone();
-        let tx = tx.clone();
-        let log = log.clone();
-        let wake = wake.clone();
-        move || {
-            let paths = session.lock().ok().and_then(|mut session| {
-                if session.refreshing {
-                    return None;
-                }
-                session.refreshing = true;
-                session.manual_refresh = true;
-                Some(session.paths.clone())
-            });
-            if let Some(paths) = paths {
-                spawn_refresh(tx.clone(), paths, log.clone(), wake.clone());
-            }
-            wake();
-        }
-    };
-    ui.on_refresh_catalog(refresh.clone());
-    panel.on_refresh_catalog(refresh);
     ui.on_add_to_queue({
         let session = session.clone();
         let log = log.clone();
+        let tx = tx.clone();
         let wake = wake.clone();
         let panel = panel.as_weak();
         move |index| {
-            select_index(&session, &log, index as usize);
+            select_index(&session, &log, &tx, &wake, index as usize);
             add_selected_to_queue(&session, &panel);
             wake();
         }
@@ -548,6 +574,68 @@ fn wire(
             wake();
         }
     });
+    let refresh = {
+        let session = session.clone();
+        let tx = tx.clone();
+        let log = log.clone();
+        let wake = wake.clone();
+        move || {
+            let paths = session.lock().ok().and_then(|mut session| {
+                if session.refreshing {
+                    return None;
+                }
+                session.refreshing = true;
+                session.manual_refresh = true;
+                Some(session.paths.clone())
+            });
+            if let Some(paths) = paths {
+                spawn_refresh(tx.clone(), paths, log.clone(), wake.clone());
+            }
+            wake();
+        }
+    };
+    ui.on_refresh_catalog(refresh.clone());
+    ui.on_request_close({
+        let session = session.clone();
+        let ui = ui.as_weak();
+        let dock = dock.clone();
+        let log = log.clone();
+        let tx = tx.clone();
+        let wake = wake.clone();
+        move || {
+            let close_to_tray = session
+                .lock()
+                .map(|session| session.config.close_to_tray)
+                .unwrap_or(true);
+            if close_to_tray {
+                dock.dismiss();
+                if let Some(ui) = ui.upgrade() {
+                    let _ = ui.hide();
+                }
+            } else {
+                begin_quit(&session, &log, &tx, &wake);
+            }
+        }
+    });
+
+    panel.on_close_panel({
+        let dock = dock.clone();
+        move || dock.close()
+    });
+    panel.on_save_settings({
+        let session = session.clone();
+        let panel = panel.as_weak();
+        let dock = dock.clone();
+        let log = log.clone();
+        let wake = wake.clone();
+        move || {
+            if save_settings(&session, &panel, &log) {
+                dock.close();
+            }
+            wake();
+        }
+    });
+    panel.on_refresh_catalog(refresh);
     panel.on_clear_images({
         let session = session.clone();
         let log = log.clone();
@@ -557,7 +645,7 @@ fn wire(
                 match net::clear_artwork(&session.paths.images()) {
                     Ok(count) => {
                         ART.with(|art| art.borrow_mut().clear());
-                        session.art_pending = true;
+                        session.art_failed.clear();
                         toast_ok(&mut session, format!("Cleared {count} cached images."));
                     }
                     Err(error) => {
@@ -725,32 +813,6 @@ fn wire(
             wake();
         }
     });
-    panel.on_close_panel({
-        let dock = dock.clone();
-        move || dock.close()
-    });
-    ui.on_request_close({
-        let session = session.clone();
-        let ui = ui.as_weak();
-        let dock = dock.clone();
-        let log = log.clone();
-        let tx = tx.clone();
-        let wake = wake.clone();
-        move || {
-            let close_to_tray = session
-                .lock()
-                .map(|session| session.config.close_to_tray)
-                .unwrap_or(true);
-            if close_to_tray {
-                dock.dismiss();
-                if let Some(ui) = ui.upgrade() {
-                    let _ = ui.hide();
-                }
-            } else {
-                begin_quit(&session, &log, &tx, &wake);
-            }
-        }
-    });
 
     tray.on_open_requested({
         let ui = ui.as_weak();
@@ -788,33 +850,44 @@ fn wire(
 }
 
 fn render(ui: &MainWindow, panel: &SidePanel, tray: &TrayIcon, session: &Arc<Mutex<Session>>) {
-    let Ok(session) = session.lock() else {
+    let Ok(mut session) = session.lock() else {
         return;
     };
     let now = Instant::now();
-    let shown = visible(&session);
+    settle_reveal(&mut session, now);
     MODELS.with(|models| {
         if let Some(models) = models.borrow().as_ref() {
-            sync_model(&models.hits, hit_rows(&session, &shown));
+            sync_model(&models.hits, hit_rows(&session));
             sync_model(&models.rows, queue_rows(&session, now));
         }
     });
-    render_main(ui, &session, &shown, now);
+    render_main(ui, &session, now);
     render_panel(panel, &session, now);
     render_tray(tray, &session, now);
 }
 
-fn render_main(ui: &MainWindow, session: &Session, shown: &[usize], now: Instant) {
-    let unavailable = session.games.is_empty() && !session.refreshing;
+fn render_main(ui: &MainWindow, session: &Session, now: Instant) {
+    let first_download = session.loaded && session.games.is_empty() && session.refreshing;
+    ui.set_loading(!session.loaded || first_download || now < session.started + LOADING_MIN);
+    ui.set_loading_label(
+        if first_download {
+            "Downloading the game list…"
+        } else {
+            "Loading games…"
+        }
+        .into(),
+    );
+    let unavailable = session.loaded && session.games.is_empty() && !session.refreshing;
     ui.set_results_state(
         if unavailable {
             "unavailable"
-        } else if session.query.trim().is_empty() {
-            "idle"
-        } else if shown.is_empty() {
-            "empty"
         } else {
-            "ready"
+            match session.results {
+                Results::Idle => "idle",
+                Results::Pending => "pending",
+                Results::Ready => "ready",
+                Results::Empty => "empty",
+            }
         }
         .into(),
     );
@@ -822,7 +895,8 @@ fn render_main(ui: &MainWindow, session: &Session, shown: &[usize], now: Instant
     ui.set_selected_index(
         selected
             .and_then(|game| {
-                shown
+                session
+                    .shown
                     .iter()
                     .position(|&index| session.games.get(index).is_some_and(|g| g.id == game.id))
             })
@@ -928,12 +1002,7 @@ fn render_tray(tray: &TrayIcon, session: &Session, now: Instant) {
     tray.set_queue_line(format!("Queue ({})", session.queue.items().len()).into());
 }
 
-fn tick(
-    session: &Arc<Mutex<Session>>,
-    log: &Arc<Log>,
-    tx: &mpsc::Sender<Msg>,
-    wake: &Arc<dyn Fn() + Send + Sync>,
-) {
+fn tick(session: &Arc<Mutex<Session>>, log: &Arc<Log>, tx: &mpsc::Sender<Msg>, wake: &Wake) {
     let Ok(mut session_guard) = session.lock() else {
         return;
     };
@@ -943,7 +1012,7 @@ fn tick(
     {
         session_guard.toast_until = None;
     }
-    if !session_guard.restored {
+    if !session_guard.restored && session_guard.loaded {
         session_guard.restored = true;
         if session_guard.config.auto_resume && session_guard.selected.is_some() {
             drop(session_guard);
@@ -956,50 +1025,65 @@ fn tick(
         let unix = unix_time_ms(SystemTime::now());
         session_guard.queue.tick(now, unix)
     };
-    let fetch_art = session_guard.art_pending;
-    if fetch_art {
-        session_guard.art_pending = false;
-        session_guard.art_generation = session_guard.art_generation.saturating_add(1);
-    }
-    let generation = session_guard.art_generation;
-    let games = if fetch_art {
-        art_targets(&session_guard)
-    } else {
-        Vec::new()
+    // The dock and the queue panel show artwork too; fetch what they miss.
+    let wanted: Vec<GameDefinition> = {
+        let session = &*session_guard;
+        let mut ids: Vec<&str> = session.selected.iter().map(String::as_str).collect();
+        ids.extend(
+            session
+                .queue
+                .items()
+                .iter()
+                .map(|item| item.application_id.as_str()),
+        );
+        ids.iter()
+            .filter_map(|id| session.games.iter().find(|game| game.id == *id))
+            .cloned()
+            .collect()
     };
-    let images = session_guard.paths.images();
+    fetch_art(&mut session_guard, &wanted, tx, wake, false);
     drop(session_guard);
     if action.stop_runner || action.launch_index.is_some() {
         dispatch_queue_action(session, log, tx, wake, action);
-    }
-    if !games.is_empty() {
-        let tx = tx.clone();
-        let wake = wake.clone();
-        std::thread::spawn(move || {
-            for game in games {
-                let path = net::ensure_artwork(&images, &game);
-                let _ = tx.send(Msg::Art {
-                    id: game.id,
-                    generation,
-                    path,
-                });
-                wake();
-            }
-        });
     }
 }
 
 fn apply_message(
     session: &Arc<Mutex<Session>>,
-    log: &Log,
+    log: &Arc<Log>,
     tx: &mpsc::Sender<Msg>,
-    _ui: &MainWindow,
+    wake: &Wake,
     message: Msg,
 ) {
     let Ok(mut session) = session.lock() else {
         return;
     };
     match message {
+        Msg::Loaded { games, updated } => {
+            log.info(format!("Catalog loaded: {} supported games", games.len()));
+            session.games = games;
+            session.loaded = true;
+            session.catalog_updated = updated;
+            if session.config.restore_last_selected_game {
+                session.selected = session
+                    .config
+                    .last_selected_discord_application_id
+                    .clone()
+                    .filter(|id| session.games.iter().any(|game| game.id == *id));
+            }
+            let plan = plan_results(&mut session);
+            fetch_art(&mut session, &plan.first, tx, wake, true);
+            fetch_art(&mut session, &plan.rest, tx, wake, false);
+            if session.games.is_empty() && !session.refreshing {
+                session.refreshing = true;
+                spawn_refresh(tx.clone(), session.paths.clone(), log.clone(), wake.clone());
+            }
+            // Render again once the loader has had its minimum time on screen.
+            let remaining =
+                (session.started + LOADING_MIN).saturating_duration_since(Instant::now());
+            let wake = wake.clone();
+            Timer::single_shot(remaining + Duration::from_millis(10), move || wake());
+        }
         Msg::Catalog(result) => {
             let manual = std::mem::take(&mut session.manual_refresh);
             session.refreshing = false;
@@ -1010,6 +1094,7 @@ fn apply_message(
                         .filter(|game| game.supported_path().is_some())
                         .collect();
                     let count = session.games.len();
+                    session.loaded = true;
                     session.offline = false;
                     session.catalog_updated = Some(SystemTime::now());
                     log.info(format!("Catalog refreshed: {count} supported games"));
@@ -1022,7 +1107,10 @@ fn apply_message(
                         session.config.last_selected_discord_application_id = None;
                         let _ = ConfigStore::new(session.paths.config()).save(&session.config);
                     }
-                    session.art_pending = true;
+                    session.art_failed.clear();
+                    let plan = plan_results(&mut session);
+                    fetch_art(&mut session, &plan.first, tx, wake, true);
+                    fetch_art(&mut session, &plan.rest, tx, wake, false);
                     if manual {
                         toast_ok(
                             &mut session,
@@ -1040,16 +1128,18 @@ fn apply_message(
                 }
             }
         }
-        Msg::Art {
-            id,
-            generation,
-            path,
-        } => {
-            if generation == session.art_generation
-                && let Some(path) = path
-                && let Ok(image) = slint::Image::load_from_path(&path)
-            {
-                ART.with(|art| art.borrow_mut().insert(id, image));
+        Msg::Art { id, path } => {
+            session.art_inflight.remove(&id);
+            match path.and_then(|path| slint::Image::load_from_path(&path).ok()) {
+                Some(image) => ART.with(|art| {
+                    art.borrow_mut().insert(id.clone(), image);
+                }),
+                None => {
+                    session.art_failed.insert(id.clone());
+                }
+            }
+            if let Some(reveal) = session.reveal.as_mut() {
+                reveal.waiting.remove(&id);
             }
         }
         Msg::Launch(result) => {

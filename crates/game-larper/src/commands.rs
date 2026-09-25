@@ -242,11 +242,19 @@ fn spawn_refresh(
     });
 }
 
-fn select_index(session: &Arc<Mutex<Session>>, log: &Log, index: usize) {
+fn select_index(
+    session: &Arc<Mutex<Session>>,
+    log: &Log,
+    tx: &mpsc::Sender<Msg>,
+    wake: &Wake,
+    index: usize,
+) {
     let Ok(mut session) = session.lock() else {
         return;
     };
-    let Some(game) = visible(&session)
+    // Indexes refer to the rows on screen, which may still be the previous query's.
+    let Some(game) = session
+        .shown
         .get(index)
         .and_then(|&index| session.games.get(index))
         .cloned()
@@ -258,12 +266,12 @@ fn select_index(session: &Arc<Mutex<Session>>, log: &Log, index: usize) {
     }
     session.selected = Some(game.id.clone());
     session.config.last_selected_discord_application_id = Some(game.id.clone());
-    session.art_pending = true;
     if let Err(error) = ConfigStore::new(session.paths.config()).save(&session.config) {
         log.info(format!("Config save failed: {error}"));
     } else {
         log.info(format!("Selected game: {} {}", game.id, game.name));
     }
+    fetch_art(&mut session, std::slice::from_ref(&game), tx, wake, true);
 }
 
 fn add_selected_to_queue(session: &Arc<Mutex<Session>>, panel: &Weak<SidePanel>) {
@@ -427,9 +435,169 @@ fn sync_settings_from_config(panel: &SidePanel, config: &AppConfig) {
     panel.set_settings_dirty(false);
 }
 
+// ---- Results and artwork ------------------------------------------------------------------
+
+/// Recompute the rows for the current query.
+///
+/// When the first rows have no artwork in memory yet, the new list waits (up to a short
+/// deadline) so rows appear with their pictures. Until then the previous rows stay, or a
+/// skeleton shows when there were none.
+fn plan_results(session: &mut Session) -> ArtPlan {
+    session.reveal = None;
+    if session.query.trim().is_empty() {
+        session.shown.clear();
+        session.results = Results::Idle;
+        return ArtPlan::default();
+    }
+    if !session.loaded {
+        session.shown.clear();
+        session.results = Results::Pending;
+        return ArtPlan::default();
+    }
+    let found = game_larper_core::search(&session.games, &session.query, DEFAULT_SEARCH_LIMIT);
+    if found.is_empty() {
+        session.shown.clear();
+        session.results = Results::Empty;
+        return ArtPlan::default();
+    }
+    let wanted = |range: &[usize]| -> Vec<GameDefinition> {
+        range
+            .iter()
+            .map(|&index| &session.games[index])
+            .filter(|game| needs_art(session, game))
+            .cloned()
+            .collect()
+    };
+    let split = found.len().min(REVEAL_ROWS);
+    let plan = ArtPlan {
+        first: wanted(&found[..split]),
+        rest: wanted(&found[split..]),
+    };
+    if plan.first.is_empty() {
+        session.shown = found;
+        session.results = Results::Ready;
+        return plan;
+    }
+    if session.results != Results::Ready || session.shown.is_empty() {
+        session.shown.clear();
+        session.results = Results::Pending;
+    }
+    session.reveal = Some(Reveal {
+        shown: found,
+        waiting: plan.first.iter().map(|game| game.id.clone()).collect(),
+        deadline: Instant::now() + ART_DEBOUNCE + REVEAL_WAIT,
+    });
+    plan
+}
+
+fn settle_reveal(session: &mut Session, now: Instant) {
+    let ready = session
+        .reveal
+        .as_ref()
+        .is_some_and(|reveal| reveal.waiting.is_empty() || now >= reveal.deadline);
+    if ready && let Some(reveal) = session.reveal.take() {
+        session.shown = reveal.shown;
+        session.results = Results::Ready;
+    }
+}
+
+/// Fetch the artwork a settled query needs, then make sure the reveal deadline renders.
+fn start_art(
+    session: &Arc<Mutex<Session>>,
+    tx: &mpsc::Sender<Msg>,
+    wake: &Wake,
+    first: Vec<GameDefinition>,
+    rest: Vec<GameDefinition>,
+) {
+    if let Ok(mut session) = session.lock() {
+        fetch_art(&mut session, &first, tx, wake, true);
+        fetch_art(&mut session, &rest, tx, wake, false);
+    }
+    let wake = wake.clone();
+    Timer::single_shot(REVEAL_WAIT + Duration::from_millis(20), move || wake());
+}
+
+fn needs_art(session: &Session, game: &GameDefinition) -> bool {
+    !ART.with(|art| art.borrow().contains_key(&game.id))
+        && !session.art_failed.contains(&game.id)
+        && !net::artwork_candidates(game).is_empty()
+}
+
+/// Start fetching artwork that is not cached, failed, or already on its way.
+/// `parallel` gives each game its own worker; otherwise one worker goes through the list.
+fn fetch_art(
+    session: &mut Session,
+    games: &[GameDefinition],
+    tx: &mpsc::Sender<Msg>,
+    wake: &Wake,
+    parallel: bool,
+) {
+    let todo: Vec<GameDefinition> = games
+        .iter()
+        .filter(|game| needs_art(session, game) && !session.art_inflight.contains(&game.id))
+        .cloned()
+        .collect();
+    if todo.is_empty() {
+        return;
+    }
+    for game in &todo {
+        session.art_inflight.insert(game.id.clone());
+    }
+    let images = session.paths.images();
+    let run = move |games: Vec<GameDefinition>, tx: mpsc::Sender<Msg>, wake: Wake| {
+        for game in games {
+            let path = net::ensure_artwork(&images, &game);
+            let _ = tx.send(Msg::Art { id: game.id, path });
+            wake();
+        }
+    };
+    if parallel {
+        for game in todo {
+            let run = run.clone();
+            let tx = tx.clone();
+            let wake = wake.clone();
+            std::thread::spawn(move || run(vec![game], tx, wake));
+        }
+    } else {
+        let tx = tx.clone();
+        let wake = wake.clone();
+        std::thread::spawn(move || run(todo, tx, wake));
+    }
+}
+
 fn cached_art(id: &str) -> slint::Image {
     ART.with(|art| art.borrow().get(id).cloned().unwrap_or_default())
 }
+
+fn hit_rows(session: &Session) -> Vec<Hit> {
+    session
+        .shown
+        .iter()
+        .filter_map(|&index| session.games.get(index))
+        .map(|game| Hit {
+            id: game.id.clone().into(),
+            steam_id: game.steam_app_id.clone().unwrap_or_default().into(),
+            name: game.name.clone().into(),
+            art: cached_art(&game.id),
+            selected: session.selected.as_deref() == Some(game.id.as_str()),
+        })
+        .collect()
+}
+
+/// Update rows in place so delegates, hover state, and scroll position survive a render.
+fn sync_model<T: Clone + PartialEq + 'static>(model: &VecModel<T>, rows: Vec<T>) {
+    if model.row_count() != rows.len() {
+        model.set_vec(rows);
+        return;
+    }
+    for (index, row) in rows.into_iter().enumerate() {
+        if model.row_data(index).as_ref() != Some(&row) {
+            model.set_row_data(index, row);
+        }
+    }
+}
+
+// ---- Presentation strings ---------------------------------------------------------------
 
 fn toast(session: &mut Session, message: impl AsRef<str>) {
     show_toast(session, ToastKind::Info, message);
@@ -455,6 +623,7 @@ fn selected_game(session: &Session) -> Option<&GameDefinition> {
         .as_ref()
         .and_then(|id| session.games.iter().find(|game| &game.id == id))
 }
+
 
 struct Controls {
     play: bool,
@@ -546,7 +715,7 @@ fn queue_line(session: &Session) -> String {
     match session.queue.activity() {
         QueueActivity::Scheduled { at_unix_ms } => format!("Starts {}", format_unix(at_unix_ms)),
         QueueActivity::Missed { at_unix_ms } => {
-            format!("Missed start · {}", format_unix(at_unix_ms))
+            format!("Missed the {} start", format_unix(at_unix_ms))
         }
         QueueActivity::Failed { message, .. } => message,
         _ => String::new(),
@@ -560,10 +729,9 @@ fn queue_state(session: &Session) -> (&'static str, String) {
         QueueActivity::Scheduled { at_unix_ms } => {
             ("scheduled", format!("Starts {}", format_unix(at_unix_ms)))
         }
-        QueueActivity::Missed { at_unix_ms } => (
-            "missed",
-            format!("Missed start · {}", format_unix(at_unix_ms)),
-        ),
+        QueueActivity::Missed { at_unix_ms } => {
+            ("missed", format!("Missed {}", format_unix(at_unix_ms)))
+        }
         QueueActivity::Running { index } => {
             ("running", format!("Playing {} of {count}", index + 1))
         }
@@ -631,60 +799,16 @@ fn queue_rows(session: &Session, now: Instant) -> Vec<QueueRow> {
         .collect()
 }
 
-/// Update rows in place so delegates, hover state, and scroll position survive a render.
-fn sync_model<T: Clone + PartialEq + 'static>(model: &VecModel<T>, rows: Vec<T>) {
-    if model.row_count() != rows.len() {
-        model.set_vec(rows);
-        return;
-    }
-    for (index, row) in rows.into_iter().enumerate() {
-        if model.row_data(index).as_ref() != Some(&row) {
-            model.set_row_data(index, row);
-        }
-    }
-}
-
-fn art_targets(session: &Session) -> Vec<GameDefinition> {
-    let mut games = Vec::new();
-    if let Some(id) = &session.selected
-        && let Some(game) = session.games.iter().find(|game| &game.id == id)
-    {
-        games.push(game.clone());
-    }
-    for index in game_larper_core::search(&session.games, &session.query, 8) {
-        let game = &session.games[index];
-        if games.iter().all(|existing| existing.id != game.id) {
-            games.push(game.clone());
-        }
-    }
-    games
-}
-
-/// Result indexes for the current query.
-fn visible(session: &Session) -> Vec<usize> {
-    game_larper_core::search(&session.games, &session.query, DEFAULT_SEARCH_LIMIT)
-}
-
-fn hit_rows(session: &Session, shown: &[usize]) -> Vec<Hit> {
-    shown
-        .iter()
-        .filter_map(|&index| session.games.get(index))
-        .map(|game| Hit {
-            id: game.id.clone().into(),
-            steam_id: game.steam_app_id.clone().unwrap_or_default().into(),
-            name: game.name.clone().into(),
-            art: cached_art(&game.id),
-            selected: session.selected.as_deref() == Some(game.id.as_str()),
-        })
-        .collect()
-}
-
 fn database_detail(session: &Session) -> String {
     if session.refreshing {
         return "Refreshing…".into();
     }
     if session.games.is_empty() {
-        return "Not downloaded yet".into();
+        return if session.loaded {
+            "Not downloaded yet".into()
+        } else {
+            "Loading…".into()
+        };
     }
     let updated = session
         .catalog_updated

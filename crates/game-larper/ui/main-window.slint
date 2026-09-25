@@ -4,7 +4,7 @@
 import { Theme, Icons } from "theme.slint";
 import { Icon, LogoMark, CaptionButton, Hairline, Gutter } from "controls.slint";
 import { Hit } from "models.slint";
-import { SearchField, ResultsList, Message } from "search.slint";
+import { SearchField, ResultsList, SkeletonRow, Message } from "search.slint";
 import { SessionDock, UtilityBar, Toast } from "dock.slint";
 
 component TitleBar inherits Rectangle {
@@ -51,6 +51,49 @@ component TitleBar inherits Rectangle {
             label: "Close";
             danger: true;
             clicked => { root.close(); }
+        }
+    }
+}
+
+component LoadingView inherits Rectangle {
+    in property <string> label;
+    background: Theme.bg;
+    TouchArea { }
+    VerticalLayout {
+        alignment: center;
+        spacing: 16px;
+        padding-bottom: 48px;
+        HorizontalLayout {
+            alignment: center;
+            LogoMark {
+                width: 56px;
+                height: 56px;
+            }
+        }
+        Text {
+            text: root.label;
+            color: Theme.text-2;
+            font-size: Theme.text-m;
+            horizontal-alignment: center;
+        }
+        HorizontalLayout {
+            alignment: center;
+            Rectangle {
+                width: 112px;
+                height: 3px;
+                border-radius: 1.5px;
+                background: Theme.fill;
+                clip: true;
+                Rectangle {
+                    property <float> t: mod(animation-tick() / 1ms, 1200) / 1200;
+                    property <float> eased: self.t * self.t * (3 - 2 * self.t);
+                    width: 36px;
+                    height: 3px;
+                    border-radius: 1.5px;
+                    background: Theme.accent;
+                    x: self.eased * (parent.width + self.width) - self.width;
+                }
+            }
         }
     }
 }
@@ -107,10 +150,14 @@ export component MainWindow inherits Window {
     default-font-family: Theme.font;
     default-font-size: Theme.text-m;
 
+    // Startup.
+    in-out property <bool> loading: true;
+    in-out property <string> loading-label: "Loading games…";
+
     // Search and results.
     in-out property <string> query;
     in-out property <[Hit]> hits;
-    // "idle" | "ready" | "empty" | "unavailable"
+    // "idle" | "pending" | "ready" | "empty" | "unavailable"
     in-out property <string> results-state: "idle";
     in-out property <int> selected-index: -1;
     in-out property <string> db-status;
@@ -243,6 +290,14 @@ export component MainWindow inherits Window {
                     menu(index, x, y) => { root.open-menu(index, x, y); }
                     steam(id) => { root.open-steam(id); }
                 }
+                if root.results-state == "pending": VerticalLayout {
+                    alignment: start;
+                    spacing: 2px;
+                    SkeletonRow { name-width: 190px; }
+                    SkeletonRow { name-width: 140px; }
+                    SkeletonRow { name-width: 170px; }
+                    SkeletonRow { name-width: 120px; }
+                }
                 if root.results-state == "idle": Message {
                     logo: true;
                     title: "Pick a game.";
@@ -307,6 +362,15 @@ export component MainWindow inherits Window {
         x: (root.width - self.width) / 2;
         y: results.y + results.height - self.height - 14px + (root.toast-visible ? 0px : 6px);
         animate y { duration: Theme.normal; easing: ease-out; }
+    }
+
+    LoadingView {
+        y: 40px;
+        height: root.height - 40px;
+        label: root.loading-label;
+        opacity: root.loading ? 1 : 0;
+        visible: self.opacity > 0;
+        animate opacity { duration: 180ms; easing: ease-out; }
     }
 
     menu := PopupWindow {
