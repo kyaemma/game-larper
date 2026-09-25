@@ -14,6 +14,10 @@ use windows_sys::Win32::Graphics::Gdi::{
     DeleteObject, GetDC, GetMonitorInfoW, MONITOR_DEFAULTTONEAREST, MONITORINFO, MonitorFromWindow,
     ReleaseDC,
 };
+use windows_sys::Win32::System::DataExchange::{
+    CloseClipboard, EmptyClipboard, OpenClipboard, SetClipboardData,
+};
+use windows_sys::Win32::System::Memory::{GMEM_MOVEABLE, GlobalAlloc, GlobalLock, GlobalUnlock};
 use windows_sys::Win32::System::Registry::{
     HKEY, HKEY_CURRENT_USER, KEY_SET_VALUE, REG_SZ, RegCloseKey, RegDeleteValueW, RegOpenKeyExW,
     RegSetValueExW,
@@ -31,6 +35,7 @@ const RUN_KEY: &str = "Software\\Microsoft\\Windows\\CurrentVersion\\Run";
 const STARTUP_VALUE: &str = "GameLarper";
 const MUTEX_NAME: &str = "Local\\GameLarper.SingleInstance";
 const EVENT_NAME: &str = "Local\\GameLarper.Activate";
+const CF_UNICODETEXT: u32 = 13;
 /// DWM draws this 1px outline around both windows on Windows 11 (COLORREF, 0x00BBGGRR).
 const BORDER_COLOR: u32 = 0x003A_2F26;
 
@@ -182,6 +187,48 @@ pub fn work_area(hwnd: HWND) -> Option<WorkArea> {
         left: info.rcWork.left,
         right: info.rcWork.right,
     })
+}
+
+/// Put plain text on the clipboard. Retries briefly if another app holds it.
+pub fn copy_text(text: &str) -> Result<(), String> {
+    let wide = wide(text);
+    let bytes = std::mem::size_of_val(wide.as_slice());
+    let mut opened = false;
+    for _ in 0..5 {
+        if unsafe { OpenClipboard(std::ptr::null_mut()) } != 0 {
+            opened = true;
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(15));
+    }
+    if !opened {
+        return Err("The clipboard is busy.".into());
+    }
+    let result = unsafe {
+        EmptyClipboard();
+        let memory = GlobalAlloc(GMEM_MOVEABLE, bytes);
+        if memory.is_null() {
+            Err("Out of memory for the clipboard.".to_string())
+        } else {
+            let target = GlobalLock(memory) as *mut u16;
+            if target.is_null() {
+                windows_sys::Win32::Foundation::GlobalFree(memory);
+                Err("The clipboard could not be written.".to_string())
+            } else {
+                std::ptr::copy_nonoverlapping(wide.as_ptr(), target, wide.len());
+                GlobalUnlock(memory);
+                // On success the clipboard owns the memory.
+                if SetClipboardData(CF_UNICODETEXT, memory).is_null() {
+                    windows_sys::Win32::Foundation::GlobalFree(memory);
+                    Err("The clipboard could not be written.".to_string())
+                } else {
+                    Ok(())
+                }
+            }
+        }
+    };
+    unsafe { CloseClipboard() };
+    result
 }
 
 pub fn integrity_of(process: HANDLE) -> String {

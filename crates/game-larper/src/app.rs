@@ -514,6 +514,30 @@ fn wire(
     };
     ui.on_refresh_catalog(refresh.clone());
     panel.on_refresh_catalog(refresh);
+    ui.on_add_to_queue({
+        let session = session.clone();
+        let log = log.clone();
+        let wake = wake.clone();
+        let panel = panel.as_weak();
+        move |index| {
+            select_index(&session, &log, index as usize);
+            add_selected_to_queue(&session, &panel);
+            wake();
+        }
+    });
+    ui.on_copy_text({
+        let session = session.clone();
+        let wake = wake.clone();
+        move |value, label| {
+            if let Ok(mut session) = session.lock() {
+                match platform::copy_text(&value) {
+                    Ok(()) => toast_ok(&mut session, format!("{label} copied")),
+                    Err(error) => toast_err(&mut session, error),
+                }
+            }
+            wake();
+        }
+    });
     ui.on_notify({
         let session = session.clone();
         let wake = wake.clone();

@@ -2,7 +2,7 @@
 // Title bar, search, results, the current session, then a quiet utility row.
 
 import { Theme, Icons } from "theme.slint";
-import { LogoMark, CaptionButton, Hairline, Gutter } from "controls.slint";
+import { Icon, LogoMark, CaptionButton, Hairline, Gutter } from "controls.slint";
 import { Hit } from "models.slint";
 import { SearchField, ResultsList, Message } from "search.slint";
 import { SessionDock, UtilityBar, Toast } from "dock.slint";
@@ -51,6 +51,45 @@ component TitleBar inherits Rectangle {
             label: "Close";
             danger: true;
             clicked => { root.close(); }
+        }
+    }
+}
+
+component MenuItem inherits Rectangle {
+    in property <string> text;
+    in property <image> icon;
+    in property <bool> enabled: true;
+    in property <bool> highlighted;
+    callback activated();
+    height: 32px;
+    border-radius: Theme.radius-s;
+    background: root.enabled && (touch.has-hover || root.highlighted) ? Theme.fill-hover : transparent;
+    accessible-role: button;
+    accessible-label: root.text;
+    accessible-enabled: root.enabled;
+    accessible-action-default => { if (root.enabled) { root.activated(); } }
+    touch := TouchArea {
+        enabled: root.enabled;
+        clicked => { root.activated(); }
+    }
+    HorizontalLayout {
+        padding-left: 10px;
+        padding-right: 12px;
+        spacing: 10px;
+        VerticalLayout {
+            alignment: center;
+            Icon {
+                source: root.icon;
+                width: 14px;
+                height: 14px;
+                tint: root.enabled ? Theme.text-2 : Theme.text-3;
+            }
+        }
+        Text {
+            text: root.text;
+            color: root.enabled ? Theme.text : Theme.text-3;
+            font-size: Theme.text-m;
+            vertical-alignment: center;
         }
     }
 }
@@ -113,9 +152,32 @@ export component MainWindow inherits Window {
     callback queue-resume();
     callback toggle-queue();
     callback open-settings();
+    callback add-to-queue(int);
+    callback copy-text(string, string);
     callback notify(string);
     callback refresh-catalog();
     callback request-close();
+
+    // Row menu target.
+    property <int> menu-index: -1;
+    property <string> menu-steam;
+    property <string> menu-id;
+    property <length> menu-x;
+    property <length> menu-y;
+    property <int> menu-focus: -1;
+
+    function open-menu(index: int, x: length, y: length) {
+        if (index < 0 || index >= root.hits.length) {
+            return;
+        }
+        root.menu-index = index;
+        root.menu-steam = root.hits[index].steam-id;
+        root.menu-id = root.hits[index].id;
+        root.menu-x = x;
+        root.menu-y = y;
+        root.menu-focus = -1;
+        menu.show();
+    }
 
     function open-steam(steam-id: string) {
         if (steam-id != "" && !Platform.open-url("https://store.steampowered.com/app/" + steam-id + "/")) {
@@ -154,6 +216,11 @@ export component MainWindow inherits Window {
                     }
                 }
                 step(delta) => { root.step(delta); }
+                menu => {
+                    if (root.selected-index >= 0) {
+                        root.open-menu(root.selected-index, search.absolute-position.x + search.width - 220px, search.absolute-position.y + search.height + 6px);
+                    }
+                }
             }
             Gutter { }
         }
@@ -173,6 +240,7 @@ export component MainWindow inherits Window {
                     animate opacity { duration: Theme.normal; easing: ease-out; }
                     select(index) => { root.choose(index); }
                     play(index) => { root.activate(index); }
+                    menu(index, x, y) => { root.open-menu(index, x, y); }
                     steam(id) => { root.open-steam(id); }
                 }
                 if root.results-state == "idle": Message {
@@ -239,5 +307,95 @@ export component MainWindow inherits Window {
         x: (root.width - self.width) / 2;
         y: results.y + results.height - self.height - 14px + (root.toast-visible ? 0px : 6px);
         animate y { duration: Theme.normal; easing: ease-out; }
+    }
+
+    menu := PopupWindow {
+        x: max(8px, min(root.menu-x, root.width - self.width - 8px));
+        y: min(root.menu-y, root.height - self.height - 8px);
+        width: 216px;
+        Rectangle {
+            background: Theme.raised;
+            border-radius: Theme.radius-m;
+            border-width: 1px;
+            border-color: Theme.border;
+            drop-shadow-blur: 20px;
+            drop-shadow-offset-y: 6px;
+            drop-shadow-color: #00000080;
+        }
+        FocusScope {
+            init => { self.focus(); }
+            key-pressed(event) => {
+                if (event.text == Key.Escape) {
+                    menu.close();
+                    return accept;
+                }
+                if (event.text == Key.DownArrow) {
+                    root.menu-focus = mod(root.menu-focus + 1, root.menu-steam != "" ? 5 : 3);
+                    return accept;
+                }
+                if (event.text == Key.UpArrow) {
+                    root.menu-focus = root.menu-focus <= 0 ? (root.menu-steam != "" ? 4 : 2) : root.menu-focus - 1;
+                    return accept;
+                }
+                if (event.text == Key.Return || event.text == Key.Space) {
+                    if (root.menu-focus == 0) {
+                        root.activate(root.menu-index);
+                    } else if (root.menu-focus == 1) {
+                        root.add-to-queue(root.menu-index);
+                    } else if (root.menu-steam != "" && root.menu-focus == 2) {
+                        root.open-steam(root.menu-steam);
+                    } else if (root.menu-steam != "" && root.menu-focus == 3) {
+                        root.copy-text(root.menu-steam, "Steam AppID");
+                    } else if (root.menu-focus >= 2) {
+                        root.copy-text(root.menu-id, "Discord App ID");
+                    }
+                    menu.close();
+                    return accept;
+                }
+                reject
+            }
+            VerticalLayout {
+                padding: 4px;
+                spacing: 0px;
+                MenuItem {
+                    text: "Play";
+                    icon: Icons.play;
+                    enabled: !root.play-blocked && !(root.session-mode == "playing" && root.menu-index == root.selected-index);
+                    highlighted: root.menu-focus == 0;
+                    activated => { root.activate(root.menu-index); }
+                }
+                MenuItem {
+                    text: "Add to queue";
+                    icon: Icons.plus;
+                    highlighted: root.menu-focus == 1;
+                    activated => { root.add-to-queue(root.menu-index); }
+                }
+                Rectangle {
+                    height: 9px;
+                    Rectangle {
+                        height: 1px;
+                        background: Theme.border;
+                    }
+                }
+                if root.menu-steam != "": MenuItem {
+                    text: "Open on Steam";
+                    icon: Icons.external;
+                    highlighted: root.menu-focus == 2;
+                    activated => { root.open-steam(root.menu-steam); }
+                }
+                if root.menu-steam != "": MenuItem {
+                    text: "Copy Steam AppID";
+                    icon: Icons.copy;
+                    highlighted: root.menu-focus == 3;
+                    activated => { root.copy-text(root.menu-steam, "Steam AppID"); }
+                }
+                MenuItem {
+                    text: "Copy Discord App ID";
+                    icon: Icons.copy;
+                    highlighted: root.menu-focus == (root.menu-steam != "" ? 4 : 2);
+                    activated => { root.copy-text(root.menu-id, "Discord App ID"); }
+                }
+            }
+        }
     }
 }

@@ -9,6 +9,7 @@ export component SearchField inherits Rectangle {
     callback edited(string);
     callback accepted();
     callback step(int);
+    callback menu();
 
     public function clear() {
         input.text = "";
@@ -52,6 +53,10 @@ export component SearchField inherits Rectangle {
             }
             if (event.text == Key.Escape && input.text != "") {
                 root.clear();
+                return accept;
+            }
+            if (event.text == Key.Menu || (event.text == Key.F10 && event.modifiers.shift)) {
+                root.menu();
                 return accept;
             }
             reject
@@ -142,6 +147,7 @@ component ResultRow inherits Rectangle {
     in property <bool> can-play: true;
     callback select();
     callback play();
+    callback menu(length, length);
     callback steam();
 
     height: 56px;
@@ -159,6 +165,12 @@ component ResultRow inherits Rectangle {
     touch := TouchArea {
         clicked => { root.select(); }
         double-clicked => { root.play(); }
+        pointer-event(event) => {
+            if (event.button == PointerEventButton.right && event.kind == PointerEventKind.up) {
+                root.select();
+                root.menu(root.absolute-position.x + self.mouse-x, root.absolute-position.y + self.mouse-y);
+            }
+        }
         HorizontalLayout {
             padding-left: 8px;
             padding-right: 8px;
@@ -191,6 +203,17 @@ component ResultRow inherits Rectangle {
                 spacing: 4px;
                 opacity: root.active ? 1 : 0;
                 animate opacity { duration: Theme.quick; }
+                VerticalLayout {
+                    alignment: center;
+                    more := IconButton {
+                        icon: Icons.more;
+                        tip: "More";
+                        clicked => {
+                            root.select();
+                            root.menu(self.absolute-position.x + self.width - 216px, self.absolute-position.y + self.height + 4px);
+                        }
+                    }
+                }
                 VerticalLayout {
                     alignment: center;
                     Rectangle {
@@ -273,6 +296,7 @@ export component ResultsList inherits Rectangle {
     in property <bool> blocked;
     callback select(int);
     callback play(int);
+    callback menu(int, length, length);
     callback steam(string);
 
     property <length> row-height: 58px;
@@ -302,6 +326,7 @@ export component ResultsList inherits Rectangle {
             can-play: !root.blocked && hit.id != root.playing-id;
             select => { root.select(index); }
             play => { root.play(index); }
+            menu(x, y) => { root.menu(index, x, y); }
             steam => { root.steam(hit.steam-id); }
         }
     }
