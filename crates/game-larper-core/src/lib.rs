@@ -1,4 +1,5 @@
-//! Domain logic for Game Larper: catalog, search, path safety, config, and session.
+//! Domain logic for Game Larper: catalog, search, path safety, config, session, and queue.
+//! Windows process ownership and the Slint UI live in the other crates.
 
 #![deny(unsafe_op_in_unsafe_fn)]
 
@@ -7,6 +8,7 @@ mod catalog;
 mod config;
 mod error;
 mod paths;
+mod queue;
 mod safe_path;
 mod search;
 mod session;
@@ -19,6 +21,10 @@ pub use catalog::{
 pub use config::{AppConfig, ConfigStore, SCHEMA_VERSION, format_startup_command};
 pub use error::Error;
 pub use paths::AppPaths;
+pub use queue::{
+    DEFAULT_TRANSITION_GAP, MAX_QUEUE_ITEMS, QueueAction, QueueActivity, QueueItem, QueueMachine,
+    QueueSnapshot, load_queue, save_queue, unix_time_ms,
+};
 pub use safe_path::{normalize_executable, resolve_executable};
 pub use search::{DEFAULT_SEARCH_LIMIT, normalize_query, search};
 pub use session::{SessionClock, SessionState, format_hms};
