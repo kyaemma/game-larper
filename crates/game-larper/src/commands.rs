@@ -75,9 +75,10 @@ fn begin_stop(
     clear_manual: bool,
 ) {
     let action = session.lock().ok().map(|mut guard| {
-        let _ = clear_manual;
-        let action = guard.queue.stop();
+        let mut action = guard.queue.stop();
         guard.clock.stop();
+        // The queue only reports its own runner. A manual session owns one too.
+        action.stop_runner |= clear_manual;
         action
     });
     if let Some(action) = action {
