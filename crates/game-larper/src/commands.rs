@@ -747,7 +747,7 @@ fn queue_line(session: &Session) -> String {
     match session.queue.activity() {
         QueueActivity::Scheduled { at_unix_ms } => format!("Starts {}", format_unix(at_unix_ms)),
         QueueActivity::Missed { at_unix_ms } => {
-            format!("Missed the {} start", format_unix(at_unix_ms))
+            format!("Missed start · {}", format_unix(at_unix_ms))
         }
         QueueActivity::Failed { message, .. } => message,
         _ => String::new(),
@@ -761,9 +761,10 @@ fn queue_state(session: &Session) -> (&'static str, String) {
         QueueActivity::Scheduled { at_unix_ms } => {
             ("scheduled", format!("Starts {}", format_unix(at_unix_ms)))
         }
-        QueueActivity::Missed { at_unix_ms } => {
-            ("missed", format!("Missed {}", format_unix(at_unix_ms)))
-        }
+        QueueActivity::Missed { at_unix_ms } => (
+            "missed",
+            format!("Missed start · {}", format_unix(at_unix_ms)),
+        ),
         QueueActivity::Running { index } => {
             ("running", format!("Playing {} of {count}", index + 1))
         }
@@ -874,14 +875,20 @@ fn group_digits(value: usize) -> String {
     grouped
 }
 
+/// "today at 23:59", "tomorrow at 08:00", or "Sat 27 Sep at 08:00".
 fn format_unix(millis: i64) -> String {
-    chrono::DateTime::from_timestamp_millis(millis)
-        .map(|time| {
-            time.with_timezone(&Local)
-                .format("%Y-%m-%d %H:%M")
-                .to_string()
-        })
-        .unwrap_or_else(|| "unknown".into())
+    let Some(time) = chrono::DateTime::from_timestamp_millis(millis) else {
+        return "unknown".into();
+    };
+    let time = time.with_timezone(&Local);
+    let today = Local::now().date_naive();
+    let day = match (time.date_naive() - today).num_days() {
+        0 => "today".to_string(),
+        1 => "tomorrow".to_string(),
+        -1 => "yesterday".to_string(),
+        _ => time.format("%a %-d %b").to_string(),
+    };
+    format!("{day} at {}", time.format("%H:%M"))
 }
 
 fn runner_template() -> Result<PathBuf, String> {

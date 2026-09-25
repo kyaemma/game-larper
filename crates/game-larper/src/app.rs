@@ -1238,3 +1238,39 @@ fn apply_message(
 }
 
 include!("commands.rs");
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn groups_thousands() {
+        assert_eq!(group_digits(7), "7");
+        assert_eq!(group_digits(999), "999");
+        assert_eq!(group_digits(10_431), "10,431");
+        assert_eq!(group_digits(1_234_567), "1,234,567");
+    }
+
+    #[test]
+    fn short_durations_drop_empty_hours() {
+        assert_eq!(format_short(Duration::from_secs(0)), "0:00");
+        assert_eq!(format_short(Duration::from_secs(12 * 60 + 4)), "12:04");
+        assert_eq!(format_short(Duration::from_secs(3723)), "1:02:03");
+    }
+
+    #[test]
+    fn minutes_round_up_and_read_naturally() {
+        assert_eq!(format_minutes(Duration::from_secs(45 * 60)), "45 min");
+        assert_eq!(format_minutes(Duration::from_secs(59 * 60 + 1)), "1 h");
+        assert_eq!(format_minutes(Duration::from_secs(90 * 60)), "1 h 30 min");
+    }
+
+    #[test]
+    fn model_sync_updates_rows_in_place() {
+        let model = VecModel::from(vec![1, 2, 3]);
+        sync_model(&model, vec![1, 5, 3]);
+        assert_eq!(model.iter().collect::<Vec<_>>(), vec![1, 5, 3]);
+        sync_model(&model, vec![4]);
+        assert_eq!(model.iter().collect::<Vec<_>>(), vec![4]);
+    }
+}
