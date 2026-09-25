@@ -1,0 +1,48 @@
+[package]
+name = "game-larper"
+version.workspace = true
+edition.workspace = true
+publish.workspace = true
+rust-version.workspace = true
+
+[[bin]]
+name = "game-larper"
+path = "src/main.rs"
+
+[dependencies]
+game-larper-core = { path = "../game-larper-core" }
+slint = { version = "~1.18.1", default-features = false, features = [
+    "compat-1-18",
+    "std",
+    "backend-winit",
+    "renderer-femtovg",
+    "system-tray",
+    "accessibility",
+    "raw-window-handle-06",
+] }
+serde.workspace = true
+serde_json.workspace = true
+ureq = "2.12"
+image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
+chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
+raw-window-handle = "0.6"
+windows-sys = { workspace = true, features = [
+    "Win32_Foundation",
+    "Win32_Graphics_Dwm",
+    "Win32_Graphics_Gdi",
+    "Win32_Security",
+    "Win32_Storage_FileSystem",
+    "Win32_System_JobObjects",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Registry",
+    "Win32_System_Threading",
+    "Win32_UI_Shell",
+    "Win32_UI_WindowsAndMessaging",
+] }
+
+[build-dependencies]
+slint-build = { version = "~1.18.1", default-features = false, features = ["compat-1-18"] }
+winresource = "0.1"
+
+[lints]
+workspace = true
