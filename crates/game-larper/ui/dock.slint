@@ -1,0 +1,315 @@
+// The bottom of the main window: the current session, the utility row, and toasts.
+
+import { Theme, Icons } from "theme.slint";
+import { Icon, Button, IconButton, Art, Gutter } from "controls.slint";
+
+export component SessionDock inherits Rectangle {
+    in property <image> art;
+    in property <string> name;
+    in property <string> state-label;
+    in property <color> state-color;
+    // "stopped" | "playing" | "paused"
+    in property <string> mode;
+    in property <string> time;
+    in property <string> note;
+    in property <bool> play-enabled;
+    in property <bool> pause-enabled;
+    in property <bool> stop-enabled;
+    in property <string> play-label;
+    callback play();
+    callback pause();
+    callback stop();
+
+    background: Theme.bg-alt;
+    vertical-stretch: 0;
+    HorizontalLayout {
+        Gutter { }
+        HorizontalLayout {
+            horizontal-stretch: 100;
+            max-width: 680px;
+            padding-top: 16px;
+            padding-bottom: 16px;
+            spacing: 14px;
+            VerticalLayout {
+                alignment: start;
+                Art {
+                    source: root.art;
+                    width: 56px;
+                    height: 56px;
+                }
+            }
+            VerticalLayout {
+                horizontal-stretch: 1;
+                alignment: start;
+                spacing: 0px;
+                HorizontalLayout {
+                    spacing: 16px;
+                    Text {
+                        text: root.name;
+                        color: Theme.text;
+                        font-size: 15px;
+                        font-weight: 600;
+                        overflow: elide;
+                        horizontal-stretch: 1;
+                        vertical-alignment: center;
+                    }
+                    if root.mode != "stopped": Text {
+                        text: root.time;
+                        color: root.mode == "playing" ? Theme.text : Theme.text-2;
+                        font-size: 17px;
+                        font-weight: 600;
+                        horizontal-alignment: right;
+                        vertical-alignment: center;
+                        accessible-role: AccessibleRole.text;
+                        accessible-label: "Elapsed " + root.time;
+                    }
+                }
+                HorizontalLayout {
+                    padding-top: 4px;
+                    spacing: 7px;
+                    alignment: start;
+                    VerticalLayout {
+                        alignment: center;
+                        Rectangle {
+                            width: 7px;
+                            height: 7px;
+                            border-radius: 3.5px;
+                            background: root.state-color;
+                            animate background { duration: Theme.normal; }
+                        }
+                    }
+                    Text {
+                        text: root.state-label;
+                        color: root.mode == "stopped" ? Theme.text-2 : root.state-color;
+                        font-size: Theme.text-s;
+                        font-weight: 600;
+                        vertical-alignment: center;
+                    }
+                    if root.note != "": Text {
+                        text: "·  " + root.note;
+                        color: Theme.text-3;
+                        font-size: Theme.text-s;
+                        vertical-alignment: center;
+                        overflow: elide;
+                    }
+                }
+                HorizontalLayout {
+                    padding-top: 12px;
+                    spacing: 8px;
+                    alignment: start;
+                    if root.mode != "playing": Button {
+                        kind: "primary";
+                        icon: Icons.play;
+                        text: root.play-label;
+                        enabled: root.play-enabled;
+                        min-width: 96px;
+                        clicked => { root.play(); }
+                    }
+                    if root.mode == "playing": Button {
+                        icon: Icons.pause;
+                        text: "Pause";
+                        enabled: root.pause-enabled;
+                        min-width: 96px;
+                        clicked => { root.pause(); }
+                    }
+                    if root.mode != "stopped": Button {
+                        icon: Icons.stop;
+                        text: "Stop";
+                        kind: "ghost";
+                        enabled: root.stop-enabled;
+                        clicked => { root.stop(); }
+                    }
+                }
+            }
+        }
+        Gutter { }
+    }
+}
+
+component QueueButton inherits Rectangle {
+    in property <int> count;
+    in property <bool> checked;
+    callback clicked();
+    height: 32px;
+    width: layout.preferred-width;
+    border-radius: Theme.radius;
+    background: root.checked ? Theme.accent-tint : touch.pressed ? Theme.press : touch.has-hover ? Theme.hover : transparent;
+    animate background { duration: Theme.quick; }
+    accessible-role: button;
+    accessible-label: "Queue, " + root.count + " items";
+    accessible-action-default => { root.clicked(); }
+    focus := FocusScope {
+        focus-on-click: false;
+        key-pressed(event) => {
+            if (event.text == Key.Return || event.text == Key.Space) {
+                root.clicked();
+                return accept;
+            }
+            reject
+        }
+    }
+    touch := TouchArea {
+        mouse-cursor: pointer;
+        clicked => { root.clicked(); }
+    }
+    layout := HorizontalLayout {
+        padding-left: 10px;
+        padding-right: 10px;
+        spacing: 8px;
+        VerticalLayout {
+            alignment: center;
+            Icon {
+                source: Icons.queue;
+                tint: root.checked ? Theme.accent-soft : touch.has-hover ? Theme.text : Theme.text-2;
+            }
+        }
+        Text {
+            text: "Queue";
+            color: root.checked ? Theme.accent-soft : touch.has-hover ? Theme.text : Theme.text-2;
+            font-size: Theme.text-m;
+            font-weight: 600;
+            vertical-alignment: center;
+        }
+        if root.count > 0: VerticalLayout {
+            alignment: center;
+            Rectangle {
+                height: 17px;
+                width: max(17px, count-text.preferred-width + 10px);
+                border-radius: 8.5px;
+                background: root.checked ? Theme.accent : Theme.fill-hover;
+                count-text := Text {
+                    text: root.count;
+                    color: Theme.text;
+                    font-size: Theme.text-xs;
+                    font-weight: 700;
+                    horizontal-alignment: center;
+                    vertical-alignment: center;
+                }
+            }
+        }
+    }
+    Rectangle {
+        x: -3px;
+        y: -3px;
+        width: parent.width + 6px;
+        height: parent.height + 6px;
+        border-radius: Theme.radius + 3px;
+        border-width: 2px;
+        border-color: focus.has-focus ? Theme.accent-soft.with-alpha(0.7) : transparent;
+    }
+}
+
+export component UtilityBar inherits Rectangle {
+    in property <int> queue-count;
+    in property <string> queue-line;
+    in property <bool> queue-open;
+    in property <bool> settings-open;
+    in property <string> db-status;
+    in property <color> db-color;
+    callback queue();
+    callback settings();
+
+    height: 48px;
+    background: Theme.bg-alt;
+    HorizontalLayout {
+      Gutter { min-width: 10px; }
+      HorizontalLayout {
+        horizontal-stretch: 100;
+        max-width: 698px;
+        spacing: 8px;
+        VerticalLayout {
+            alignment: center;
+            QueueButton {
+                count: root.queue-count;
+                checked: root.queue-open;
+                clicked => { root.queue(); }
+            }
+        }
+        Text {
+            text: root.queue-line;
+            color: Theme.text-3;
+            font-size: Theme.text-s;
+            vertical-alignment: center;
+            overflow: elide;
+            horizontal-stretch: 1;
+        }
+        if root.db-status != "": HorizontalLayout {
+            spacing: 6px;
+            VerticalLayout {
+                alignment: center;
+                Rectangle {
+                    width: 6px;
+                    height: 6px;
+                    border-radius: 3px;
+                    background: root.db-color;
+                }
+            }
+            Text {
+                text: root.db-status;
+                color: Theme.text-3;
+                font-size: Theme.text-s;
+                vertical-alignment: center;
+            }
+        }
+        VerticalLayout {
+            alignment: center;
+            IconButton {
+                icon: Icons.settings;
+                tip: "Settings";
+                tip-above: true;
+                checked: root.settings-open;
+                clicked => { root.settings(); }
+            }
+        }
+      }
+      Gutter { min-width: 8px; }
+    }
+}
+
+export component Toast inherits Rectangle {
+    in property <string> text;
+    in property <bool> shown;
+    // "info" | "success" | "error"
+    in property <string> kind;
+
+    height: 36px;
+    width: min(layout.preferred-width, 440px);
+    border-radius: Theme.radius-m;
+    background: Theme.raised;
+    border-width: 1px;
+    border-color: Theme.border;
+    drop-shadow-blur: 18px;
+    drop-shadow-offset-y: 4px;
+    drop-shadow-color: #00000070;
+    opacity: root.shown ? 1 : 0;
+    animate opacity { duration: Theme.normal; easing: ease-out; }
+    accessible-role: AccessibleRole.text;
+    accessible-label: root.text;
+    layout := HorizontalLayout {
+        padding-left: 12px;
+        padding-right: 14px;
+        spacing: 9px;
+        VerticalLayout {
+            alignment: center;
+            if root.kind == "success": Icon {
+                source: Icons.check;
+                width: 14px;
+                height: 14px;
+                tint: Theme.success;
+            }
+            if root.kind != "success": Rectangle {
+                width: 7px;
+                height: 7px;
+                border-radius: 3.5px;
+                background: root.kind == "error" ? Theme.danger : Theme.accent-soft;
+            }
+        }
+        Text {
+            text: root.text;
+            color: Theme.text;
+            font-size: Theme.text-m;
+            vertical-alignment: center;
+            overflow: elide;
+        }
+    }
+}
