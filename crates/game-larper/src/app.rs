@@ -971,5 +971,4 @@ fn apply_message(
     }
 }
 
-
 include!("commands.rs");
