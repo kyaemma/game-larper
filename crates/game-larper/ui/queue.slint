@@ -1,0 +1,442 @@
+// Queue content for the side panel: controls, the list, adding, and the one-shot schedule.
+
+import { Theme, Icons } from "theme.slint";
+import { Icon, Button, IconButton, TextField, Chip, Art, SectionLabel, Hairline } from "controls.slint";
+import { QueueRow } from "models.slint";
+
+component QueueItem inherits Rectangle {
+    in property <QueueRow> item;
+    in property <int> index;
+    in property <bool> first;
+    in property <bool> last;
+    callback up();
+    callback down();
+    callback remove();
+
+    property <bool> show-actions: touch.has-hover || up-button.has-focus || down-button.has-focus || remove-button.has-focus;
+
+    height: 48px;
+    border-radius: Theme.radius;
+    background: root.item.active ? Theme.accent-tint : touch.has-hover ? Theme.hover : transparent;
+    animate background { duration: Theme.quick; }
+    accessible-role: list-item;
+    accessible-label: root.item.name + ", " + root.item.meta;
+
+    touch := TouchArea {
+        HorizontalLayout {
+            padding-left: 6px;
+            padding-right: 4px;
+            spacing: 10px;
+            Text {
+                width: 14px;
+                text: root.index + 1;
+                color: root.item.active ? Theme.accent-soft : Theme.text-3;
+                font-size: Theme.text-s;
+                font-weight: 600;
+                horizontal-alignment: center;
+                vertical-alignment: center;
+            }
+            VerticalLayout {
+                alignment: center;
+                Art {
+                    source: root.item.art;
+                    width: 32px;
+                    height: 32px;
+                }
+            }
+            VerticalLayout {
+                alignment: center;
+                spacing: 1px;
+                horizontal-stretch: 1;
+                Text {
+                    text: root.item.name;
+                    color: Theme.text;
+                    font-size: Theme.text-m;
+                    font-weight: 600;
+                    overflow: elide;
+                }
+                Text {
+                    text: root.item.meta;
+                    color: root.item.active ? Theme.accent-soft : Theme.text-3;
+                    font-size: Theme.text-s;
+                }
+            }
+            HorizontalLayout {
+                spacing: 0px;
+                opacity: root.show-actions ? 1 : 0;
+                animate opacity { duration: Theme.quick; }
+                VerticalLayout {
+                    alignment: center;
+                    up-button := IconButton {
+                        width: 26px;
+                        height: 26px;
+                        icon-size: 14px;
+                        icon: Icons.chevron-up;
+                        tip: "Move up";
+                        enabled: !root.first;
+                        clicked => { root.up(); }
+                    }
+                }
+                VerticalLayout {
+                    alignment: center;
+                    down-button := IconButton {
+                        width: 26px;
+                        height: 26px;
+                        icon-size: 14px;
+                        icon: Icons.chevron-down;
+                        tip: "Move down";
+                        enabled: !root.last;
+                        clicked => { root.down(); }
+                    }
+                }
+                VerticalLayout {
+                    alignment: center;
+                    remove-button := IconButton {
+                        width: 26px;
+                        height: 26px;
+                        icon-size: 12px;
+                        icon: Icons.close;
+                        tip: "Remove";
+                        hover-tint: Theme.danger;
+                        clicked => { root.remove(); }
+                    }
+                }
+            }
+        }
+    }
+}
+
+export component QueueView inherits VerticalLayout {
+    in property <[QueueRow]> rows;
+    // "idle" | "scheduled" | "missed" | "running" | "paused" | "transition" | "failed"
+    in property <string> state;
+    in property <string> status;
+    in property <string> summary;
+    in property <bool> has-selection;
+    in property <string> selected-name;
+    in property <image> selected-art;
+    in-out property <string> minutes;
+    in-out property <string> schedule-date;
+    in-out property <string> schedule-time;
+    in property <bool> armed;
+    callback add();
+    callback up(int);
+    callback down(int);
+    callback remove(int);
+    callback clear();
+    callback start();
+    callback pause();
+    callback resume();
+    callback skip();
+    callback stop();
+    callback arm();
+    callback disarm();
+
+    property <bool> live: root.state == "running" || root.state == "paused" || root.state == "transition";
+    property <bool> schedule-open: root.armed;
+
+    spacing: 0px;
+
+    // Status and the controls that matter right now.
+    VerticalLayout {
+        padding-left: 20px;
+        padding-right: 20px;
+        padding-bottom: 14px;
+        spacing: 12px;
+        HorizontalLayout {
+            spacing: 7px;
+            VerticalLayout {
+                alignment: center;
+                Rectangle {
+                    width: 7px;
+                    height: 7px;
+                    border-radius: 3.5px;
+                    background: root.state == "running" || root.state == "transition" ? Theme.success
+                        : root.state == "paused" || root.state == "scheduled" ? Theme.warning
+                        : root.state == "failed" || root.state == "missed" ? Theme.danger
+                        : Theme.text-3;
+                }
+            }
+            Text {
+                text: root.status;
+                color: Theme.text-2;
+                font-size: Theme.text-s;
+                font-weight: 600;
+                vertical-alignment: center;
+                overflow: elide;
+                horizontal-stretch: 1;
+            }
+            Text {
+                text: root.summary;
+                color: Theme.text-3;
+                font-size: Theme.text-s;
+                vertical-alignment: center;
+            }
+        }
+        HorizontalLayout {
+            spacing: 8px;
+            if !root.live: Button {
+                kind: "primary";
+                icon: Icons.play;
+                text: "Start queue";
+                enabled: root.rows.length > 0;
+                horizontal-stretch: 1;
+                clicked => { root.start(); }
+            }
+            if !root.live: Button {
+                kind: "ghost";
+                icon: Icons.trash;
+                text: "Clear";
+                enabled: root.rows.length > 0;
+                clicked => { root.clear(); }
+            }
+            if root.state == "paused": Button {
+                kind: "primary";
+                icon: Icons.play;
+                text: "Resume";
+                horizontal-stretch: 1;
+                clicked => { root.resume(); }
+            }
+            if root.state == "running" || root.state == "transition": Button {
+                icon: Icons.pause;
+                text: "Pause";
+                horizontal-stretch: 1;
+                clicked => { root.pause(); }
+            }
+            if root.live: Button {
+                kind: "ghost";
+                icon: Icons.skip;
+                text: "Skip";
+                clicked => { root.skip(); }
+            }
+            if root.live: Button {
+                kind: "ghost";
+                icon: Icons.stop;
+                text: "Stop";
+                clicked => { root.stop(); }
+            }
+        }
+    }
+
+    Hairline { }
+
+    // The list.
+    Rectangle {
+        vertical-stretch: 1;
+        min-height: 120px;
+        if root.rows.length == 0: VerticalLayout {
+            alignment: center;
+            spacing: 4px;
+            padding-left: 28px;
+            padding-right: 28px;
+            padding-bottom: 12px;
+            Text {
+                text: "Nothing queued yet";
+                color: Theme.text-2;
+                font-size: Theme.text-m;
+                font-weight: 600;
+                horizontal-alignment: center;
+            }
+            Text {
+                text: "Pick a game, choose how long, add it below.";
+                color: Theme.text-3;
+                font-size: Theme.text-s;
+                horizontal-alignment: center;
+                wrap: word-wrap;
+            }
+        }
+        flick := Flickable {
+            content-height: root.rows.length * 50px + 16px;
+            for row[index] in root.rows: QueueItem {
+                x: 10px;
+                y: 8px + index * 50px;
+                width: flick.width - 20px;
+                item: row;
+                index: index;
+                first: index == 0;
+                last: index == root.rows.length - 1;
+                up => { root.up(index); }
+                down => { root.down(index); }
+                remove => { root.remove(index); }
+            }
+        }
+    }
+
+    Hairline { }
+
+    // Add the selected game.
+    VerticalLayout {
+        padding-left: 20px;
+        padding-right: 20px;
+        padding-top: 14px;
+        padding-bottom: 14px;
+        spacing: 10px;
+        HorizontalLayout {
+            spacing: 10px;
+            if root.has-selection: VerticalLayout {
+                alignment: center;
+                Art {
+                    source: root.selected-art;
+                    width: 30px;
+                    height: 30px;
+                }
+            }
+            VerticalLayout {
+                alignment: center;
+                spacing: 1px;
+                horizontal-stretch: 1;
+                SectionLabel { text: "ADD TO QUEUE"; }
+                Text {
+                    text: root.has-selection ? root.selected-name : "Select a game in the main window.";
+                    color: root.has-selection ? Theme.text : Theme.text-3;
+                    font-size: Theme.text-m;
+                    font-weight: root.has-selection ? 600 : 400;
+                    overflow: elide;
+                }
+            }
+            VerticalLayout {
+                alignment: center;
+                Button {
+                    kind: "primary";
+                    icon: Icons.plus;
+                    text: "Add";
+                    enabled: root.has-selection;
+                    clicked => { root.add(); }
+                }
+            }
+        }
+        HorizontalLayout {
+            spacing: 6px;
+            Chip {
+                text: "15m";
+                checked: root.minutes == "15";
+                clicked => { root.minutes = "15"; }
+            }
+            Chip {
+                text: "30m";
+                checked: root.minutes == "30";
+                clicked => { root.minutes = "30"; }
+            }
+            Chip {
+                text: "1h";
+                checked: root.minutes == "60";
+                clicked => { root.minutes = "60"; }
+            }
+            Chip {
+                text: "2h";
+                checked: root.minutes == "120";
+                clicked => { root.minutes = "120"; }
+            }
+            Rectangle { horizontal-stretch: 1; }
+            TextField {
+                height: 28px;
+                width: 52px;
+                horizontal-stretch: 0;
+                text <=> root.minutes;
+                placeholder: "min";
+                input-type: number;
+                align: center;
+                accepted => { root.add(); }
+            }
+            Text {
+                text: "min";
+                color: Theme.text-3;
+                font-size: Theme.text-s;
+                vertical-alignment: center;
+            }
+        }
+    }
+
+    Hairline { }
+
+    // One-shot scheduled start, tucked away until needed.
+    VerticalLayout {
+        padding-left: 12px;
+        padding-right: 12px;
+        padding-top: 6px;
+        padding-bottom: 8px;
+        spacing: 4px;
+        Rectangle {
+            height: 36px;
+            border-radius: Theme.radius;
+            background: disclose.has-hover ? Theme.hover : transparent;
+            accessible-role: button;
+            accessible-label: "Schedule start";
+            accessible-expandable: true;
+            accessible-expanded: root.schedule-open;
+            accessible-action-default => { root.schedule-open = !root.schedule-open; }
+            disclose := TouchArea {
+                mouse-cursor: pointer;
+                clicked => { root.schedule-open = !root.schedule-open; }
+            }
+            HorizontalLayout {
+                padding-left: 8px;
+                padding-right: 8px;
+                spacing: 10px;
+                VerticalLayout {
+                    alignment: center;
+                    Icon {
+                        source: Icons.clock;
+                        width: 15px;
+                        height: 15px;
+                        tint: root.armed ? Theme.warning : Theme.text-2;
+                    }
+                }
+                Text {
+                    text: root.armed ? "Scheduled" : "Schedule start";
+                    color: Theme.text;
+                    font-size: Theme.text-m;
+                    vertical-alignment: center;
+                    horizontal-stretch: 1;
+                }
+                VerticalLayout {
+                    alignment: center;
+                    Icon {
+                        source: root.schedule-open ? Icons.chevron-up : Icons.chevron-down;
+                        width: 14px;
+                        height: 14px;
+                        tint: Theme.text-3;
+                    }
+                }
+            }
+        }
+        if root.schedule-open: VerticalLayout {
+            padding-left: 8px;
+            padding-right: 8px;
+            padding-bottom: 10px;
+            spacing: 8px;
+            HorizontalLayout {
+                spacing: 8px;
+                TextField {
+                    text <=> root.schedule-date;
+                    placeholder: "YYYY-MM-DD";
+                    horizontal-stretch: 1;
+                    accepted => { root.arm(); }
+                }
+                TextField {
+                    text <=> root.schedule-time;
+                    placeholder: "HH:MM";
+                    width: 72px;
+                    horizontal-stretch: 0;
+                    align: center;
+                    accepted => { root.arm(); }
+                }
+                if !root.armed: Button {
+                    text: "Arm";
+                    clicked => { root.arm(); }
+                }
+                if root.armed: Button {
+                    text: "Disarm";
+                    kind: "danger";
+                    clicked => { root.disarm(); }
+                }
+            }
+            Text {
+                text: "The whole queue starts once at this local time. Game Larper has to be running.";
+                color: Theme.text-3;
+                font-size: Theme.text-s;
+                wrap: word-wrap;
+            }
+        }
+    }
+}

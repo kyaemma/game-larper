@@ -1,0 +1,18 @@
+// Presentation models filled by Rust.
+
+export struct Hit {
+    // Discord application id.
+    id: string,
+    // Empty when the catalog knows no Steam app.
+    steam-id: string,
+    name: string,
+    art: image,
+    selected: bool,
+}
+
+export struct QueueRow {
+    name: string,
+    meta: string,
+    art: image,
+    active: bool,
+}

@@ -1,0 +1,206 @@
+// Settings content for the side panel. Values stay staged until Save.
+
+import { Theme } from "theme.slint";
+import { LogoMark, Button, Toggle, SectionLabel } from "controls.slint";
+
+component Section inherits HorizontalLayout {
+    in property <string> text;
+    padding-left: 10px;
+    padding-top: 14px;
+    padding-bottom: 4px;
+    SectionLabel { text: root.text; }
+}
+
+component SettingRow inherits Rectangle {
+    in property <string> label;
+    in property <string> hint;
+    in-out property <bool> checked;
+    callback toggled(bool);
+
+    min-height: root.hint == "" ? 38px : 48px;
+    border-radius: Theme.radius;
+    background: touch.has-hover ? Theme.hover : transparent;
+    animate background { duration: Theme.quick; }
+    touch := TouchArea {
+        clicked => { toggle.flip(); }
+    }
+    HorizontalLayout {
+        padding-left: 10px;
+        padding-right: 10px;
+        spacing: 12px;
+        VerticalLayout {
+            alignment: center;
+            spacing: 2px;
+            horizontal-stretch: 1;
+            Text {
+                text: root.label;
+                color: Theme.text;
+                font-size: Theme.text-m;
+                wrap: word-wrap;
+            }
+            if root.hint != "": Text {
+                text: root.hint;
+                color: Theme.text-3;
+                font-size: Theme.text-s;
+                wrap: word-wrap;
+            }
+        }
+        VerticalLayout {
+            alignment: center;
+            toggle := Toggle {
+                label: root.label;
+                checked <=> root.checked;
+                toggled(value) => { root.toggled(value); }
+            }
+        }
+    }
+}
+
+component DataRow inherits HorizontalLayout {
+    in property <string> label;
+    in property <string> detail;
+    in property <string> action;
+    in property <image> icon;
+    callback clicked();
+
+    padding-left: 10px;
+    padding-right: 10px;
+    spacing: 12px;
+    min-height: root.detail == "" ? 38px : 48px;
+    VerticalLayout {
+        alignment: center;
+        spacing: 2px;
+        horizontal-stretch: 1;
+        Text {
+            text: root.label;
+            color: Theme.text;
+            font-size: Theme.text-m;
+        }
+        if root.detail != "": Text {
+            text: root.detail;
+            color: Theme.text-3;
+            font-size: Theme.text-s;
+            overflow: elide;
+        }
+    }
+    VerticalLayout {
+        alignment: center;
+        Button {
+            text: root.action;
+            icon: root.icon;
+            height: 28px;
+            font-size: Theme.text-s;
+            clicked => { root.clicked(); }
+        }
+    }
+}
+
+export component SettingsView inherits VerticalLayout {
+    in-out property <bool> launch-with-windows;
+    in-out property <bool> start-minimized;
+    in-out property <bool> close-to-tray;
+    in-out property <bool> restore-last;
+    in-out property <bool> auto-resume;
+    in-out property <bool> preserve-queue;
+    in property <string> database-detail;
+    in property <string> version;
+    callback changed();
+    callback refresh-catalog();
+    callback clear-images();
+    callback open-logs();
+    callback open-data();
+
+    padding-left: 10px;
+    padding-right: 10px;
+    padding-bottom: 12px;
+    spacing: 0px;
+
+    Section { text: "GENERAL"; }
+    SettingRow {
+        label: "Launch with Windows";
+        checked <=> root.launch-with-windows;
+        toggled => { root.changed(); }
+    }
+    SettingRow {
+        label: "Start minimized";
+        hint: "Open straight to the tray.";
+        checked <=> root.start-minimized;
+        toggled => { root.changed(); }
+    }
+    SettingRow {
+        label: "Close button minimizes to tray";
+        checked <=> root.close-to-tray;
+        toggled => { root.changed(); }
+    }
+
+    Section { text: "SESSION"; }
+    SettingRow {
+        label: "Restore last selected game";
+        checked <=> root.restore-last;
+        toggled => { root.changed(); }
+    }
+    SettingRow {
+        label: "Auto-resume the manual session";
+        hint: "Play the restored game again at launch.";
+        checked <=> root.auto-resume;
+        toggled => { root.changed(); }
+    }
+    SettingRow {
+        label: "Preserve the queue across restarts";
+        checked <=> root.preserve-queue;
+        toggled => { root.changed(); }
+    }
+
+    Section { text: "DATA"; }
+    DataRow {
+        label: "Game database";
+        detail: root.database-detail;
+        action: "Refresh";
+        clicked => { root.refresh-catalog(); }
+    }
+    DataRow {
+        label: "Artwork cache";
+        action: "Clear";
+        clicked => { root.clear-images(); }
+    }
+    DataRow {
+        label: "Logs";
+        action: "Open";
+        clicked => { root.open-logs(); }
+    }
+    DataRow {
+        label: "Data folder";
+        action: "Open";
+        clicked => { root.open-data(); }
+    }
+
+    Section { text: "ABOUT"; }
+    HorizontalLayout {
+        padding-left: 10px;
+        padding-top: 8px;
+        spacing: 12px;
+        VerticalLayout {
+            alignment: center;
+            LogoMark {
+                width: 32px;
+                height: 32px;
+            }
+        }
+        VerticalLayout {
+            alignment: center;
+            spacing: 2px;
+            Text {
+                text: "Game Larper " + root.version;
+                color: Theme.text;
+                font-size: Theme.text-m;
+                font-weight: 600;
+            }
+            Text {
+                text: "Pick a game. Press play. Discord gets lied to.";
+                color: Theme.text-3;
+                font-size: Theme.text-s;
+                wrap: word-wrap;
+            }
+        }
+    }
+}
