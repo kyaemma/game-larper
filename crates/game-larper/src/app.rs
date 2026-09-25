@@ -31,6 +31,7 @@ const ART_DEBOUNCE: Duration = Duration::from_millis(110);
 const REVEAL_WAIT: Duration = Duration::from_millis(260);
 /// Keeps the startup loader from flashing for a single frame.
 const LOADING_MIN: Duration = Duration::from_millis(280);
+const CATALOG_STALE: Duration = Duration::from_secs(24 * 60 * 60);
 
 struct Models {
     hits: Rc<VecModel<Hit>>,
@@ -1074,7 +1075,10 @@ fn apply_message(
             let plan = plan_results(&mut session);
             fetch_art(&mut session, &plan.first, tx, wake, true);
             fetch_art(&mut session, &plan.rest, tx, wake, false);
-            if session.games.is_empty() && !session.refreshing {
+            let stale = updated.is_none_or(|time| {
+                SystemTime::now().duration_since(time).unwrap_or_default() > CATALOG_STALE
+            });
+            if (stale || session.games.is_empty()) && !session.refreshing {
                 session.refreshing = true;
                 spawn_refresh(tx.clone(), session.paths.clone(), log.clone(), wake.clone());
             }
