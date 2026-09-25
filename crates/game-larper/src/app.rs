@@ -104,6 +104,8 @@ struct Session {
     results: Results,
     reveal: Option<Reveal>,
     selected: Option<String>,
+    /// The game the runner was last launched for.
+    active: Option<String>,
     clock: SessionClock,
     queue: QueueMachine,
     host: Arc<Mutex<RunnerHost>>,
@@ -308,6 +310,7 @@ fn load_session(paths: &AppPaths, log: &Log) -> Session {
         results: Results::Idle,
         reveal: None,
         selected: None,
+        active: None,
         clock: SessionClock::new(),
         queue,
         host: Arc::new(Mutex::new(RunnerHost::new(paths.runtime()))),
@@ -447,6 +450,9 @@ fn wire(
         let tx = tx.clone();
         let wake = wake.clone();
         move || {
+            if let Ok(mut session) = session.lock() {
+                reselect_paused(&mut session, &log);
+            }
             begin_play(&session, &log, &tx, &wake);
             wake();
         }
@@ -921,13 +927,21 @@ fn render_main(ui: &MainWindow, session: &Session, now: Instant) {
         SessionState::Paused => ("Paused", "paused", Tone::Warning),
         SessionState::Stopped => ("Ready", "stopped", Tone::Muted),
     };
-    ui.set_session_visible(selected.is_some());
+    let current = session_game(session);
+    ui.set_session_visible(current.is_some());
+    ui.set_active_id(
+        current
+            .filter(|_| state != SessionState::Stopped)
+            .map(|game| game.id.clone())
+            .unwrap_or_default()
+            .into(),
+    );
     ui.set_session_state(label.into());
     ui.set_session_mode(mode.into());
     ui.set_session_color(tone.into());
     ui.set_session_time(displayed_time(session, now).into());
     ui.set_session_note(queue_note(session, now).into());
-    if let Some(game) = selected {
+    if let Some(game) = current {
         ui.set_session_name(game.name.clone().into());
         ui.set_session_art(cached_art(&game.id));
     } else {
@@ -977,7 +991,7 @@ fn render_panel(panel: &SidePanel, session: &Session, now: Instant) {
 }
 
 fn render_tray(tray: &TrayIcon, session: &Session, now: Instant) {
-    let selected = selected_game(session);
+    let selected = session_game(session);
     let label = match session.clock.state() {
         SessionState::Playing => "Playing",
         SessionState::Paused => "Paused",
@@ -1029,7 +1043,12 @@ fn tick(session: &Arc<Mutex<Session>>, log: &Arc<Log>, tx: &mpsc::Sender<Msg>, w
     // The dock and the queue panel show artwork too; fetch what they miss.
     let wanted: Vec<GameDefinition> = {
         let session = &*session_guard;
-        let mut ids: Vec<&str> = session.selected.iter().map(String::as_str).collect();
+        let mut ids: Vec<&str> = session
+            .selected
+            .iter()
+            .chain(session.active.iter())
+            .map(String::as_str)
+            .collect();
         ids.extend(
             session
                 .queue

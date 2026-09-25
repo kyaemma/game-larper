@@ -28,6 +28,7 @@ fn begin_play(
         return;
     };
     guard.busy = true;
+    guard.active = Some(game.id.clone());
     let host = guard.host.clone();
     let images = guard.paths.images();
     drop(guard);
@@ -131,6 +132,7 @@ fn dispatch_queue_action(
             .find(|game| game.id == item.application_id)
             .cloned();
         guard.selected = Some(item.application_id.clone());
+        guard.active = Some(item.application_id.clone());
         guard.config.last_selected_discord_application_id = Some(item.application_id);
         let _ = ConfigStore::new(guard.paths.config()).save(&guard.config);
         game.or_else(|| {
@@ -625,6 +627,35 @@ fn selected_game(session: &Session) -> Option<&GameDefinition> {
         .and_then(|id| session.games.iter().find(|game| &game.id == id))
 }
 
+/// The game the dock shows: the one running or paused, else the selection.
+fn session_game(session: &Session) -> Option<&GameDefinition> {
+    if session.clock.state() == SessionState::Stopped {
+        return selected_game(session);
+    }
+    session
+        .active
+        .as_ref()
+        .and_then(|id| session.games.iter().find(|game| &game.id == id))
+        .or_else(|| selected_game(session))
+}
+
+/// Resume means the paused game, even if another row got selected meanwhile.
+fn reselect_paused(session: &mut Session, log: &Log) {
+    if session.clock.state() != SessionState::Paused {
+        return;
+    }
+    let Some(active) = session.active.clone() else {
+        return;
+    };
+    if session.selected.as_ref() == Some(&active) {
+        return;
+    }
+    session.selected = Some(active.clone());
+    session.config.last_selected_discord_application_id = Some(active);
+    if let Err(error) = ConfigStore::new(session.paths.config()).save(&session.config) {
+        log.info(format!("Config save failed: {error}"));
+    }
+}
 
 struct Controls {
     play: bool,

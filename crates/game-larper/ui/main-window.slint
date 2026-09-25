@@ -178,6 +178,7 @@ export component MainWindow inherits Window {
     in-out property <bool> stop-enabled;
     in-out property <bool> resume-queue;
     in-out property <bool> play-blocked;
+    in-out property <string> active-id;
 
     // Utility row.
     in-out property <int> queue-count;
@@ -279,8 +280,7 @@ export component MainWindow inherits Window {
                 max-width: 696px;
                 list := ResultsList {
                     hits: root.hits;
-                    // The dock follows the selection, so the selected row is the one playing.
-                    playing-id: root.session-mode == "playing" && root.selected-index >= 0 ? root.hits[root.selected-index].id : "";
+                    playing-id: root.session-mode == "playing" ? root.active-id : "";
                     blocked: root.play-blocked;
                     opacity: root.results-state == "ready" ? 1 : 0;
                     visible: self.opacity > 0;
@@ -424,7 +424,7 @@ export component MainWindow inherits Window {
                 MenuItem {
                     text: "Play";
                     icon: Icons.play;
-                    enabled: !root.play-blocked && !(root.session-mode == "playing" && root.menu-index == root.selected-index);
+                    enabled: !root.play-blocked && !(root.session-mode == "playing" && root.menu-id == root.active-id);
                     highlighted: root.menu-focus == 0;
                     activated => { root.activate(root.menu-index); }
                 }
