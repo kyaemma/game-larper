@@ -29,11 +29,30 @@ pub fn write_atomic(path: &Path, bytes: &[u8]) -> io::Result<()> {
         let _ = fs::remove_file(&temporary);
         return Err(error);
     }
-    if let Err(error) = replace_file(&temporary, path) {
+    if let Err(error) = replace_with_retry(&temporary, path) {
         let _ = fs::remove_file(&temporary);
         return Err(error);
     }
     Ok(())
+}
+
+fn replace_with_retry(from: &Path, to: &Path) -> io::Result<()> {
+    let mut last = None;
+    for attempt in 0..3 {
+        match replace_file(from, to) {
+            Ok(()) => return Ok(()),
+            Err(error) if attempt < 2 && is_sharing_error(&error) => {
+                last = Some(error);
+                std::thread::sleep(std::time::Duration::from_millis(30));
+            }
+            Err(error) => return Err(error),
+        }
+    }
+    Err(last.unwrap_or_else(|| io::Error::other("atomic replace failed")))
+}
+
+fn is_sharing_error(error: &io::Error) -> bool {
+    matches!(error.raw_os_error(), Some(5 | 32))
 }
 
 #[cfg(windows)]
