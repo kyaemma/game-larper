@@ -1,0 +1,379 @@
+// Search: the field, result rows, and the quiet states around them.
+
+import { Theme, Icons } from "theme.slint";
+import { Icon, LogoMark, Tip, Button, IconButton, Art } from "controls.slint";
+import { Hit } from "models.slint";
+
+export component SearchField inherits Rectangle {
+    in-out property <string> text;
+    callback edited(string);
+    callback accepted();
+    callback step(int);
+
+    public function clear() {
+        input.text = "";
+        root.edited("");
+        input.focus();
+    }
+
+    forward-focus: input;
+    height: 44px;
+    border-radius: Theme.radius-m;
+    background: Theme.surface;
+    border-width: 1px;
+    border-color: input.has-focus ? Theme.accent.with-alpha(0.7) : touch.has-hover ? #30374A : #222838;
+    animate border-color { duration: Theme.quick; }
+
+    Rectangle {
+        x: -3px;
+        y: -3px;
+        width: parent.width + 6px;
+        height: parent.height + 6px;
+        border-radius: Theme.radius-m + 3px;
+        border-width: 3px;
+        border-color: input.has-focus ? Theme.accent.with-alpha(0.14) : transparent;
+        animate border-color { duration: Theme.normal; }
+    }
+    touch := TouchArea {
+        mouse-cursor: MouseCursor.text;
+        clicked => { input.focus(); }
+    }
+    FocusScope {
+        focus-on-click: false;
+        focus-on-tab-navigation: false;
+        capture-key-pressed(event) => {
+            if (event.text == Key.DownArrow) {
+                root.step(1);
+                return accept;
+            }
+            if (event.text == Key.UpArrow) {
+                root.step(-1);
+                return accept;
+            }
+            if (event.text == Key.Escape && input.text != "") {
+                root.clear();
+                return accept;
+            }
+            reject
+        }
+        HorizontalLayout {
+            padding-left: 14px;
+            padding-right: 7px;
+            spacing: 10px;
+            VerticalLayout {
+                alignment: center;
+                Icon {
+                    source: Icons.search;
+                    tint: input.has-focus ? Theme.accent-soft : Theme.text-3;
+                    animate colorize { duration: Theme.quick; }
+                }
+            }
+            input := TextInput {
+                text <=> root.text;
+                color: Theme.text;
+                font-size: Theme.text-l;
+                vertical-alignment: center;
+                single-line: true;
+                selection-background-color: Theme.accent.with-alpha(0.45);
+                selection-foreground-color: Theme.text;
+                accessible-role: text-input;
+                accessible-label: "Search games";
+                edited => { root.edited(self.text); }
+                accepted => { root.accepted(); }
+            }
+            if input.text != "": VerticalLayout {
+                alignment: center;
+                IconButton {
+                    icon: Icons.close;
+                    icon-size: 12px;
+                    width: 28px;
+                    height: 28px;
+                    tip: "Clear search";
+                    clicked => { root.clear(); }
+                }
+            }
+        }
+    }
+    if input.text == "": Text {
+        x: 40px;
+        text: "Search a game…";
+        color: Theme.text-3;
+        font-size: Theme.text-l;
+        vertical-alignment: center;
+    }
+}
+
+component SteamLink inherits Rectangle {
+    callback clicked();
+    height: 16px;
+    width: layout.preferred-width;
+    accessible-role: button;
+    accessible-label: "Open on Steam";
+    accessible-action-default => { root.clicked(); }
+    touch := TouchArea {
+        mouse-cursor: pointer;
+        clicked => { root.clicked(); }
+    }
+    layout := HorizontalLayout {
+        spacing: 5px;
+        VerticalLayout {
+            alignment: center;
+            Icon {
+                source: Icons.steam;
+                width: 11px;
+                height: 11px;
+                tint: touch.has-hover ? Theme.text : Theme.text-3;
+            }
+        }
+        Text {
+            text: "Steam";
+            color: touch.has-hover ? Theme.text : Theme.text-3;
+            font-size: Theme.text-xs;
+            vertical-alignment: center;
+        }
+    }
+    Tooltip {
+        Tip { text: "Open on Steam"; }
+    }
+}
+
+component ResultRow inherits Rectangle {
+    in property <Hit> hit;
+    in property <bool> can-play: true;
+    callback select();
+    callback play();
+    callback steam();
+
+    height: 56px;
+    border-radius: Theme.radius-m;
+    background: root.hit.selected ? Theme.accent-tint : touch.has-hover ? Theme.hover : transparent;
+    animate background { duration: Theme.quick; }
+    accessible-role: list-item;
+    accessible-label: root.hit.name;
+    accessible-item-selectable: true;
+    accessible-item-selected: root.hit.selected;
+    accessible-action-default => { root.select(); }
+
+    property <bool> active: touch.has-hover || root.hit.selected;
+
+    touch := TouchArea {
+        clicked => { root.select(); }
+        double-clicked => { root.play(); }
+        HorizontalLayout {
+            padding-left: 8px;
+            padding-right: 8px;
+            spacing: 12px;
+            VerticalLayout {
+                alignment: center;
+                Art {
+                    source: root.hit.art;
+                    width: 40px;
+                    height: 40px;
+                }
+            }
+            VerticalLayout {
+                alignment: center;
+                spacing: 3px;
+                horizontal-stretch: 1;
+                Text {
+                    text: root.hit.name;
+                    color: Theme.text;
+                    font-size: Theme.text-l;
+                    font-weight: 600;
+                    overflow: elide;
+                }
+                if root.hit.steam-id != "": HorizontalLayout {
+                    alignment: start;
+                    SteamLink { clicked => { root.steam(); } }
+                }
+            }
+            HorizontalLayout {
+                spacing: 4px;
+                opacity: root.active ? 1 : 0;
+                animate opacity { duration: Theme.quick; }
+                VerticalLayout {
+                    alignment: center;
+                    Rectangle {
+                        width: 32px;
+                        height: 32px;
+                        border-radius: 16px;
+                        opacity: root.can-play ? 1 : 0.35;
+                        background: play-touch.pressed ? Theme.accent-press : play-touch.has-hover ? Theme.accent-hover : Theme.accent;
+                        animate background { duration: Theme.quick; }
+                        accessible-role: button;
+                        accessible-label: "Play " + root.hit.name;
+                        accessible-action-default => { root.play(); }
+                        play-touch := TouchArea {
+                            enabled: root.can-play;
+                            mouse-cursor: pointer;
+                            clicked => { root.play(); }
+                        }
+                        Icon {
+                            source: Icons.play;
+                            width: 13px;
+                            height: 13px;
+                            x: (parent.width - self.width) / 2 + 1px;
+                            tint: #FFFFFF;
+                        }
+                        Tooltip {
+                            Tip { text: "Play"; }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+export component SkeletonRow inherits Rectangle {
+    in property <length> name-width: 160px;
+    height: 56px;
+    HorizontalLayout {
+        padding-left: 8px;
+        padding-right: 8px;
+        spacing: 12px;
+        VerticalLayout {
+            alignment: center;
+            Rectangle {
+                width: 40px;
+                height: 40px;
+                border-radius: Theme.radius;
+                background: Theme.fill;
+            }
+        }
+        VerticalLayout {
+            alignment: center;
+            spacing: 8px;
+            HorizontalLayout {
+                alignment: start;
+                Rectangle {
+                    width: root.name-width;
+                    height: 10px;
+                    border-radius: 5px;
+                    background: Theme.fill;
+                }
+            }
+            HorizontalLayout {
+                alignment: start;
+                Rectangle {
+                    width: 48px;
+                    height: 8px;
+                    border-radius: 4px;
+                    background: Theme.hover;
+                }
+            }
+        }
+    }
+}
+
+export component ResultsList inherits Rectangle {
+    in property <[Hit]> hits;
+    // Id of the game playing right now, if any.
+    in property <string> playing-id;
+    in property <bool> blocked;
+    callback select(int);
+    callback play(int);
+    callback steam(string);
+
+    property <length> row-height: 58px;
+
+    public function reveal(index: int) {
+        if (index < 0) {
+            return;
+        }
+        if (index * root.row-height + flick.content-y < 0) {
+            flick.content-y = -index * root.row-height;
+        } else if ((index + 1) * root.row-height + flick.content-y > flick.height) {
+            flick.content-y = flick.height - (index + 1) * root.row-height;
+        }
+    }
+
+    public function top() {
+        flick.content-y = 0;
+    }
+
+    flick := Flickable {
+        content-height: root.hits.length * root.row-height;
+        for hit[index] in root.hits: ResultRow {
+            x: 0;
+            y: index * root.row-height;
+            width: flick.width - 10px;
+            hit: hit;
+            can-play: !root.blocked && hit.id != root.playing-id;
+            select => { root.select(index); }
+            play => { root.play(index); }
+            steam => { root.steam(hit.steam-id); }
+        }
+    }
+    if flick.content-height > flick.height: Rectangle {
+        property <length> track: flick.height;
+        property <float> ratio: flick.height / flick.content-height;
+        x: parent.width - self.width - 1px;
+        width: thumb-touch.has-hover || thumb-touch.pressed ? 6px : 4px;
+        height: max(28px, self.track * self.ratio);
+        y: (-flick.content-y) / (flick.content-height - flick.height) * (self.track - self.height);
+        border-radius: self.width / 2;
+        background: thumb-touch.pressed ? #FFFFFF40 : thumb-touch.has-hover ? #FFFFFF2E : #FFFFFF1C;
+        animate width, background { duration: Theme.quick; }
+        thumb-touch := TouchArea {
+            property <length> start;
+            pointer-event(event) => {
+                if (event.kind == PointerEventKind.down) {
+                    self.start = flick.content-y;
+                }
+            }
+            moved => {
+                if (self.pressed) {
+                    flick.content-y = max(flick.height - flick.content-height, min(0px,
+                        self.start - (self.mouse-y - self.pressed-y) * flick.content-height / flick.height));
+                }
+            }
+        }
+    }
+}
+
+export component Message inherits VerticalLayout {
+    in property <string> title;
+    in property <string> body;
+    in property <bool> logo;
+    in property <string> action;
+    callback action-clicked();
+
+    alignment: center;
+    spacing: 6px;
+    padding-left: 32px;
+    padding-right: 32px;
+    padding-bottom: 36px;
+    if root.logo: HorizontalLayout {
+        alignment: center;
+        padding-bottom: 10px;
+        LogoMark {
+            width: 44px;
+            height: 44px;
+        }
+    }
+    Text {
+        text: root.title;
+        color: Theme.text;
+        font-size: Theme.text-l;
+        font-weight: 600;
+        horizontal-alignment: center;
+        wrap: word-wrap;
+    }
+    Text {
+        text: root.body;
+        color: Theme.text-3;
+        font-size: Theme.text-m;
+        horizontal-alignment: center;
+        wrap: word-wrap;
+    }
+    if root.action != "": HorizontalLayout {
+        alignment: center;
+        padding-top: 10px;
+        Button {
+            text: root.action;
+            icon: Icons.refresh;
+            clicked => { root.action-clicked(); }
+        }
+    }
+}
