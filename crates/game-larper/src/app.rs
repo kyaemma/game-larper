@@ -57,6 +57,7 @@ struct Session {
     toast: String,
     toast_until: Option<Instant>,
     busy: bool,
+    catalog_updated: Option<SystemTime>,
     art_generation: u64,
     art_pending: bool,
     restored: bool,
@@ -86,9 +87,9 @@ pub fn run(
             rows: rows.clone(),
         });
     });
-    ui.set_version_label(env!("CARGO_PKG_VERSION").into());
+    panel.set_version_label(env!("CARGO_PKG_VERSION").into());
     sync_settings_from_config(
-        &ui,
+        &panel,
         &session.lock().unwrap_or_else(|p| p.into_inner()).config,
     );
     render(&ui, &panel, &tray, &hits, &rows, &session);
@@ -318,6 +319,7 @@ fn load_session(paths: &AppPaths, log: &Log) -> Session {
         toast: String::new(),
         toast_until: None,
         busy: false,
+        catalog_updated: updated,
         art_generation: 1,
         art_pending: true,
         restored: false,
@@ -424,34 +426,42 @@ fn wire(
             }
         }
     });
+    let open_settings = {
+        let dock = dock.clone();
+        let panel = panel.as_weak();
+        let session = session.clone();
+        move || {
+            if let (Some(panel), Ok(session)) = (panel.upgrade(), session.lock()) {
+                sync_settings_from_config(&panel, &session.config);
+            }
+            dock.open(Mode::Settings);
+        }
+    };
     ui.on_open_settings({
-        let session = session.clone();
-        let ui = ui.as_weak();
+        let dock = dock.clone();
+        let open_settings = open_settings.clone();
         move || {
-            if let (Ok(session), Some(ui)) = (session.lock(), ui.upgrade()) {
-                sync_settings_from_config(&ui, &session.config);
-                let _ = ui.show();
-            }
-            if let Some(ui) = ui.upgrade() {
-                ui.set_settings_open(true);
+            if dock.mode() == Some(Mode::Settings) {
+                dock.close();
+            } else {
+                open_settings();
             }
         }
     });
-    ui.on_close_settings({
-        let ui = ui.as_weak();
-        move || {
-            if let Some(ui) = ui.upgrade() {
-                ui.set_settings_open(false);
-            }
-        }
-    });
-    ui.on_save_settings({
+    panel.on_save_settings({
         let session = session.clone();
-        let ui = ui.as_weak();
+        let panel = panel.as_weak();
+        let dock = dock.clone();
         let log = log.clone();
-        move || save_settings(&session, &ui, &log)
+        let wake = wake.clone();
+        move || {
+            if save_settings(&session, &panel, &log) {
+                dock.close();
+            }
+            wake();
+        }
     });
-    ui.on_refresh_catalog({
+    panel.on_refresh_catalog({
         let session = session.clone();
         let tx = tx.clone();
         let log = log.clone();
@@ -463,9 +473,10 @@ fn wire(
             }
         }
     });
-    ui.on_clear_images({
+    panel.on_clear_images({
         let session = session.clone();
         let log = log.clone();
+        let wake = wake.clone();
         move || {
             if let Ok(mut session) = session.lock() {
                 match net::clear_artwork(&session.paths.images()) {
@@ -480,9 +491,10 @@ fn wire(
                     }
                 }
             }
+            wake();
         }
     });
-    ui.on_open_logs({
+    panel.on_open_logs({
         let session = session.clone();
         move || {
             if let Ok(session) = session.lock() {
@@ -490,7 +502,7 @@ fn wire(
             }
         }
     });
-    ui.on_open_data({
+    panel.on_open_data({
         let session = session.clone();
         move || {
             if let Ok(session) = session.lock() {
@@ -723,8 +735,8 @@ fn wire(
         move || {
             if let Some(ui) = ui.upgrade() {
                 show_main(&ui);
-                ui.set_settings_open(true);
             }
+            open_settings();
         }
     });
     tray.on_quit({
@@ -831,6 +843,7 @@ fn render(
         panel.set_selected_name(game.name.clone().into());
         panel.set_selected_art(cached_art(&game.id));
     }
+    panel.set_database_detail(database_detail(&session).into());
 
     tray.set_status_tip(if let Some(game) = selected {
         format!("Game Larper · {} · {label}", game.name).into()
@@ -938,6 +951,7 @@ fn apply_message(
                     .into_iter()
                     .filter(|game| game.supported_path().is_some())
                     .collect();
+                session.catalog_updated = Some(SystemTime::now());
                 session.catalog_note = format!("{count} supported games");
                 log.info(format!("Catalog refreshed: {count} supported games"));
                 if session

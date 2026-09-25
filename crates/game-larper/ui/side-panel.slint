@@ -1,13 +1,14 @@
 // The attached side panel. Rust keeps it docked beside the main window.
-// It hosts the queue; more surfaces can share the same dock.
+// It shows either Settings or the Queue.
 
 import { Theme, Icons } from "theme.slint";
-import { IconButton } from "controls.slint";
+import { IconButton, Button, Hairline } from "controls.slint";
 import { QueueRow } from "models.slint";
+import { SettingsView } from "settings.slint";
 import { QueueView } from "queue.slint";
 
 export component SidePanel inherits Window {
-    title: "Queue · Game Larper";
+    title: root.mode == "queue" ? "Queue · Game Larper" : "Settings · Game Larper";
     icon: @image-url("../../../assets/branding/game-larper-logo.png");
     no-frame: true;
     min-width: 336px;
@@ -19,12 +20,23 @@ export component SidePanel inherits Window {
     default-font-family: Theme.font;
     default-font-size: Theme.text-m;
 
-    // "queue"
-    in-out property <string> mode: "queue";
+    // "settings" | "queue"
+    in-out property <string> mode: "settings";
     // Drives the open/close motion.
     in-out property <bool> shown;
     // True when the panel sits left of the main window.
     in-out property <bool> from-left;
+
+    // Settings, staged until Save.
+    in-out property <bool> launch-with-windows;
+    in-out property <bool> start-minimized;
+    in-out property <bool> close-to-tray: true;
+    in-out property <bool> restore-last: true;
+    in-out property <bool> auto-resume;
+    in-out property <bool> preserve-queue: true;
+    in-out property <bool> settings-dirty;
+    in-out property <string> database-detail;
+    in-out property <string> version-label: "0.1.0";
 
     // Queue.
     in-out property <[QueueRow]> queue-rows;
@@ -40,6 +52,11 @@ export component SidePanel inherits Window {
     in-out property <bool> schedule-armed;
 
     callback close-panel();
+    callback save-settings();
+    callback refresh-catalog();
+    callback clear-images();
+    callback open-logs();
+    callback open-data();
     callback add-queue();
     callback queue-up(int);
     callback queue-down(int);
@@ -77,7 +94,7 @@ export component SidePanel inherits Window {
                     padding-right: 10px;
                     spacing: 8px;
                     Text {
-                        text: "Queue";
+                        text: root.mode == "queue" ? "Queue" : "Settings";
                         color: Theme.text;
                         font-size: 15px;
                         font-weight: 600;
@@ -92,6 +109,48 @@ export component SidePanel inherits Window {
                             tip: "Close";
                             clicked => { root.close-panel(); }
                         }
+                    }
+                }
+
+                if root.mode == "settings": Flickable {
+                    vertical-stretch: 1;
+                    content-height: settings.preferred-height;
+                    settings := SettingsView {
+                        width: parent.width;
+                        launch-with-windows <=> root.launch-with-windows;
+                        start-minimized <=> root.start-minimized;
+                        close-to-tray <=> root.close-to-tray;
+                        restore-last <=> root.restore-last;
+                        auto-resume <=> root.auto-resume;
+                        preserve-queue <=> root.preserve-queue;
+                        database-detail: root.database-detail;
+                        version: root.version-label;
+                        changed => { root.settings-dirty = true; }
+                        refresh-catalog => { root.refresh-catalog(); }
+                        clear-images => { root.clear-images(); }
+                        open-logs => { root.open-logs(); }
+                        open-data => { root.open-data(); }
+                    }
+                }
+                if root.mode == "settings": Hairline { }
+                if root.mode == "settings": HorizontalLayout {
+                    padding-left: 20px;
+                    padding-right: 20px;
+                    padding-top: 12px;
+                    padding-bottom: 12px;
+                    spacing: 8px;
+                    alignment: end;
+                    Button {
+                        text: "Cancel";
+                        kind: "ghost";
+                        clicked => { root.close-panel(); }
+                    }
+                    Button {
+                        text: "Save";
+                        kind: "primary";
+                        min-width: 88px;
+                        enabled: root.settings-dirty;
+                        clicked => { root.save-settings(); }
                     }
                 }
 

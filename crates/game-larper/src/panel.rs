@@ -26,12 +26,14 @@ const CLOSE_DELAY: Duration = Duration::from_millis(170);
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum Mode {
     Queue,
+    Settings,
 }
 
 impl Mode {
     fn name(self) -> &'static str {
         match self {
             Mode::Queue => "queue",
+            Mode::Settings => "settings",
         }
     }
 }

@@ -71,39 +71,6 @@ component CaptionButton inherits Rectangle {
     }
 }
 
-component CheckRow inherits Rectangle {
-    in-out property <bool> checked;
-    in property <string> label;
-    height: 32px;
-    HorizontalLayout {
-        spacing: 10px;
-        alignment: start;
-        Rectangle {
-            width: 16px;
-            height: 16px;
-            border-radius: 4px;
-            border-width: 1px;
-            border-color: root.checked ? Theme.accent : Theme.border;
-            background: root.checked ? Theme.accent : Theme.surface;
-            vertical-stretch: 0;
-            y: (parent.height - self.height) / 2;
-            Text {
-                text: root.checked ? "✓" : "";
-                color: Theme.text;
-                font-size: 11px;
-                horizontal-alignment: center;
-                vertical-alignment: center;
-            }
-        }
-        Text {
-            text: root.label;
-            color: Theme.text;
-            vertical-alignment: center;
-        }
-    }
-    TouchArea { clicked => { root.checked = !root.checked; } }
-}
-
 export component MainWindow inherits Window {
     title: "Game Larper";
     icon: @image-url("../../../assets/branding/game-larper-logo.png");
@@ -131,17 +98,8 @@ export component MainWindow inherits Window {
     in-out property <bool> pause-enabled: false;
     in-out property <bool> stop-enabled: false;
     in-out property <string> queue-count: "Queue";
-    // The docked side panel that is open: "" or "queue".
+    // The docked side panel that is open: "", "queue", or "settings".
     in-out property <string> panel;
-    in-out property <bool> settings-open: false;
-    in-out property <bool> launch-with-windows: false;
-    in-out property <bool> start-minimized: false;
-    in-out property <bool> close-to-tray: true;
-    in-out property <bool> restore-last: true;
-    in-out property <bool> auto-resume: false;
-    in-out property <bool> preserve-queue: true;
-    in-out property <string> refresh-label: "Never";
-    in-out property <string> version-label: "0.1.0";
     in-out property <string> toast: "";
 
     callback query-edited(string);
@@ -152,12 +110,6 @@ export component MainWindow inherits Window {
     callback stop();
     callback toggle-queue();
     callback open-settings();
-    callback close-settings();
-    callback save-settings();
-    callback refresh-catalog();
-    callback clear-images();
-    callback open-logs();
-    callback open-data();
     callback request-close();
 
     forward-focus: search;
@@ -363,63 +315,6 @@ export component MainWindow inherits Window {
             horizontal-alignment: center;
             vertical-alignment: center;
             overflow: elide;
-        }
-    }
-
-    if (root.settings-open): Rectangle {
-        background: #000000aa;
-        TouchArea { clicked => { root.close-settings(); } }
-        Rectangle {
-            width: 460px;
-            height: 560px;
-            x: (parent.width - self.width) / 2;
-            y: (parent.height - self.height) / 2;
-            background: Theme.surface;
-            border-radius: 12px;
-            border-width: 1px;
-            border-color: Theme.border;
-            TouchArea { }
-            VerticalLayout {
-                padding: 18px;
-                spacing: 8px;
-                Image {
-                    source: @image-url("../../../assets/branding/game-larper-banner.png");
-                    height: 42px;
-                    width: self.height * self.source.width / self.source.height;
-                    image-fit: contain;
-                    horizontal-stretch: 0;
-                }
-                Text { text: "Settings"; color: Theme.text; font-size: 18px; font-weight: 700; }
-                CheckRow { label: "Launch with Windows"; checked <=> root.launch-with-windows; }
-                CheckRow { label: "Start minimized"; checked <=> root.start-minimized; }
-                CheckRow { label: "Close button minimizes to tray"; checked <=> root.close-to-tray; }
-                CheckRow { label: "Restore last selected game"; checked <=> root.restore-last; }
-                CheckRow { label: "Auto-resume the manual session"; checked <=> root.auto-resume; }
-                CheckRow { label: "Preserve the queue across restarts"; checked <=> root.preserve-queue; }
-                Text { text: "Last refresh  " + root.refresh-label; color: Theme.muted; font-size: 12px; }
-                HorizontalLayout {
-                    spacing: 8px;
-                    Action { label: "Refresh database"; clicked => { root.refresh-catalog(); } }
-                    Action { label: "Clear artwork"; clicked => { root.clear-images(); } }
-                }
-                HorizontalLayout {
-                    spacing: 8px;
-                    Action { label: "Open logs"; clicked => { root.open-logs(); } }
-                    Action { label: "Open data"; clicked => { root.open-data(); } }
-                }
-                Rectangle { vertical-stretch: 1; }
-                Text {
-                    text: "Game Larper " + root.version-label + "\nPick a game. Press play. Discord gets lied to.";
-                    color: Theme.muted;
-                    font-size: 12px;
-                    wrap: word-wrap;
-                }
-                HorizontalLayout {
-                    spacing: 8px;
-                    Action { label: "Close"; clicked => { root.close-settings(); } }
-                    Action { label: "Save"; primary: true; clicked => { root.save-settings(); } }
-                }
-            }
         }
     }
 }

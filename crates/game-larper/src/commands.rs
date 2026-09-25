@@ -338,20 +338,23 @@ fn arm_schedule(session: &Arc<Mutex<Session>>, panel: &Weak<SidePanel>) {
     }
 }
 
-fn save_settings(session: &Arc<Mutex<Session>>, ui: &Weak<MainWindow>, log: &Log) {
-    let Some(ui) = ui.upgrade() else { return };
+/// Apply the staged settings. Returns false and keeps the panel open when something failed.
+fn save_settings(session: &Arc<Mutex<Session>>, panel: &Weak<SidePanel>, log: &Log) -> bool {
+    let Some(panel) = panel.upgrade() else {
+        return false;
+    };
     let Ok(mut session) = session.lock() else {
-        return;
+        return false;
     };
     let executable = std::env::current_exe();
     let next = AppConfig {
         schema_version: session.config.schema_version,
-        launch_with_windows: ui.get_launch_with_windows(),
-        start_minimized: ui.get_start_minimized(),
-        close_to_tray: ui.get_close_to_tray(),
-        restore_last_selected_game: ui.get_restore_last(),
-        auto_resume: ui.get_auto_resume(),
-        preserve_queue: ui.get_preserve_queue(),
+        launch_with_windows: panel.get_launch_with_windows(),
+        start_minimized: panel.get_start_minimized(),
+        close_to_tray: panel.get_close_to_tray(),
+        restore_last_selected_game: panel.get_restore_last(),
+        auto_resume: panel.get_auto_resume(),
+        preserve_queue: panel.get_preserve_queue(),
         last_selected_discord_application_id: session
             .config
             .last_selected_discord_application_id
@@ -366,7 +369,7 @@ fn save_settings(session: &Arc<Mutex<Session>>, ui: &Weak<MainWindow>, log: &Log
     {
         log.info(format!("Startup registry error: {error}"));
         toast(&mut session, error);
-        return;
+        return false;
     }
     if !next.preserve_queue {
         let _ = std::fs::remove_file(session.paths.queue());
@@ -375,13 +378,14 @@ fn save_settings(session: &Arc<Mutex<Session>>, ui: &Weak<MainWindow>, log: &Log
     if let Err(error) = ConfigStore::new(session.paths.config()).save(&session.config) {
         log.info(format!("Config save failed: {error}"));
         toast(&mut session, "Settings could not be saved.");
-        return;
+        return false;
     }
     if session.config.preserve_queue {
         persist_queue(&mut session);
     }
-    ui.set_settings_open(false);
+    panel.set_settings_dirty(false);
     toast(&mut session, "Settings saved.");
+    true
 }
 
 fn persist_queue(session: &mut Session) {
@@ -412,13 +416,14 @@ fn queue_command(
     }
 }
 
-fn sync_settings_from_config(ui: &MainWindow, config: &AppConfig) {
-    ui.set_launch_with_windows(config.launch_with_windows);
-    ui.set_start_minimized(config.start_minimized);
-    ui.set_close_to_tray(config.close_to_tray);
-    ui.set_restore_last(config.restore_last_selected_game);
-    ui.set_auto_resume(config.auto_resume);
-    ui.set_preserve_queue(config.preserve_queue);
+fn sync_settings_from_config(panel: &SidePanel, config: &AppConfig) {
+    panel.set_launch_with_windows(config.launch_with_windows);
+    panel.set_start_minimized(config.start_minimized);
+    panel.set_close_to_tray(config.close_to_tray);
+    panel.set_restore_last(config.restore_last_selected_game);
+    panel.set_auto_resume(config.auto_resume);
+    panel.set_preserve_queue(config.preserve_queue);
+    panel.set_settings_dirty(false);
 }
 
 fn cached_art(id: &str) -> slint::Image {
@@ -574,6 +579,41 @@ fn detail_line(game: &GameDefinition) -> String {
         Some(id) => format!("Steam {id} · Discord detected"),
         None => "Discord detected".into(),
     }
+}
+
+fn database_detail(session: &Session) -> String {
+    if session.games.is_empty() {
+        return "Not downloaded yet".into();
+    }
+    let updated = session
+        .catalog_updated
+        .and_then(|time| SystemTime::now().duration_since(time).ok())
+        .map(|age| match age.as_secs() {
+            0..60 => "updated just now".to_string(),
+            60..3600 => format!("updated {} min ago", age.as_secs() / 60),
+            3600..86_400 => format!("updated {} h ago", age.as_secs() / 3600),
+            _ => {
+                let days = age.as_secs() / 86_400;
+                format!("updated {days} day{} ago", if days == 1 { "" } else { "s" })
+            }
+        });
+    let games = format!("{} games", group_digits(session.games.len()));
+    match updated {
+        Some(updated) => format!("{games} · {updated}"),
+        None => games,
+    }
+}
+
+fn group_digits(value: usize) -> String {
+    let digits = value.to_string();
+    let mut grouped = String::with_capacity(digits.len() + digits.len() / 3);
+    for (index, digit) in digits.chars().enumerate() {
+        if index > 0 && (digits.len() - index).is_multiple_of(3) {
+            grouped.push(',');
+        }
+        grouped.push(digit);
+    }
+    grouped
 }
 
 fn supported_count(games: &[GameDefinition]) -> usize {
