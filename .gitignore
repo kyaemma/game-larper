@@ -1,0 +1,47 @@
+# Rust build output
+/target/
+
+# Slint/generated build output
+**/generated/
+**/*.slint.rs
+
+# Release/artifacts
+/artifacts/
+/dist/
+/release/
+
+# IDE / editors
+.vscode/
+.idea/
+.vs/
+
+# Visual Studio / Windows junk
+*.user
+*.suo
+*.userosscache
+*.sln.docstates
+Thumbs.db
+Desktop.ini
+
+# Logs
+*.log
+/logs/
+
+# Temporary files
+*.tmp
+*.temp
+*.bak
+*.old
+
+# Local config / runtime data
+/config.local.*
+/runtime/
+/cache/
+
+# Environment / secrets
+.env
+.env.*
+!.env.example
+
+# OS
+.DS_Store
