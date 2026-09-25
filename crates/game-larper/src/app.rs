@@ -1056,6 +1056,12 @@ fn tick(session: &Arc<Mutex<Session>>, log: &Arc<Log>, tx: &mpsc::Sender<Msg>, w
                 .iter()
                 .map(|item| item.application_id.as_str()),
         );
+        // Most ticks have nothing to fetch; skip the catalog scan for those.
+        ids.retain(|id| {
+            !ART.with(|art| art.borrow().contains_key(*id))
+                && !session.art_failed.contains(*id)
+                && !session.art_inflight.contains(*id)
+        });
         ids.iter()
             .filter_map(|id| session.games.iter().find(|game| game.id == *id))
             .cloned()
