@@ -10,12 +10,12 @@ use game_larper_core::{
     GameDefinition, QueueAction, QueueActivity, QueueMachine, SessionClock, SessionState,
     format_hms, load_catalog_with_legacy, load_queue, save_queue, unix_time_ms,
 };
-use raw_window_handle::{HasWindowHandle, RawWindowHandle};
-use slint::{ComponentHandle, ModelRc, SharedString, Timer, TimerMode, VecModel, Weak};
+use slint::{ComponentHandle, Model, ModelRc, SharedString, Timer, TimerMode, VecModel, Weak};
 
 use crate::host::{LaunchReport, RunnerHost};
 use crate::log::Log;
 use crate::net;
+use crate::panel::{Dock, Mode};
 use crate::platform;
 
 slint::include_modules!();
@@ -57,7 +57,6 @@ struct Session {
     toast: String,
     toast_until: Option<Instant>,
     busy: bool,
-    queue_open: bool,
     art_generation: u64,
     art_pending: bool,
     restored: bool,
@@ -71,14 +70,16 @@ pub fn run(
 ) -> Result<(), slint::PlatformError> {
     let log = Arc::new(log);
     let ui = MainWindow::new()?;
+    let panel = SidePanel::new()?;
     let tray = TrayIcon::new()?;
+    let dock = Dock::new(&ui, &panel);
     let (tx, rx) = mpsc::channel();
     let rx = Arc::new(Mutex::new(rx));
     let session = Arc::new(Mutex::new(load_session(&paths, &log)));
     let hits = Rc::new(VecModel::from(Vec::<Hit>::new()));
     let rows = Rc::new(VecModel::from(Vec::<QueueRow>::new()));
     ui.set_hits(ModelRc::from(hits.clone()));
-    ui.set_queue_rows(ModelRc::from(rows.clone()));
+    panel.set_queue_rows(ModelRc::from(rows.clone()));
     MODELS.with(|slot| {
         *slot.borrow_mut() = Some(Models {
             hits: hits.clone(),
@@ -90,25 +91,28 @@ pub fn run(
         &ui,
         &session.lock().unwrap_or_else(|p| p.into_inner()).config,
     );
-    render(&ui, &tray, &hits, &rows, &session);
+    render(&ui, &panel, &tray, &hits, &rows, &session);
 
     let wake: Arc<dyn Fn() + Send + Sync> = {
         let rx = rx.clone();
         let session = session.clone();
         let ui_weak = ui.as_weak();
+        let panel_weak = panel.as_weak();
         let tray_weak = tray.as_weak();
         let log = log.clone();
         let tx = tx.clone();
         Arc::new(move || {
             let ui_weak = ui_weak.clone();
+            let panel_weak = panel_weak.clone();
             let tray_weak = tray_weak.clone();
             let session = session.clone();
             let rx = rx.clone();
             let log = log.clone();
             let tx = tx.clone();
             let _ = slint::invoke_from_event_loop(move || {
-                let Some(ui) = ui_weak.upgrade() else { return };
-                let Some(tray) = tray_weak.upgrade() else {
+                let (Some(ui), Some(panel), Some(tray)) =
+                    (ui_weak.upgrade(), panel_weak.upgrade(), tray_weak.upgrade())
+                else {
                     return;
                 };
                 let mut batch = Vec::new();
@@ -122,21 +126,21 @@ pub fn run(
                 }
                 MODELS.with(|models| {
                     if let Some(models) = models.borrow().as_ref() {
-                        render(&ui, &tray, &models.hits, &models.rows, &session);
+                        render(&ui, &panel, &tray, &models.hits, &models.rows, &session);
                     }
                 });
             });
         }) as Arc<dyn Fn() + Send + Sync>
     };
 
-    wire(&ui, &tray, &session, &log, &tx, &wake, &hits);
+    wire(&ui, &panel, &tray, &dock, &session, &log, &tx, &wake, &hits);
     platform::watch_activation({
         let ui_weak = ui.as_weak();
         move || {
             let ui_weak = ui_weak.clone();
             let _ = slint::invoke_from_event_loop(move || {
                 if let Some(ui) = ui_weak.upgrade() {
-                    let _ = ui.show();
+                    show_main(&ui);
                 }
             });
         }
@@ -150,7 +154,7 @@ pub fn run(
             .start_minimized;
     if !minimized {
         ui.show()?;
-        round_after_show(&ui);
+        style_main(&ui);
     }
     if session
         .lock()
@@ -170,14 +174,16 @@ pub fn run(
     {
         let session = session.clone();
         let ui_weak = ui.as_weak();
+        let panel_weak = panel.as_weak();
         let tray_weak = tray.as_weak();
         let tx = tx.clone();
         let log = log.clone();
         let wake = wake.clone();
         let rx = rx.clone();
         timer.start(TimerMode::Repeated, Duration::from_secs(1), move || {
-            let Some(ui) = ui_weak.upgrade() else { return };
-            let Some(tray) = tray_weak.upgrade() else {
+            let (Some(ui), Some(panel), Some(tray)) =
+                (ui_weak.upgrade(), panel_weak.upgrade(), tray_weak.upgrade())
+            else {
                 return;
             };
             let mut batch = Vec::new();
@@ -192,7 +198,7 @@ pub fn run(
             tick(&session, &log, &tx, &wake);
             MODELS.with(|models| {
                 if let Some(models) = models.borrow().as_ref() {
-                    render(&ui, &tray, &models.hits, &models.rows, &session);
+                    render(&ui, &panel, &tray, &models.hits, &models.rows, &session);
                 }
             });
         });
@@ -201,6 +207,7 @@ pub fn run(
     ui.window().on_close_requested({
         let session = session.clone();
         let ui_weak = ui.as_weak();
+        let dock = dock.clone();
         let log = log.clone();
         let tx = tx.clone();
         let wake = wake.clone();
@@ -211,12 +218,20 @@ pub fn run(
                 .config
                 .close_to_tray;
             if close_to_tray {
+                dock.dismiss();
                 if let Some(ui) = ui_weak.upgrade() {
                     let _ = ui.hide();
                 }
             } else {
                 begin_quit(&session, &log, &tx, &wake);
             }
+            slint::CloseRequestResponse::KeepWindowShown
+        }
+    });
+    panel.window().on_close_requested({
+        let dock = dock.clone();
+        move || {
+            dock.close();
             slint::CloseRequestResponse::KeepWindowShown
         }
     });
@@ -303,7 +318,6 @@ fn load_session(paths: &AppPaths, log: &Log) -> Session {
         toast: String::new(),
         toast_until: None,
         busy: false,
-        queue_open: false,
         art_generation: 1,
         art_pending: true,
         restored: false,
@@ -311,9 +325,12 @@ fn load_session(paths: &AppPaths, log: &Log) -> Session {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
 fn wire(
     ui: &MainWindow,
+    panel: &SidePanel,
     tray: &TrayIcon,
+    dock: &Rc<Dock>,
     session: &Arc<Mutex<Session>>,
     log: &Arc<Log>,
     tx: &mpsc::Sender<Msg>,
@@ -323,6 +340,7 @@ fn wire(
     ui.on_query_edited({
         let session = session.clone();
         let ui = ui.as_weak();
+        let panel = panel.as_weak();
         let tray = tray.as_weak();
         let hits = hits.clone();
         move |text| {
@@ -330,9 +348,12 @@ fn wire(
                 session.query = text.to_string();
                 session.art_pending = true;
             }
-            if let (Some(ui), Some(tray)) = (ui.upgrade(), tray.upgrade()) {
+            if let (Some(ui), Some(panel), Some(tray)) =
+                (ui.upgrade(), panel.upgrade(), tray.upgrade())
+            {
                 render(
                     &ui,
+                    &panel,
                     &tray,
                     &hits,
                     &Rc::new(VecModel::from(Vec::new())),
@@ -380,11 +401,26 @@ fn wire(
         let wake = wake.clone();
         move || begin_stop(&session, &log, &tx, &wake, true)
     });
-    ui.on_toggle_queue({
-        let session = session.clone();
+    let open_queue = {
+        let dock = dock.clone();
+        let panel = panel.as_weak();
         move || {
-            if let Ok(mut session) = session.lock() {
-                session.queue_open = !session.queue_open;
+            if let Some(panel) = panel.upgrade()
+                && panel.get_schedule_date().is_empty()
+            {
+                panel.set_schedule_date(Local::now().format("%Y-%m-%d").to_string().into());
+            }
+            dock.open(Mode::Queue);
+        }
+    };
+    ui.on_toggle_queue({
+        let dock = dock.clone();
+        let open_queue = open_queue.clone();
+        move || {
+            if dock.mode() == Some(Mode::Queue) {
+                dock.close();
+            } else {
+                open_queue();
             }
         }
     });
@@ -392,13 +428,9 @@ fn wire(
         let session = session.clone();
         let ui = ui.as_weak();
         move || {
-            if let (Ok(mut session), Some(ui)) = (session.lock(), ui.upgrade()) {
+            if let (Ok(session), Some(ui)) = (session.lock(), ui.upgrade()) {
                 sync_settings_from_config(&ui, &session.config);
-                session.queue_open = false;
                 let _ = ui.show();
-            }
-            if let Ok(mut session) = session.lock() {
-                let _ = &mut session;
             }
             if let Some(ui) = ui.upgrade() {
                 ui.set_settings_open(true);
@@ -466,21 +498,36 @@ fn wire(
             }
         }
     });
-    ui.on_add_queue({
+    panel.on_add_queue({
         let session = session.clone();
-        let ui = ui.as_weak();
-        move || add_selected_to_queue(&session, &ui)
+        let panel = panel.as_weak();
+        let wake = wake.clone();
+        move || {
+            add_selected_to_queue(&session, &panel);
+            wake();
+        }
     });
-    ui.on_queue_up({
+    panel.on_queue_up({
         let session = session.clone();
-        move |index| move_queue(&session, index as usize, index as usize - 1)
+        let wake = wake.clone();
+        move |index| {
+            if index > 0 {
+                move_queue(&session, index as usize, index as usize - 1);
+            }
+            wake();
+        }
     });
-    ui.on_queue_down({
+    panel.on_queue_down({
         let session = session.clone();
-        move |index| move_queue(&session, index as usize, index as usize + 1)
+        let wake = wake.clone();
+        move |index| {
+            move_queue(&session, index as usize, index as usize + 1);
+            wake();
+        }
     });
-    ui.on_queue_remove({
+    panel.on_queue_remove({
         let session = session.clone();
+        let wake = wake.clone();
         move |index| {
             if let Ok(mut session) = session.lock() {
                 if let Err(error) = session.queue.remove(index as usize) {
@@ -489,9 +536,10 @@ fn wire(
                     persist_queue(&mut session);
                 }
             }
+            wake();
         }
     });
-    ui.on_queue_clear({
+    panel.on_queue_clear({
         let session = session.clone();
         let log = log.clone();
         let tx = tx.clone();
@@ -505,9 +553,10 @@ fn wire(
             if let Some(action) = action {
                 dispatch_queue_action(&session, &log, &tx, &wake, action);
             }
+            wake();
         }
     });
-    ui.on_queue_start({
+    panel.on_queue_start({
         let session = session.clone();
         let log = log.clone();
         let tx = tx.clone();
@@ -515,10 +564,11 @@ fn wire(
         move || {
             queue_command(&session, &log, &tx, &wake, |queue| {
                 queue.start_now(Instant::now())
-            })
+            });
+            wake();
         }
     });
-    ui.on_queue_pause({
+    panel.on_queue_pause({
         let session = session.clone();
         let log = log.clone();
         let tx = tx.clone();
@@ -534,9 +584,10 @@ fn wire(
             if let Some(action) = action {
                 dispatch_queue_action(&session, &log, &tx, &wake, action);
             }
+            wake();
         }
     });
-    ui.on_queue_resume({
+    panel.on_queue_resume({
         let session = session.clone();
         let log = log.clone();
         let tx = tx.clone();
@@ -549,9 +600,10 @@ fn wire(
             if let Some(action) = action {
                 dispatch_queue_action(&session, &log, &tx, &wake, action);
             }
+            wake();
         }
     });
-    ui.on_queue_skip({
+    panel.on_queue_skip({
         let session = session.clone();
         let log = log.clone();
         let tx = tx.clone();
@@ -564,22 +616,31 @@ fn wire(
             if let Some(action) = action {
                 dispatch_queue_action(&session, &log, &tx, &wake, action);
             }
+            wake();
         }
     });
-    ui.on_queue_stop({
+    panel.on_queue_stop({
         let session = session.clone();
         let log = log.clone();
         let tx = tx.clone();
         let wake = wake.clone();
-        move || begin_stop(&session, &log, &tx, &wake, false)
+        move || {
+            begin_stop(&session, &log, &tx, &wake, false);
+            wake();
+        }
     });
-    ui.on_arm_schedule({
+    panel.on_arm_schedule({
         let session = session.clone();
-        let ui = ui.as_weak();
-        move || arm_schedule(&session, &ui)
+        let panel = panel.as_weak();
+        let wake = wake.clone();
+        move || {
+            arm_schedule(&session, &panel);
+            wake();
+        }
     });
-    ui.on_disarm_schedule({
+    panel.on_disarm_schedule({
         let session = session.clone();
+        let wake = wake.clone();
         move || {
             if let Ok(mut session) = session.lock() {
                 if let Err(error) = session.queue.disarm() {
@@ -589,11 +650,17 @@ fn wire(
                     toast(&mut session, "Schedule cleared.");
                 }
             }
+            wake();
         }
+    });
+    panel.on_close_panel({
+        let dock = dock.clone();
+        move || dock.close()
     });
     ui.on_request_close({
         let session = session.clone();
         let ui = ui.as_weak();
+        let dock = dock.clone();
         let log = log.clone();
         let tx = tx.clone();
         let wake = wake.clone();
@@ -603,6 +670,7 @@ fn wire(
                 .map(|session| session.config.close_to_tray)
                 .unwrap_or(true);
             if close_to_tray {
+                dock.dismiss();
                 if let Some(ui) = ui.upgrade() {
                     let _ = ui.hide();
                 }
@@ -616,7 +684,7 @@ fn wire(
         let ui = ui.as_weak();
         move || {
             if let Some(ui) = ui.upgrade() {
-                let _ = ui.show();
+                show_main(&ui);
             }
         }
     });
@@ -642,22 +710,19 @@ fn wire(
         move || begin_stop(&session, &log, &tx, &wake, true)
     });
     tray.on_open_queue({
-        let session = session.clone();
         let ui = ui.as_weak();
         move || {
-            if let Ok(mut session) = session.lock() {
-                session.queue_open = true;
-            }
             if let Some(ui) = ui.upgrade() {
-                let _ = ui.show();
+                show_main(&ui);
             }
+            open_queue();
         }
     });
     tray.on_open_settings({
         let ui = ui.as_weak();
         move || {
             if let Some(ui) = ui.upgrade() {
-                let _ = ui.show();
+                show_main(&ui);
                 ui.set_settings_open(true);
             }
         }
@@ -673,6 +738,7 @@ fn wire(
 
 fn render(
     ui: &MainWindow,
+    panel: &SidePanel,
     tray: &TrayIcon,
     hits: &VecModel<Hit>,
     rows: &VecModel<QueueRow>,
@@ -702,7 +768,6 @@ fn render(
     } else {
         "No games match that.".into()
     });
-    ui.set_queue_open(session.queue_open);
     ui.set_queue_count(format!("Queue ({})", session.queue.items().len()).into());
     let selected = session
         .selected
@@ -747,13 +812,25 @@ fn render(
         }
         .into(),
     );
-    ui.set_queue_status(queue_status(&session).into());
     ui.set_toast(if session.toast_until.is_some_and(|until| now < until) {
         session.toast.clone().into()
     } else {
         SharedString::default()
     });
-    rows.set_vec(queue_rows(&session, now));
+    sync_model(rows, queue_rows(&session, now));
+    let (queue_phase, queue_text) = queue_state(&session);
+    panel.set_queue_state(queue_phase.into());
+    panel.set_queue_status(queue_text.into());
+    panel.set_queue_summary(queue_summary(&session, now).into());
+    panel.set_schedule_armed(matches!(
+        session.queue.activity(),
+        QueueActivity::Scheduled { .. }
+    ));
+    panel.set_has_selection(selected.is_some());
+    if let Some(game) = selected {
+        panel.set_selected_name(game.name.clone().into());
+        panel.set_selected_art(cached_art(&game.id));
+    }
 
     tray.set_status_tip(if let Some(game) = selected {
         format!("Game Larper · {} · {label}", game.name).into()

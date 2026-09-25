@@ -19,6 +19,7 @@ slint = { version = "~1.18.1", default-features = false, features = [
     "system-tray",
     "accessibility",
     "raw-window-handle-06",
+    "unstable-winit-030",
 ] }
 serde.workspace = true
 serde_json.workspace = true

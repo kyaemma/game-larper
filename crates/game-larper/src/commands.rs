@@ -265,9 +265,11 @@ fn select_index(session: &Arc<Mutex<Session>>, log: &Log, index: usize, _play: b
     }
 }
 
-fn add_selected_to_queue(session: &Arc<Mutex<Session>>, ui: &Weak<MainWindow>) {
-    let Some(ui) = ui.upgrade() else { return };
-    let minutes: u64 = ui.get_minutes().parse().unwrap_or(0);
+fn add_selected_to_queue(session: &Arc<Mutex<Session>>, panel: &Weak<SidePanel>) {
+    let minutes: u64 = panel
+        .upgrade()
+        .map(|panel| panel.get_minutes().trim().parse().unwrap_or(0))
+        .unwrap_or(30);
     let Ok(mut session) = session.lock() else {
         return;
     };
@@ -290,7 +292,6 @@ fn add_selected_to_queue(session: &Arc<Mutex<Session>>, ui: &Weak<MainWindow>) {
     {
         Ok(_) => {
             persist_queue(&mut session);
-            session.queue_open = true;
             toast(&mut session, format!("Queued {name} for {minutes} min."));
         }
         Err(error) => toast(&mut session, error.to_string()),
@@ -307,10 +308,10 @@ fn move_queue(session: &Arc<Mutex<Session>>, from: usize, to: usize) {
     }
 }
 
-fn arm_schedule(session: &Arc<Mutex<Session>>, ui: &Weak<MainWindow>) {
-    let Some(ui) = ui.upgrade() else { return };
-    let date = ui.get_schedule_date().to_string();
-    let time = ui.get_schedule_time().to_string();
+fn arm_schedule(session: &Arc<Mutex<Session>>, panel: &Weak<SidePanel>) {
+    let Some(panel) = panel.upgrade() else { return };
+    let date = panel.get_schedule_date().to_string();
+    let time = panel.get_schedule_time().to_string();
     let Ok(mut session) = session.lock() else {
         return;
     };
@@ -440,19 +441,76 @@ fn displayed_time(session: &Session, now: Instant) -> String {
     }
 }
 
-fn queue_status(session: &Session) -> String {
+/// "12:04" under an hour, "1:02:03" above.
+fn format_short(duration: Duration) -> String {
+    let seconds = duration.as_secs();
+    let (hours, minutes, seconds) = (seconds / 3600, seconds / 60 % 60, seconds % 60);
+    if hours > 0 {
+        format!("{hours}:{minutes:02}:{seconds:02}")
+    } else {
+        format!("{minutes}:{seconds:02}")
+    }
+}
+
+/// "45 min", "1 h", "1 h 30 min".
+fn format_minutes(duration: Duration) -> String {
+    let minutes = duration.as_secs().div_ceil(60);
+    match (minutes / 60, minutes % 60) {
+        (0, minutes) => format!("{minutes} min"),
+        (hours, 0) => format!("{hours} h"),
+        (hours, minutes) => format!("{hours} h {minutes} min"),
+    }
+}
+
+fn queue_state(session: &Session) -> (&'static str, String) {
+    let count = session.queue.items().len();
     match session.queue.activity() {
-        QueueActivity::Idle => "Queue is idle.".into(),
-        QueueActivity::Scheduled { at_unix_ms } => format!("Armed for {}", format_unix(at_unix_ms)),
-        QueueActivity::Missed { at_unix_ms } => format!("Missed {}", format_unix(at_unix_ms)),
+        QueueActivity::Idle => ("idle", "Idle".into()),
+        QueueActivity::Scheduled { at_unix_ms } => {
+            ("scheduled", format!("Starts {}", format_unix(at_unix_ms)))
+        }
+        QueueActivity::Missed { at_unix_ms } => (
+            "missed",
+            format!("Missed start · {}", format_unix(at_unix_ms)),
+        ),
         QueueActivity::Running { index } => {
-            format!("Playing {} of {}", index + 1, session.queue.items().len())
+            ("running", format!("Playing {} of {count}", index + 1))
         }
         QueueActivity::Paused { index } => {
-            format!("Paused on {} of {}", index + 1, session.queue.items().len())
+            ("paused", format!("Paused on {} of {count}", index + 1))
         }
-        QueueActivity::Transition { next_index } => format!("Switching to item {}", next_index + 1),
-        QueueActivity::Failed { message, .. } => message,
+        QueueActivity::Transition { next_index } => (
+            "transition",
+            format!("Switching to {} of {count}…", next_index + 1),
+        ),
+        QueueActivity::Failed { message, .. } => ("failed", message),
+    }
+}
+
+/// Time left in the whole queue, or its total length when idle.
+fn queue_summary(session: &Session, now: Instant) -> String {
+    let items = session.queue.items();
+    if items.is_empty() {
+        return String::new();
+    }
+    let active = session.queue.active_index();
+    let total: Duration = items
+        .iter()
+        .enumerate()
+        .filter(|(index, _)| active.is_none_or(|active| *index >= active))
+        .map(|(index, item)| {
+            if Some(index) == active {
+                session.queue.remaining(now).unwrap_or(item.duration)
+            } else {
+                item.duration
+            }
+        })
+        .sum();
+    if active.is_some() {
+        format!("{} left", format_minutes(total))
+    } else {
+        let games = if items.len() == 1 { "game" } else { "games" };
+        format!("{} {games} · {}", items.len(), format_minutes(total))
     }
 }
 
@@ -467,18 +525,32 @@ fn queue_rows(session: &Session, now: Instant) -> Vec<QueueRow> {
             let meta = if Some(index) == active {
                 format!(
                     "{} left",
-                    format_hms(session.queue.remaining(now).unwrap_or(item.duration))
+                    format_short(session.queue.remaining(now).unwrap_or(item.duration))
                 )
             } else {
-                format!("{} min", item.duration.as_secs() / 60)
+                format_minutes(item.duration)
             };
             QueueRow {
                 name: item.name.clone().into(),
                 meta: meta.into(),
+                art: cached_art(&item.application_id),
                 active: Some(index) == active,
             }
         })
         .collect()
+}
+
+/// Update rows in place so delegates, hover state, and scroll position survive a render.
+fn sync_model<T: Clone + PartialEq + 'static>(model: &VecModel<T>, rows: Vec<T>) {
+    if model.row_count() != rows.len() {
+        model.set_vec(rows);
+        return;
+    }
+    for (index, row) in rows.into_iter().enumerate() {
+        if model.row_data(index).as_ref() != Some(&row) {
+            model.set_row_data(index, row);
+        }
+    }
 }
 
 fn art_targets(session: &Session) -> Vec<GameDefinition> {
@@ -535,14 +607,16 @@ fn runner_template() -> Result<PathBuf, String> {
     Err("The bundled native runner is missing.".into())
 }
 
-fn round_after_show(ui: &MainWindow) {
-    let handle = ui.window().window_handle();
-    let Ok(handle) = handle.window_handle() else {
-        return;
-    };
-    if let RawWindowHandle::Win32(window) = handle.as_raw() {
-        let hwnd = window.hwnd.get() as windows_sys::Win32::Foundation::HWND;
-        platform::round_corners(hwnd);
+fn style_main(ui: &MainWindow) {
+    if let Some(hwnd) = platform::hwnd_of(ui.window()) {
+        platform::style_frame(hwnd);
+    }
+}
+
+/// Show the main window. The first show creates the native window, so style it each time.
+fn show_main(ui: &MainWindow) {
+    if ui.show().is_ok() {
+        style_main(ui);
     }
 }
 

@@ -7,11 +7,12 @@ use windows_sys::Win32::Foundation::{
     CloseHandle, ERROR_ALREADY_EXISTS, GetLastError, HANDLE, HWND, LPARAM, WPARAM,
 };
 use windows_sys::Win32::Graphics::Dwm::{
-    DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_ROUND, DwmSetWindowAttribute,
+    DWMWA_BORDER_COLOR, DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_ROUNDSMALL, DwmSetWindowAttribute,
 };
 use windows_sys::Win32::Graphics::Gdi::{
     BI_RGB, BITMAPINFO, BITMAPINFOHEADER, CreateBitmap, CreateDIBSection, DIB_RGB_COLORS,
-    DeleteObject, GetDC, ReleaseDC,
+    DeleteObject, GetDC, GetMonitorInfoW, MONITOR_DEFAULTTONEAREST, MONITORINFO, MonitorFromWindow,
+    ReleaseDC,
 };
 use windows_sys::Win32::System::Registry::{
     HKEY, HKEY_CURRENT_USER, KEY_SET_VALUE, REG_SZ, RegCloseKey, RegDeleteValueW, RegOpenKeyExW,
@@ -22,14 +23,16 @@ use windows_sys::Win32::System::Threading::{
     WaitForSingleObject,
 };
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    CreateIconIndirect, DestroyIcon, HICON, ICON_BIG, ICON_SMALL, ICONINFO, SendMessageW,
-    WM_SETICON,
+    CreateIconIndirect, DestroyIcon, GWLP_HWNDPARENT, HICON, ICON_BIG, ICON_SMALL, ICONINFO,
+    SendMessageW, SetWindowLongPtrW, WM_SETICON,
 };
 
 const RUN_KEY: &str = "Software\\Microsoft\\Windows\\CurrentVersion\\Run";
 const STARTUP_VALUE: &str = "GameLarper";
 const MUTEX_NAME: &str = "Local\\GameLarper.SingleInstance";
 const EVENT_NAME: &str = "Local\\GameLarper.Activate";
+/// DWM draws this 1px outline around both windows on Windows 11 (COLORREF, 0x00BBGGRR).
+const BORDER_COLOR: u32 = 0x003A_2F26;
 
 pub fn claim_primary_instance() -> bool {
     let name = wide(MUTEX_NAME);
@@ -122,16 +125,63 @@ pub fn open_in_explorer(path: &Path) -> Result<(), String> {
         .map_err(|error| error.to_string())
 }
 
-pub fn round_corners(hwnd: HWND) {
-    let preference = DWMWCP_ROUND as u32;
+/// The Win32 handle behind a shown Slint window.
+pub fn hwnd_of(window: &slint::Window) -> Option<HWND> {
+    use raw_window_handle::{HasWindowHandle, RawWindowHandle};
+    let handle = window.window_handle();
+    let handle = handle.window_handle().ok()?;
+    match handle.as_raw() {
+        RawWindowHandle::Win32(window) => Some(window.hwnd.get() as HWND),
+        _ => None,
+    }
+}
+
+/// Small system corners and a quiet outline, so the frameless window still reads as native.
+pub fn style_frame(hwnd: HWND) {
+    let corners = DWMWCP_ROUNDSMALL as u32;
+    let border = BORDER_COLOR;
     unsafe {
         DwmSetWindowAttribute(
             hwnd,
             DWMWA_WINDOW_CORNER_PREFERENCE as u32,
-            &preference as *const _ as *const c_void,
-            std::mem::size_of_val(&preference) as u32,
+            &corners as *const _ as *const c_void,
+            std::mem::size_of_val(&corners) as u32,
+        );
+        DwmSetWindowAttribute(
+            hwnd,
+            DWMWA_BORDER_COLOR as u32,
+            &border as *const _ as *const c_void,
+            std::mem::size_of_val(&border) as u32,
         );
     }
+}
+
+/// Owned windows stay above their owner, minimize with it, and skip the taskbar.
+pub fn set_owner(window: HWND, owner: HWND) {
+    unsafe { SetWindowLongPtrW(window, GWLP_HWNDPARENT, owner as isize) };
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct WorkArea {
+    pub left: i32,
+    pub right: i32,
+}
+
+/// The usable horizontal span (without the taskbar) of the monitor showing `hwnd`.
+pub fn work_area(hwnd: HWND) -> Option<WorkArea> {
+    let monitor = unsafe { MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST) };
+    if monitor.is_null() {
+        return None;
+    }
+    let mut info: MONITORINFO = unsafe { std::mem::zeroed() };
+    info.cbSize = std::mem::size_of::<MONITORINFO>() as u32;
+    if unsafe { GetMonitorInfoW(monitor, &mut info) } == 0 {
+        return None;
+    }
+    Some(WorkArea {
+        left: info.rcWork.left,
+        right: info.rcWork.right,
+    })
 }
 
 pub fn integrity_of(process: HANDLE) -> String {

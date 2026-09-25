@@ -5,6 +5,7 @@ mod app;
 mod host;
 mod log;
 mod net;
+mod panel;
 mod platform;
 
 use std::process::ExitCode;

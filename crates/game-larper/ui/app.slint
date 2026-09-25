@@ -1,5 +1,8 @@
 import { LineEdit, ListView } from "std-widgets.slint";
 
+export { QueueRow } from "models.slint";
+export { SidePanel } from "side-panel.slint";
+
 export global Theme {
     out property <color> background: #0D1018;
     out property <color> surface: #151A26;
@@ -21,12 +24,6 @@ export struct Hit {
     detail: string,
     art: image,
     selected: bool,
-}
-
-export struct QueueRow {
-    name: string,
-    meta: string,
-    active: bool,
 }
 
 component Action inherits Rectangle {
@@ -134,12 +131,8 @@ export component MainWindow inherits Window {
     in-out property <bool> pause-enabled: false;
     in-out property <bool> stop-enabled: false;
     in-out property <string> queue-count: "Queue";
-    in-out property <bool> queue-open: false;
-    in-out property <[QueueRow]> queue-rows;
-    in-out property <string> queue-status: "Queue is idle.";
-    in-out property <string> minutes: "30";
-    in-out property <string> schedule-date: "";
-    in-out property <string> schedule-time: "";
+    // The docked side panel that is open: "" or "queue".
+    in-out property <string> panel;
     in-out property <bool> settings-open: false;
     in-out property <bool> launch-with-windows: false;
     in-out property <bool> start-minimized: false;
@@ -165,18 +158,6 @@ export component MainWindow inherits Window {
     callback clear-images();
     callback open-logs();
     callback open-data();
-    callback add-queue();
-    callback queue-up(int);
-    callback queue-down(int);
-    callback queue-remove(int);
-    callback queue-clear();
-    callback queue-start();
-    callback queue-pause();
-    callback queue-resume();
-    callback queue-skip();
-    callback queue-stop();
-    callback arm-schedule();
-    callback disarm-schedule();
     callback request-close();
 
     forward-focus: search;
@@ -242,7 +223,7 @@ export component MainWindow inherits Window {
                     overflow: elide;
                 }
 
-                if (!root.queue-open): VerticalLayout {
+                VerticalLayout {
                     vertical-stretch: 1;
                     spacing: 8px;
                     if (root.hits.length == 0): Text {
@@ -298,78 +279,6 @@ export component MainWindow inherits Window {
                     }
                 }
 
-                if (root.queue-open): VerticalLayout {
-                    vertical-stretch: 1;
-                    spacing: 8px;
-                    Text { text: root.queue-status; color: Theme.muted; font-size: 12px; wrap: word-wrap; }
-                    HorizontalLayout {
-                        spacing: 8px;
-                        alignment: center;
-                        LineEdit {
-                            text: root.minutes;
-                            placeholder-text: "Minutes";
-                            horizontal-stretch: 0;
-                            width: 88px;
-                            edited(text) => { root.minutes = text; }
-                        }
-                        Action { label: "15m"; horizontal-stretch: 0; min-width: 56px; clicked => { root.minutes = "15"; } }
-                        Action { label: "30m"; horizontal-stretch: 0; min-width: 56px; clicked => { root.minutes = "30"; } }
-                        Action { label: "1h"; horizontal-stretch: 0; min-width: 56px; clicked => { root.minutes = "60"; } }
-                        Action { label: "2h"; horizontal-stretch: 0; min-width: 56px; clicked => { root.minutes = "120"; } }
-                        Action { label: "Add selected"; primary: true; clicked => { root.add-queue(); } }
-                    }
-                    ListView {
-                        vertical-stretch: 1;
-                        for row[index] in root.queue-rows: Rectangle {
-                            height: 56px;
-                            background: row.active ? Theme.raised : Theme.surface;
-                            border-radius: 8px;
-                            border-width: 1px;
-                            border-color: Theme.border;
-                            HorizontalLayout {
-                                padding-left: 12px;
-                                padding-right: 8px;
-                                spacing: 8px;
-                                alignment: center;
-                                VerticalLayout {
-                                    alignment: center;
-                                    Text { text: row.name; color: Theme.text; font-weight: 600; overflow: elide; }
-                                    Text { text: row.meta; color: Theme.muted; font-size: 12px; }
-                                }
-                                Action { label: "Up"; horizontal-stretch: 0; min-width: 48px; clicked => { root.queue-up(index); } }
-                                Action { label: "Down"; horizontal-stretch: 0; min-width: 64px; clicked => { root.queue-down(index); } }
-                                Action { label: "Remove"; horizontal-stretch: 0; min-width: 76px; clicked => { root.queue-remove(index); } }
-                            }
-                        }
-                    }
-                    HorizontalLayout {
-                        spacing: 8px;
-                        Action { label: "Start"; primary: true; clicked => { root.queue-start(); } }
-                        Action { label: "Pause"; clicked => { root.queue-pause(); } }
-                        Action { label: "Resume"; clicked => { root.queue-resume(); } }
-                        Action { label: "Skip"; clicked => { root.queue-skip(); } }
-                        Action { label: "Stop"; clicked => { root.queue-stop(); } }
-                        Action { label: "Clear"; clicked => { root.queue-clear(); } }
-                    }
-                    HorizontalLayout {
-                        spacing: 8px;
-                        alignment: center;
-                        LineEdit {
-                            text: root.schedule-date;
-                            placeholder-text: "YYYY-MM-DD";
-                            edited(text) => { root.schedule-date = text; }
-                        }
-                        LineEdit {
-                            text: root.schedule-time;
-                            placeholder-text: "HH:MM";
-                            width: 90px;
-                            horizontal-stretch: 0;
-                            edited(text) => { root.schedule-time = text; }
-                        }
-                        Action { label: "Arm"; horizontal-stretch: 0; min-width: 64px; clicked => { root.arm-schedule(); } }
-                        Action { label: "Disarm"; horizontal-stretch: 0; min-width: 80px; clicked => { root.disarm-schedule(); } }
-                    }
-                }
             }
 
             Rectangle {

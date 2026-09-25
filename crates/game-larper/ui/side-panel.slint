@@ -1,0 +1,127 @@
+// The attached side panel. Rust keeps it docked beside the main window.
+// It hosts the queue; more surfaces can share the same dock.
+
+import { Theme, Icons } from "theme.slint";
+import { IconButton } from "controls.slint";
+import { QueueRow } from "models.slint";
+import { QueueView } from "queue.slint";
+
+export component SidePanel inherits Window {
+    title: "Queue · Game Larper";
+    icon: @image-url("../../../assets/branding/game-larper-logo.png");
+    no-frame: true;
+    min-width: 336px;
+    max-width: 336px;
+    preferred-width: 336px;
+    min-height: 420px;
+    preferred-height: 740px;
+    background: Theme.bg-alt;
+    default-font-family: Theme.font;
+    default-font-size: Theme.text-m;
+
+    // "queue"
+    in-out property <string> mode: "queue";
+    // Drives the open/close motion.
+    in-out property <bool> shown;
+    // True when the panel sits left of the main window.
+    in-out property <bool> from-left;
+
+    // Queue.
+    in-out property <[QueueRow]> queue-rows;
+    in-out property <string> queue-state: "idle";
+    in-out property <string> queue-status: "Idle";
+    in-out property <string> queue-summary;
+    in-out property <bool> has-selection;
+    in-out property <string> selected-name;
+    in-out property <image> selected-art;
+    in-out property <string> minutes: "30";
+    in-out property <string> schedule-date;
+    in-out property <string> schedule-time;
+    in-out property <bool> schedule-armed;
+
+    callback close-panel();
+    callback add-queue();
+    callback queue-up(int);
+    callback queue-down(int);
+    callback queue-remove(int);
+    callback queue-clear();
+    callback queue-start();
+    callback queue-pause();
+    callback queue-resume();
+    callback queue-skip();
+    callback queue-stop();
+    callback arm-schedule();
+    callback disarm-schedule();
+
+    forward-focus: keys;
+
+    keys := FocusScope {
+        capture-key-pressed(event) => {
+            if (event.text == Key.Escape) {
+                root.close-panel();
+                return accept;
+            }
+            reject
+        }
+
+        Rectangle {
+            x: root.shown ? 0px : (root.from-left ? 10px : -10px);
+            opacity: root.shown ? 1 : 0;
+            animate x { duration: Theme.normal; easing: ease-out; }
+            animate opacity { duration: Theme.normal; easing: ease-out; }
+
+            VerticalLayout {
+                HorizontalLayout {
+                    height: 52px;
+                    padding-left: 20px;
+                    padding-right: 10px;
+                    spacing: 8px;
+                    Text {
+                        text: "Queue";
+                        color: Theme.text;
+                        font-size: 15px;
+                        font-weight: 600;
+                        vertical-alignment: center;
+                        horizontal-stretch: 1;
+                    }
+                    VerticalLayout {
+                        alignment: center;
+                        IconButton {
+                            icon: Icons.close;
+                            icon-size: 13px;
+                            tip: "Close";
+                            clicked => { root.close-panel(); }
+                        }
+                    }
+                }
+
+                if root.mode == "queue": QueueView {
+                    vertical-stretch: 1;
+                    rows: root.queue-rows;
+                    state: root.queue-state;
+                    status: root.queue-status;
+                    summary: root.queue-summary;
+                    has-selection: root.has-selection;
+                    selected-name: root.selected-name;
+                    selected-art: root.selected-art;
+                    minutes <=> root.minutes;
+                    schedule-date <=> root.schedule-date;
+                    schedule-time <=> root.schedule-time;
+                    armed: root.schedule-armed;
+                    add => { root.add-queue(); }
+                    up(index) => { root.queue-up(index); }
+                    down(index) => { root.queue-down(index); }
+                    remove(index) => { root.queue-remove(index); }
+                    clear => { root.queue-clear(); }
+                    start => { root.queue-start(); }
+                    pause => { root.queue-pause(); }
+                    resume => { root.queue-resume(); }
+                    skip => { root.queue-skip(); }
+                    stop => { root.queue-stop(); }
+                    arm => { root.arm-schedule(); }
+                    disarm => { root.disarm-schedule(); }
+                }
+            }
+        }
+    }
+}
