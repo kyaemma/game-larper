@@ -1,0 +1,243 @@
+// The main window: one calm vertical column.
+// Title bar, search, results, the current session, then a quiet utility row.
+
+import { Theme, Icons } from "theme.slint";
+import { LogoMark, CaptionButton, Hairline, Gutter } from "controls.slint";
+import { Hit } from "models.slint";
+import { SearchField, ResultsList, Message } from "search.slint";
+import { SessionDock, UtilityBar, Toast } from "dock.slint";
+
+component TitleBar inherits Rectangle {
+    in property <bool> maximized;
+    callback minimize();
+    callback toggle-maximize();
+    callback close();
+
+    height: 40px;
+    WindowMoveArea {
+        width: 100%;
+        height: 100%;
+    }
+    HorizontalLayout {
+        padding-left: 14px;
+        spacing: 9px;
+        VerticalLayout {
+            alignment: center;
+            LogoMark {
+                width: 18px;
+                height: 18px;
+            }
+        }
+        Text {
+            text: "Game Larper";
+            color: Theme.text-2;
+            font-size: Theme.text-m;
+            font-weight: 600;
+            vertical-alignment: center;
+        }
+        Rectangle { horizontal-stretch: 1; }
+        CaptionButton {
+            icon: Icons.window-minimize;
+            label: "Minimize";
+            clicked => { root.minimize(); }
+        }
+        CaptionButton {
+            icon: root.maximized ? Icons.window-restore : Icons.window-maximize;
+            label: root.maximized ? "Restore" : "Maximize";
+            clicked => { root.toggle-maximize(); }
+        }
+        CaptionButton {
+            icon: Icons.window-close;
+            label: "Close";
+            danger: true;
+            clicked => { root.close(); }
+        }
+    }
+}
+
+export component MainWindow inherits Window {
+    title: "Game Larper";
+    icon: @image-url("../../../assets/branding/game-larper-logo.png");
+    no-frame: true;
+    resize-border-width: root.maximized ? 0px : 6px;
+    min-width: 440px;
+    min-height: 560px;
+    preferred-width: 560px;
+    preferred-height: 740px;
+    background: Theme.bg;
+    default-font-family: Theme.font;
+    default-font-size: Theme.text-m;
+
+    // Search and results.
+    in-out property <string> query;
+    in-out property <[Hit]> hits;
+    // "idle" | "ready" | "empty" | "unavailable"
+    in-out property <string> results-state: "idle";
+    in-out property <int> selected-index: -1;
+    in-out property <string> db-status;
+    in-out property <color> db-color: Theme.text-3;
+
+    // Current session.
+    in-out property <bool> session-visible;
+    in-out property <image> session-art;
+    in-out property <string> session-name;
+    in-out property <string> session-state: "Ready";
+    in-out property <string> session-mode: "stopped";
+    in-out property <color> session-color: Theme.text-3;
+    in-out property <string> session-time: "00:00:00";
+    in-out property <string> session-note;
+    in-out property <string> play-label: "Play";
+    in-out property <bool> play-enabled;
+    in-out property <bool> pause-enabled;
+    in-out property <bool> stop-enabled;
+    in-out property <bool> resume-queue;
+    in-out property <bool> play-blocked;
+
+    // Utility row.
+    in-out property <int> queue-count;
+    in-out property <string> queue-line;
+    // "" | "queue" | "settings"
+    in-out property <string> panel;
+
+    in-out property <string> toast;
+    in-out property <bool> toast-visible;
+    in-out property <string> toast-kind: "info";
+
+    callback query-edited(string);
+    callback step(int);
+    callback choose(int);
+    callback activate(int);
+    callback play();
+    callback pause();
+    callback stop();
+    callback queue-resume();
+    callback toggle-queue();
+    callback open-settings();
+    callback notify(string);
+    callback refresh-catalog();
+    callback request-close();
+
+    function open-steam(steam-id: string) {
+        if (steam-id != "" && !Platform.open-url("https://store.steampowered.com/app/" + steam-id + "/")) {
+            root.notify("Couldn't open the browser.");
+        }
+    }
+
+    changed selected-index => {
+        list.reveal(root.selected-index);
+    }
+
+    forward-focus: search;
+
+    VerticalLayout {
+        TitleBar {
+            maximized: root.maximized;
+            minimize => { root.minimized = true; }
+            toggle-maximize => { root.maximized = !root.maximized; }
+            close => { root.request-close(); }
+        }
+        HorizontalLayout {
+            padding-top: 4px;
+            padding-bottom: 12px;
+            Gutter { }
+            search := SearchField {
+                horizontal-stretch: 100;
+                max-width: 680px;
+                text <=> root.query;
+                edited(text) => {
+                    root.query-edited(text);
+                    list.top();
+                }
+                accepted => {
+                    if (root.hits.length > 0) {
+                        root.activate(root.selected-index >= 0 ? root.selected-index : 0);
+                    }
+                }
+                step(delta) => { root.step(delta); }
+            }
+            Gutter { }
+        }
+        results := HorizontalLayout {
+            vertical-stretch: 1;
+            Gutter { min-width: 12px; }
+            Rectangle {
+                horizontal-stretch: 100;
+                max-width: 696px;
+                list := ResultsList {
+                    hits: root.hits;
+                    // The dock follows the selection, so the selected row is the one playing.
+                    playing-id: root.session-mode == "playing" && root.selected-index >= 0 ? root.hits[root.selected-index].id : "";
+                    blocked: root.play-blocked;
+                    opacity: root.results-state == "ready" ? 1 : 0;
+                    visible: self.opacity > 0;
+                    animate opacity { duration: Theme.normal; easing: ease-out; }
+                    select(index) => { root.choose(index); }
+                    play(index) => { root.activate(index); }
+                    steam(id) => { root.open-steam(id); }
+                }
+                if root.results-state == "idle": Message {
+                    logo: true;
+                    title: "Pick a game.";
+                    body: "Type a name. Elden is a fine place to start.";
+                }
+                if root.results-state == "empty": Message {
+                    title: "Nothing called “" + root.query + "”";
+                    body: "Only games Discord knows how to detect show up here.";
+                }
+                if root.results-state == "unavailable": Message {
+                    title: "The game list isn’t here yet";
+                    body: "Game Larper couldn’t load Discord’s list of detectable games.";
+                    action: "Try again";
+                    action-clicked => { root.refresh-catalog(); }
+                }
+            }
+            Gutter { min-width: 12px; }
+        }
+        if root.session-visible: VerticalLayout {
+            vertical-stretch: 0;
+            Hairline { }
+            SessionDock {
+                art: root.session-art;
+                name: root.session-name;
+                state-label: root.session-state;
+                state-color: root.session-color;
+                mode: root.session-mode;
+                time: root.session-time;
+                note: root.session-note;
+                play-label: root.play-label;
+                play-enabled: root.play-enabled || root.resume-queue;
+                pause-enabled: root.pause-enabled;
+                stop-enabled: root.stop-enabled;
+                play => {
+                    if (root.resume-queue) {
+                        root.queue-resume();
+                    } else {
+                        root.play();
+                    }
+                }
+                pause => { root.pause(); }
+                stop => { root.stop(); }
+            }
+        }
+        Hairline { }
+        UtilityBar {
+            queue-count: root.queue-count;
+            queue-line: root.queue-line;
+            queue-open: root.panel == "queue";
+            settings-open: root.panel == "settings";
+            db-status: root.db-status;
+            db-color: root.db-color;
+            queue => { root.toggle-queue(); }
+            settings => { root.open-settings(); }
+        }
+    }
+
+    Toast {
+        text: root.toast;
+        shown: root.toast-visible;
+        kind: root.toast-kind;
+        x: (root.width - self.width) / 2;
+        y: results.y + results.height - self.height - 14px + (root.toast-visible ? 0px : 6px);
+        animate y { duration: Theme.normal; easing: ease-out; }
+    }
+}

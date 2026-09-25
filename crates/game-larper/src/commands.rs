@@ -24,7 +24,7 @@ fn begin_play(
         return;
     };
     let Some(game) = guard.games.iter().find(|game| game.id == id).cloned() else {
-        toast(&mut guard, "That game is no longer supported.");
+        toast_err(&mut guard, "That game is no longer supported.");
         return;
     };
     guard.busy = true;
@@ -133,7 +133,7 @@ fn dispatch_queue_action(
         guard.config.last_selected_discord_application_id = Some(item.application_id);
         let _ = ConfigStore::new(guard.paths.config()).save(&guard.config);
         game.or_else(|| {
-            toast(
+            toast_err(
                 &mut guard,
                 format!("{} is not in the current catalog.", item.name),
             );
@@ -275,7 +275,7 @@ fn add_selected_to_queue(session: &Arc<Mutex<Session>>, panel: &Weak<SidePanel>)
         return;
     };
     if !(1..=24 * 60).contains(&minutes) {
-        toast(&mut session, "Duration must be between 1 and 1440 minutes.");
+        toast_err(&mut session, "Duration must be between 1 and 1440 minutes.");
         return;
     }
     let Some(id) = session.selected.clone() else {
@@ -293,16 +293,16 @@ fn add_selected_to_queue(session: &Arc<Mutex<Session>>, panel: &Weak<SidePanel>)
     {
         Ok(_) => {
             persist_queue(&mut session);
-            toast(&mut session, format!("Queued {name} for {minutes} min."));
+            toast_ok(&mut session, format!("Queued {name} for {minutes} min."));
         }
-        Err(error) => toast(&mut session, error.to_string()),
+        Err(error) => toast_err(&mut session, error.to_string()),
     }
 }
 
 fn move_queue(session: &Arc<Mutex<Session>>, from: usize, to: usize) {
     if let Ok(mut session) = session.lock() {
         if let Err(error) = session.queue.move_item(from, to) {
-            toast(&mut session, error.to_string());
+            toast_err(&mut session, error.to_string());
         } else {
             persist_queue(&mut session);
         }
@@ -331,11 +331,11 @@ fn arm_schedule(session: &Arc<Mutex<Session>>, panel: &Weak<SidePanel>) {
         Ok(at) => match session.queue.arm(at, unix_time_ms(SystemTime::now())) {
             Ok(()) => {
                 persist_queue(&mut session);
-                toast(&mut session, "Queue armed.");
+                toast_ok(&mut session, "Queue armed.");
             }
-            Err(error) => toast(&mut session, error.to_string()),
+            Err(error) => toast_err(&mut session, error.to_string()),
         },
-        Err(error) => toast(&mut session, error),
+        Err(error) => toast_err(&mut session, error),
     }
 }
 
@@ -369,7 +369,7 @@ fn save_settings(session: &Arc<Mutex<Session>>, panel: &Weak<SidePanel>, log: &L
         )
     {
         log.info(format!("Startup registry error: {error}"));
-        toast(&mut session, error);
+        toast_err(&mut session, error);
         return false;
     }
     if !next.preserve_queue {
@@ -378,14 +378,14 @@ fn save_settings(session: &Arc<Mutex<Session>>, panel: &Weak<SidePanel>, log: &L
     session.config = next;
     if let Err(error) = ConfigStore::new(session.paths.config()).save(&session.config) {
         log.info(format!("Config save failed: {error}"));
-        toast(&mut session, "Settings could not be saved.");
+        toast_err(&mut session, "Settings could not be saved.");
         return false;
     }
     if session.config.preserve_queue {
         persist_queue(&mut session);
     }
     panel.set_settings_dirty(false);
-    toast(&mut session, "Settings saved.");
+    toast_ok(&mut session, "Settings saved.");
     true
 }
 
@@ -408,7 +408,7 @@ fn queue_command(
         .and_then(|mut guard| match command(&mut guard.queue) {
             Ok(action) => Some(action),
             Err(error) => {
-                toast(&mut guard, error.to_string());
+                toast_err(&mut guard, error.to_string());
                 None
             }
         });
@@ -432,7 +432,20 @@ fn cached_art(id: &str) -> slint::Image {
 }
 
 fn toast(session: &mut Session, message: impl AsRef<str>) {
+    show_toast(session, ToastKind::Info, message);
+}
+
+fn toast_ok(session: &mut Session, message: impl AsRef<str>) {
+    show_toast(session, ToastKind::Success, message);
+}
+
+fn toast_err(session: &mut Session, message: impl AsRef<str>) {
+    show_toast(session, ToastKind::Error, message);
+}
+
+fn show_toast(session: &mut Session, kind: ToastKind, message: impl AsRef<str>) {
     session.toast = message.as_ref().to_string();
+    session.toast_kind = kind;
     session.toast_until = Some(Instant::now() + Duration::from_secs(4));
 }
 
@@ -447,12 +460,16 @@ struct Controls {
     play: bool,
     pause: bool,
     stop: bool,
+    resume_queue: bool,
+    /// Nothing new can start: a launch or stop is in flight, or the queue owns the runner.
+    blocked: bool,
     play_label: &'static str,
 }
 
 fn controls(session: &Session) -> Controls {
+    let activity = session.queue.activity();
     let queue_running = matches!(
-        session.queue.activity(),
+        activity,
         QueueActivity::Running { .. }
             | QueueActivity::Paused { .. }
             | QueueActivity::Transition { .. }
@@ -465,6 +482,8 @@ fn controls(session: &Session) -> Controls {
             && !queue_running,
         pause: !session.busy && state == SessionState::Playing,
         stop: !session.busy && (state != SessionState::Stopped || queue_running),
+        resume_queue: !session.busy && matches!(activity, QueueActivity::Paused { .. }),
+        blocked: session.busy || queue_running,
         play_label: if state == SessionState::Paused {
             "Resume"
         } else {
@@ -502,6 +521,35 @@ fn format_minutes(duration: Duration) -> String {
         (0, minutes) => format!("{minutes} min"),
         (hours, 0) => format!("{hours} h"),
         (hours, minutes) => format!("{hours} h {minutes} min"),
+    }
+}
+
+/// The dock's quiet second line while the queue drives the session.
+fn queue_note(session: &Session, now: Instant) -> String {
+    let count = session.queue.items().len();
+    match session.queue.activity() {
+        QueueActivity::Running { index } => format!(
+            "Queue {} of {count} · {} left",
+            index + 1,
+            format_short(session.queue.remaining(now).unwrap_or_default())
+        ),
+        QueueActivity::Paused { index } => format!("Queue {} of {count}", index + 1),
+        QueueActivity::Transition { next_index } => {
+            format!("Queue · up next {} of {count}", next_index + 1)
+        }
+        _ => String::new(),
+    }
+}
+
+/// The utility row only speaks up about a schedule or a problem.
+fn queue_line(session: &Session) -> String {
+    match session.queue.activity() {
+        QueueActivity::Scheduled { at_unix_ms } => format!("Starts {}", format_unix(at_unix_ms)),
+        QueueActivity::Missed { at_unix_ms } => {
+            format!("Missed start · {}", format_unix(at_unix_ms))
+        }
+        QueueActivity::Failed { message, .. } => message,
+        _ => String::new(),
     }
 }
 
@@ -612,13 +660,6 @@ fn art_targets(session: &Session) -> Vec<GameDefinition> {
     games
 }
 
-fn detail_line(game: &GameDefinition) -> String {
-    match &game.steam_app_id {
-        Some(id) => format!("Steam {id} · Discord detected"),
-        None => "Discord detected".into(),
-    }
-}
-
 /// Result indexes for the current query.
 fn visible(session: &Session) -> Vec<usize> {
     game_larper_core::search(&session.games, &session.query, DEFAULT_SEARCH_LIMIT)
@@ -630,25 +671,12 @@ fn hit_rows(session: &Session, shown: &[usize]) -> Vec<Hit> {
         .filter_map(|&index| session.games.get(index))
         .map(|game| Hit {
             id: game.id.clone().into(),
+            steam_id: game.steam_app_id.clone().unwrap_or_default().into(),
             name: game.name.clone().into(),
-            detail: detail_line(game).into(),
             art: cached_art(&game.id),
             selected: session.selected.as_deref() == Some(game.id.as_str()),
         })
         .collect()
-}
-
-/// The status line under the search field.
-fn catalog_line(session: &Session) -> String {
-    if session.refreshing {
-        "Refreshing the game list…".into()
-    } else if session.games.is_empty() {
-        "Game database unavailable. Use Settings to retry.".into()
-    } else if session.offline {
-        "Offline: using the cached game database".into()
-    } else {
-        format!("{} supported games", group_digits(session.games.len()))
-    }
 }
 
 fn database_detail(session: &Session) -> String {
@@ -727,18 +755,23 @@ fn show_main(ui: &MainWindow) {
     }
 }
 
-enum ThemeColor {
+#[derive(Clone, Copy)]
+enum Tone {
+    Accent,
     Success,
     Warning,
+    Danger,
     Muted,
 }
 
-impl From<ThemeColor> for slint::Color {
-    fn from(value: ThemeColor) -> Self {
+impl From<Tone> for slint::Color {
+    fn from(value: Tone) -> Self {
         match value {
-            ThemeColor::Success => slint::Color::from_rgb_u8(0x69, 0xDA, 0xA5),
-            ThemeColor::Warning => slint::Color::from_rgb_u8(0xF5, 0xBE, 0x66),
-            ThemeColor::Muted => slint::Color::from_rgb_u8(0xAA, 0xB3, 0xC5),
+            Tone::Accent => slint::Color::from_rgb_u8(0xA4, 0x9E, 0xF8),
+            Tone::Success => slint::Color::from_rgb_u8(0x69, 0xDA, 0xA5),
+            Tone::Warning => slint::Color::from_rgb_u8(0xF5, 0xBE, 0x66),
+            Tone::Danger => slint::Color::from_rgb_u8(0xFF, 0x64, 0x75),
+            Tone::Muted => slint::Color::from_rgb_u8(0x70, 0x7A, 0x8D),
         }
     }
 }

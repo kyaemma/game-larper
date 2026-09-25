@@ -44,6 +44,13 @@ enum Msg {
     },
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum ToastKind {
+    Info,
+    Success,
+    Error,
+}
+
 struct Session {
     paths: AppPaths,
     config: AppConfig,
@@ -54,6 +61,7 @@ struct Session {
     queue: QueueMachine,
     host: Arc<Mutex<RunnerHost>>,
     toast: String,
+    toast_kind: ToastKind,
     toast_until: Option<Instant>,
     busy: bool,
     catalog_updated: Option<SystemTime>,
@@ -291,6 +299,7 @@ fn load_session(paths: &AppPaths, log: &Log) -> Session {
         queue,
         host: Arc::new(Mutex::new(RunnerHost::new(paths.runtime()))),
         toast: String::new(),
+        toast_kind: ToastKind::Info,
         toast_until: None,
         busy: false,
         catalog_updated: updated,
@@ -322,6 +331,31 @@ fn wire(
             if let Ok(mut session) = session.lock() {
                 session.query = text.to_string();
                 session.art_pending = true;
+            }
+            wake();
+        }
+    });
+    ui.on_step({
+        let session = session.clone();
+        let log = log.clone();
+        let wake = wake.clone();
+        move |delta| {
+            let next = session.lock().ok().and_then(|session| {
+                let shown = visible(&session);
+                let last = shown.len().checked_sub(1)?;
+                let current = session.selected.as_ref().and_then(|id| {
+                    shown
+                        .iter()
+                        .position(|&index| session.games.get(index).is_some_and(|g| &g.id == id))
+                });
+                Some(match current {
+                    Some(position) => position.saturating_add_signed(delta as isize).min(last),
+                    None if delta < 0 => last,
+                    None => 0,
+                })
+            });
+            if let Some(index) = next {
+                select_index(&session, &log, index);
             }
             wake();
         }
@@ -395,6 +429,7 @@ fn wire(
     ui.on_play(play.clone());
     ui.on_pause(pause.clone());
     ui.on_stop(stop.clone());
+    ui.on_queue_resume(queue_resume.clone());
     tray.on_play(play);
     tray.on_pause(pause);
     tray.on_stop(stop);
@@ -457,7 +492,7 @@ fn wire(
             wake();
         }
     });
-    panel.on_refresh_catalog({
+    let refresh = {
         let session = session.clone();
         let tx = tx.clone();
         let log = log.clone();
@@ -476,6 +511,18 @@ fn wire(
             }
             wake();
         }
+    };
+    ui.on_refresh_catalog(refresh.clone());
+    panel.on_refresh_catalog(refresh);
+    ui.on_notify({
+        let session = session.clone();
+        let wake = wake.clone();
+        move |message| {
+            if let Ok(mut session) = session.lock() {
+                toast_err(&mut session, message);
+            }
+            wake();
+        }
     });
     panel.on_clear_images({
         let session = session.clone();
@@ -487,11 +534,11 @@ fn wire(
                     Ok(count) => {
                         ART.with(|art| art.borrow_mut().clear());
                         session.art_pending = true;
-                        toast(&mut session, format!("Cleared {count} cached images."));
+                        toast_ok(&mut session, format!("Cleared {count} cached images."));
                     }
                     Err(error) => {
                         log.info(&error);
-                        toast(&mut session, error);
+                        toast_err(&mut session, error);
                     }
                 }
             }
@@ -547,7 +594,7 @@ fn wire(
         move |index| {
             if let Ok(mut session) = session.lock() {
                 if let Err(error) = session.queue.remove(index as usize) {
-                    toast(&mut session, error.to_string());
+                    toast_err(&mut session, error.to_string());
                 } else {
                     persist_queue(&mut session);
                 }
@@ -645,7 +692,7 @@ fn wire(
         move || {
             if let Ok(mut session) = session.lock() {
                 if let Err(error) = session.queue.disarm() {
-                    toast(&mut session, error.to_string());
+                    toast_err(&mut session, error.to_string());
                 } else {
                     persist_queue(&mut session);
                     toast(&mut session, "Schedule cleared.");
@@ -728,48 +775,88 @@ fn render(ui: &MainWindow, panel: &SidePanel, tray: &TrayIcon, session: &Arc<Mut
             sync_model(&models.rows, queue_rows(&session, now));
         }
     });
-    render_main(ui, &session, now);
+    render_main(ui, &session, &shown, now);
     render_panel(panel, &session, now);
     render_tray(tray, &session, now);
 }
 
-fn render_main(ui: &MainWindow, session: &Session, now: Instant) {
-    ui.set_catalog_status(catalog_line(session).into());
-    ui.set_empty_message(if session.games.is_empty() {
-        "No supported games yet. Open Settings and refresh the database.".into()
-    } else if session.query.trim().is_empty() {
-        "Type a name. Elden is a fine place to start.".into()
+fn render_main(ui: &MainWindow, session: &Session, shown: &[usize], now: Instant) {
+    let unavailable = session.games.is_empty() && !session.refreshing;
+    ui.set_results_state(
+        if unavailable {
+            "unavailable"
+        } else if session.query.trim().is_empty() {
+            "idle"
+        } else if shown.is_empty() {
+            "empty"
+        } else {
+            "ready"
+        }
+        .into(),
+    );
+    let selected = selected_game(session);
+    ui.set_selected_index(
+        selected
+            .and_then(|game| {
+                shown
+                    .iter()
+                    .position(|&index| session.games.get(index).is_some_and(|g| g.id == game.id))
+            })
+            .map_or(-1, |position| position as i32),
+    );
+    let (status, color) = if session.refreshing && !session.games.is_empty() {
+        ("Refreshing…", Tone::Accent)
+    } else if session.offline {
+        ("Offline · using cache", Tone::Warning)
+    } else if unavailable {
+        ("Database unavailable", Tone::Danger)
     } else {
-        "No games match that.".into()
-    });
-    ui.set_queue_count(format!("Queue ({})", session.queue.items().len()).into());
-    let (label, color) = match session.clock.state() {
-        SessionState::Playing => ("Playing", ThemeColor::Success),
-        SessionState::Paused => ("Paused", ThemeColor::Warning),
-        SessionState::Stopped => ("Stopped", ThemeColor::Muted),
+        ("", Tone::Muted)
     };
+    ui.set_db_status(status.into());
+    ui.set_db_color(color.into());
+
+    let state = session.clock.state();
+    let (label, mode, tone) = match state {
+        SessionState::Playing => ("Playing", "playing", Tone::Success),
+        SessionState::Paused => ("Paused", "paused", Tone::Warning),
+        SessionState::Stopped => ("Ready", "stopped", Tone::Muted),
+    };
+    ui.set_session_visible(selected.is_some());
     ui.set_session_state(label.into());
-    ui.set_session_color(color.into());
+    ui.set_session_mode(mode.into());
+    ui.set_session_color(tone.into());
     ui.set_session_time(displayed_time(session, now).into());
-    if let Some(game) = selected_game(session) {
+    ui.set_session_note(queue_note(session, now).into());
+    if let Some(game) = selected {
         ui.set_session_name(game.name.clone().into());
-        ui.set_session_detail(detail_line(game).into());
         ui.set_session_art(cached_art(&game.id));
     } else {
-        ui.set_session_name("No game selected".into());
-        ui.set_session_detail("Search, then press Play.".into());
+        ui.set_session_name(SharedString::default());
         ui.set_session_art(slint::Image::default());
     }
     let controls = controls(session);
     ui.set_play_enabled(controls.play);
     ui.set_pause_enabled(controls.pause);
     ui.set_stop_enabled(controls.stop);
+    ui.set_resume_queue(controls.resume_queue);
+    ui.set_play_blocked(controls.blocked);
     ui.set_play_label(controls.play_label.into());
-    ui.set_toast(if session.toast_until.is_some_and(|until| now < until) {
-        session.toast.clone().into()
-    } else {
-        SharedString::default()
-    });
+
+    ui.set_queue_count(session.queue.items().len() as i32);
+    ui.set_queue_line(queue_line(session).into());
+    ui.set_toast_visible(session.toast_until.is_some_and(|until| now < until));
+    if !session.toast.is_empty() {
+        ui.set_toast(session.toast.clone().into());
+        ui.set_toast_kind(
+            match session.toast_kind {
+                ToastKind::Info => "info",
+                ToastKind::Success => "success",
+                ToastKind::Error => "error",
+            }
+            .into(),
+        );
+    }
 }
 
 fn render_panel(panel: &SidePanel, session: &Session, now: Instant) {
@@ -830,7 +917,6 @@ fn tick(
         .toast_until
         .is_some_and(|until| Instant::now() >= until)
     {
-        session_guard.toast.clear();
         session_guard.toast_until = None;
     }
     if !session_guard.restored {
@@ -914,7 +1000,7 @@ fn apply_message(
                     }
                     session.art_pending = true;
                     if manual {
-                        toast(
+                        toast_ok(
                             &mut session,
                             format!("Game list updated · {} games", group_digits(count)),
                         );
@@ -923,7 +1009,7 @@ fn apply_message(
                 Err(error) => {
                     log.info(format!("Metadata refresh failed: {error}"));
                     session.offline = !session.games.is_empty();
-                    toast(
+                    toast_err(
                         &mut session,
                         "Refresh failed. The last good database is still here.",
                     );
@@ -977,7 +1063,7 @@ fn apply_message(
                         };
                         session.queue.fail(index, error.clone());
                     }
-                    toast(&mut session, error);
+                    toast_err(&mut session, error);
                 }
             }
         }
@@ -985,7 +1071,7 @@ fn apply_message(
             session.busy = false;
             if let Err(error) = result {
                 log.info(format!("Stop failed: {error}"));
-                toast(&mut session, error);
+                toast_err(&mut session, error);
             }
             if session.quitting {
                 let _ = slint::quit_event_loop();
@@ -1008,7 +1094,7 @@ fn apply_message(
                     session.queue.fail(index, "The runner exited.");
                 }
                 session.busy = false;
-                toast(&mut session, "The runner exited.");
+                toast_err(&mut session, "The runner exited.");
             }
         }
     }
