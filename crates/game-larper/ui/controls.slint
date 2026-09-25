@@ -1,0 +1,427 @@
+// Small building blocks. Every control is flat, quiet, and keyboard reachable.
+
+import { Theme, Icons } from "theme.slint";
+
+export component Icon inherits Image {
+    in property <color> tint: Theme.text-2;
+    width: 16px;
+    height: 16px;
+    colorize: root.tint;
+    image-fit: contain;
+}
+
+// The official square logo, clipped to its tile so it fills small slots.
+export component LogoMark inherits Image {
+    source: Icons.logo;
+    source-clip-x: 259;
+    source-clip-y: 259;
+    source-clip-width: 737;
+    source-clip-height: 737;
+    image-fit: contain;
+    width: 18px;
+    height: 18px;
+}
+
+export component Tip inherits Rectangle {
+    in property <string> text;
+    background: Theme.raised;
+    border-radius: Theme.radius;
+    border-width: 1px;
+    border-color: Theme.border;
+    drop-shadow-blur: 12px;
+    drop-shadow-offset-y: 2px;
+    drop-shadow-color: #00000059;
+    HorizontalLayout {
+        padding-left: 8px;
+        padding-right: 8px;
+        padding-top: 4px;
+        padding-bottom: 5px;
+        Text {
+            text: root.text;
+            color: Theme.text;
+            font-size: Theme.text-s;
+        }
+    }
+}
+
+// Draws a keyboard focus ring around its parent.
+component FocusRing inherits Rectangle {
+    in property <bool> active;
+    in property <length> radius: Theme.radius;
+    x: -3px;
+    y: -3px;
+    border-radius: root.radius + 3px;
+    border-width: 2px;
+    border-color: root.active ? Theme.accent-soft.with-alpha(0.7) : transparent;
+}
+
+// kind: "primary" | "secondary" | "ghost" | "danger"
+export component Button inherits Rectangle {
+    in property <string> text;
+    in property <image> icon;
+    in property <string> kind: "secondary";
+    in property <bool> enabled: true;
+    in property <string> tip;
+    in property <length> font-size: Theme.text-m;
+    callback clicked();
+
+    property <bool> primary: root.kind == "primary";
+    property <color> fg: !root.enabled ? Theme.text-3
+        : root.primary ? #FFFFFF
+        : root.kind == "danger" ? (touch.has-hover ? Theme.danger : Theme.danger.with-alpha(0.85))
+        : root.kind == "ghost" ? (touch.has-hover ? Theme.text : Theme.text-2)
+        : Theme.text;
+
+    height: 32px;
+    min-width: max(layout.min-width, root.height);
+    horizontal-stretch: 0;
+    border-radius: Theme.radius;
+    background: root.primary
+        ? (!root.enabled ? Theme.accent.with-alpha(0.35) : touch.pressed ? Theme.accent-press : touch.has-hover ? Theme.accent-hover : Theme.accent)
+        : root.kind == "secondary"
+            ? (!root.enabled ? Theme.hover : touch.pressed ? Theme.press : touch.has-hover ? Theme.fill-hover : Theme.fill)
+            : (!root.enabled ? transparent : touch.pressed ? Theme.press : touch.has-hover ? Theme.hover : transparent);
+    animate background { duration: Theme.quick; easing: ease-out; }
+
+    accessible-role: button;
+    accessible-label: root.text != "" ? root.text : root.tip;
+    accessible-enabled: root.enabled;
+    accessible-action-default => { if (root.enabled) { root.clicked(); } }
+
+    focus := FocusScope {
+        enabled: root.enabled;
+        focus-on-click: false;
+        key-pressed(event) => {
+            if (event.text == Key.Return || event.text == Key.Space) {
+                root.clicked();
+                return accept;
+            }
+            reject
+        }
+    }
+    touch := TouchArea {
+        enabled: root.enabled;
+        mouse-cursor: root.enabled ? pointer : default;
+        clicked => { root.clicked(); }
+    }
+    layout := HorizontalLayout {
+        padding-left: root.text == "" ? 0px : 12px;
+        padding-right: root.text == "" ? 0px : 12px;
+        spacing: 6px;
+        alignment: center;
+        if root.icon.width > 0: VerticalLayout {
+            alignment: center;
+            Icon {
+                source: root.icon;
+                width: 14px;
+                height: 14px;
+                tint: root.fg;
+            }
+        }
+        if root.text != "": Text {
+            text: root.text;
+            color: root.fg;
+            font-size: root.font-size;
+            font-weight: 600;
+            vertical-alignment: center;
+        }
+    }
+    FocusRing {
+        active: focus.has-focus;
+        width: root.width + 6px;
+        height: root.height + 6px;
+    }
+    if root.tip != "": Tooltip {
+        Tip { text: root.tip; }
+    }
+}
+
+// Square, icon-only. `checked` marks an open surface.
+export component IconButton inherits Rectangle {
+    in property <image> icon;
+    in property <string> tip;
+    in property <bool> checked;
+    in property <bool> enabled: true;
+    in property <length> icon-size: 16px;
+    in property <color> tint: Theme.text-2;
+    in property <color> hover-tint: Theme.text;
+    // Draw the tooltip above, right-aligned, for buttons along the bottom edge.
+    in property <bool> tip-above;
+    out property <bool> has-focus: focus.has-focus;
+    callback clicked();
+
+    property <bool> tip-ready;
+
+    width: 32px;
+    height: 32px;
+    border-radius: Theme.radius;
+    background: root.checked ? Theme.accent-tint
+        : touch.pressed ? Theme.press
+        : touch.has-hover ? Theme.hover : transparent;
+    animate background { duration: Theme.quick; easing: ease-out; }
+
+    accessible-role: button;
+    accessible-label: root.tip;
+    accessible-enabled: root.enabled;
+    accessible-action-default => { if (root.enabled) { root.clicked(); } }
+
+    focus := FocusScope {
+        enabled: root.enabled;
+        focus-on-click: false;
+        key-pressed(event) => {
+            if (event.text == Key.Return || event.text == Key.Space) {
+                root.clicked();
+                return accept;
+            }
+            reject
+        }
+    }
+    touch := TouchArea {
+        enabled: root.enabled;
+        mouse-cursor: root.enabled ? pointer : default;
+        clicked => { root.clicked(); }
+        changed has-hover => {
+            if (!self.has-hover) {
+                root.tip-ready = false;
+            }
+        }
+    }
+    Icon {
+        source: root.icon;
+        width: root.icon-size;
+        height: root.icon-size;
+        tint: !root.enabled ? Theme.text-3 : root.checked ? Theme.accent-soft : touch.has-hover ? root.hover-tint : root.tint;
+        animate colorize { duration: Theme.quick; }
+    }
+    FocusRing {
+        active: focus.has-focus;
+        width: root.width + 6px;
+        height: root.height + 6px;
+    }
+    if root.tip != "" && !root.tip-above: Tooltip {
+        Tip { text: root.tip; }
+    }
+    Timer {
+        interval: 500ms;
+        running: root.tip-above && touch.has-hover && !root.tip-ready;
+        triggered => { root.tip-ready = true; }
+    }
+    if root.tip-above && root.tip-ready && touch.has-hover: Tip {
+        text: root.tip;
+        x: root.width - self.width;
+        y: -self.height - 6px;
+    }
+}
+
+export component CaptionButton inherits Rectangle {
+    in property <image> icon;
+    in property <bool> danger;
+    in property <string> label;
+    callback clicked();
+    width: 46px;
+    background: touch.pressed ? (root.danger ? Theme.danger.darker(0.15) : Theme.press)
+        : touch.has-hover ? (root.danger ? Theme.danger : Theme.hover) : transparent;
+    animate background { duration: Theme.quick; }
+    accessible-role: button;
+    accessible-label: root.label;
+    accessible-action-default => { root.clicked(); }
+    touch := TouchArea { clicked => { root.clicked(); } }
+    Icon {
+        source: root.icon;
+        width: 10px;
+        height: 10px;
+        tint: touch.has-hover ? Theme.text : Theme.text-2;
+    }
+}
+
+export component Toggle inherits Rectangle {
+    in-out property <bool> checked;
+    in property <bool> enabled: true;
+    in property <string> label;
+    callback toggled(bool);
+
+    width: 34px;
+    height: 20px;
+    border-radius: 10px;
+    background: root.checked ? (touch.has-hover ? Theme.accent-hover : Theme.accent) : (touch.has-hover ? #343C51 : #2A3144);
+    animate background { duration: Theme.normal; easing: ease-out; }
+
+    accessible-role: switch;
+    accessible-label: root.label;
+    accessible-checkable: true;
+    accessible-checked: root.checked;
+    accessible-action-default => { root.flip(); }
+
+    public function flip() {
+        if (root.enabled) {
+            root.checked = !root.checked;
+            root.toggled(root.checked);
+        }
+    }
+
+    focus := FocusScope {
+        focus-on-click: false;
+        key-pressed(event) => {
+            if (event.text == Key.Space || event.text == Key.Return) {
+                root.flip();
+                return accept;
+            }
+            reject
+        }
+    }
+    touch := TouchArea {
+        mouse-cursor: pointer;
+        clicked => { root.flip(); }
+    }
+    Rectangle {
+        width: 14px;
+        height: 14px;
+        y: 3px;
+        x: root.checked ? root.width - self.width - 3px : 3px;
+        border-radius: 7px;
+        background: root.checked ? #FFFFFF : Theme.text-2;
+        animate x { duration: Theme.normal; easing: ease-out; }
+        animate background { duration: Theme.normal; }
+    }
+    FocusRing {
+        active: focus.has-focus;
+        radius: 10px;
+        width: root.width + 6px;
+        height: root.height + 6px;
+    }
+}
+
+export component TextField inherits Rectangle {
+    in-out property <string> text;
+    in property <string> placeholder;
+    in property <InputType> input-type: InputType.text;
+    in property <TextHorizontalAlignment> align: left;
+    callback edited(string);
+    callback accepted();
+
+    height: 32px;
+    border-radius: Theme.radius;
+    background: Theme.field;
+    border-width: 1px;
+    border-color: input.has-focus ? Theme.accent.with-alpha(0.8) : touch.has-hover ? #333A4E : Theme.border;
+    animate border-color { duration: Theme.quick; }
+    accessible-role: text-input;
+    accessible-label: root.placeholder;
+    accessible-value: root.text;
+
+    touch := TouchArea {
+        mouse-cursor: MouseCursor.text;
+        clicked => { input.focus(); }
+    }
+    HorizontalLayout {
+        padding-left: 10px;
+        padding-right: 10px;
+        input := TextInput {
+            text <=> root.text;
+            input-type: root.input-type;
+            color: Theme.text;
+            font-size: Theme.text-m;
+            horizontal-alignment: root.align;
+            vertical-alignment: center;
+            single-line: true;
+            selection-background-color: Theme.accent.with-alpha(0.45);
+            selection-foreground-color: Theme.text;
+            edited => { root.edited(self.text); }
+            accepted => { root.accepted(); }
+        }
+    }
+    if root.text == "": Text {
+        x: 10px;
+        width: parent.width - 20px;
+        text: root.placeholder;
+        color: Theme.text-3;
+        font-size: Theme.text-m;
+        horizontal-alignment: root.align;
+        vertical-alignment: center;
+    }
+}
+
+export component Chip inherits Rectangle {
+    in property <string> text;
+    in property <bool> checked;
+    callback clicked();
+    height: 28px;
+    min-width: label.preferred-width + 20px;
+    horizontal-stretch: 0;
+    border-radius: Theme.radius;
+    background: root.checked ? Theme.accent-tint : touch.pressed ? Theme.press : touch.has-hover ? Theme.fill-hover : Theme.fill;
+    border-width: 1px;
+    border-color: root.checked ? Theme.accent.with-alpha(0.55) : transparent;
+    animate background, border-color { duration: Theme.quick; }
+    accessible-role: button;
+    accessible-label: root.text;
+    accessible-checkable: true;
+    accessible-checked: root.checked;
+    accessible-action-default => { root.clicked(); }
+    focus := FocusScope {
+        focus-on-click: false;
+        key-pressed(event) => {
+            if (event.text == Key.Space || event.text == Key.Return) {
+                root.clicked();
+                return accept;
+            }
+            reject
+        }
+    }
+    touch := TouchArea {
+        mouse-cursor: pointer;
+        clicked => { root.clicked(); }
+    }
+    label := Text {
+        text: root.text;
+        color: root.checked ? Theme.accent-soft : Theme.text-2;
+        font-size: Theme.text-s;
+        font-weight: 600;
+        horizontal-alignment: center;
+        vertical-alignment: center;
+    }
+    FocusRing {
+        active: focus.has-focus;
+        width: root.width + 6px;
+        height: root.height + 6px;
+    }
+}
+
+// Game artwork with the official logo as a calm fallback. Late images fade in.
+export component Art inherits Rectangle {
+    in property <image> source;
+    border-radius: Theme.radius;
+    clip: true;
+    background: #0F1016;
+    if root.source.width == 0: LogoMark {
+        width: parent.width;
+        height: parent.height;
+        opacity: 0.9;
+    }
+    Image {
+        source: root.source;
+        width: parent.width;
+        height: parent.height;
+        image-fit: cover;
+        opacity: root.source.width > 0 ? 1 : 0;
+        animate opacity { duration: Theme.normal; easing: ease-out; }
+    }
+}
+
+export component SectionLabel inherits Text {
+    color: Theme.text-3;
+    font-size: Theme.text-xs;
+    font-weight: 600;
+    letter-spacing: 0.6px;
+}
+
+export component Hairline inherits Rectangle {
+    height: 1px;
+    background: Theme.hairline;
+}
+
+// Flexible side margin. Content next to it stretches up to its max width first.
+export component Gutter inherits Rectangle {
+    min-width: 20px;
+    horizontal-stretch: 1;
+}

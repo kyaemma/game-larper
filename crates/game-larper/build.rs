@@ -2,7 +2,8 @@ fn main() {
     let manifest_dir = std::path::PathBuf::from(std::env::var("CARGO_MANIFEST_DIR").unwrap());
     let icon = manifest_dir.join("../../assets/branding/game-larper.ico");
     println!("cargo:rerun-if-changed={}", icon.display());
-    println!("cargo:rerun-if-changed=ui/app.slint");
+    println!("cargo:rerun-if-changed=ui");
+    println!("cargo:rerun-if-changed=../../assets/ui");
     if std::env::var("CARGO_CFG_TARGET_OS").as_deref() == Ok("windows") {
         let mut resource = winresource::WindowsResource::new();
         resource.set_icon(icon.to_str().expect("icon path is unicode"));

@@ -1,0 +1,77 @@
+// Design tokens shared by every Game Larper surface.
+
+export global Theme {
+    // Surfaces, darkest to lightest.
+    out property <color> field: #0A0D14;
+    out property <color> bg: #0D1018;
+    out property <color> bg-alt: #101520;
+    out property <color> surface: #151A26;
+    out property <color> raised: #1A2030;
+    out property <color> border: #2A3144;
+    out property <color> hairline: #1A2030;
+    out property <color> hover: #FFFFFF0A;
+    out property <color> press: #FFFFFF12;
+    out property <color> fill: #FFFFFF0E;
+    out property <color> fill-hover: #FFFFFF17;
+
+    // Text.
+    out property <color> text: #F2F4F8;
+    out property <color> text-2: #AAB3C5;
+    out property <color> text-3: #707A8D;
+
+    // Brand. Sampled from the official logo (#6E63EB).
+    out property <color> accent: #6E63EB;
+    out property <color> accent-hover: #7B71F1;
+    out property <color> accent-press: #6157DC;
+    out property <color> accent-soft: #A49EF8;
+    out property <color> accent-tint: #6E63EB26;
+
+    out property <color> success: #69DAA5;
+    out property <color> warning: #F5BE66;
+    out property <color> danger: #FF6475;
+
+    // Shape.
+    out property <length> radius-s: 4px;
+    out property <length> radius: 6px;
+    out property <length> radius-m: 8px;
+
+    // Motion.
+    out property <duration> quick: 110ms;
+    out property <duration> normal: 160ms;
+
+    // Type.
+    out property <string> font: "Segoe UI Variable";
+    out property <length> text-xs: 11px;
+    out property <length> text-s: 12px;
+    out property <length> text-m: 13px;
+    out property <length> text-l: 14px;
+}
+
+export global Icons {
+    out property <image> logo: @image-url("../../../assets/branding/game-larper-logo.png");
+    out property <image> search: @image-url("../../../assets/ui/search.svg");
+    out property <image> close: @image-url("../../../assets/ui/close.svg");
+    out property <image> play: @image-url("../../../assets/ui/play.svg");
+    out property <image> pause: @image-url("../../../assets/ui/pause.svg");
+    out property <image> stop: @image-url("../../../assets/ui/stop.svg");
+    out property <image> skip: @image-url("../../../assets/ui/skip.svg");
+    out property <image> more: @image-url("../../../assets/ui/more.svg");
+    out property <image> queue: @image-url("../../../assets/ui/queue.svg");
+    out property <image> settings: @image-url("../../../assets/ui/settings.svg");
+    out property <image> copy: @image-url("../../../assets/ui/copy.svg");
+    out property <image> external: @image-url("../../../assets/ui/external.svg");
+    out property <image> plus: @image-url("../../../assets/ui/plus.svg");
+    out property <image> chevron-up: @image-url("../../../assets/ui/chevron-up.svg");
+    out property <image> chevron-down: @image-url("../../../assets/ui/chevron-down.svg");
+    out property <image> check: @image-url("../../../assets/ui/check.svg");
+    out property <image> clock: @image-url("../../../assets/ui/clock.svg");
+    out property <image> refresh: @image-url("../../../assets/ui/refresh.svg");
+    out property <image> folder: @image-url("../../../assets/ui/folder.svg");
+    out property <image> file: @image-url("../../../assets/ui/file.svg");
+    out property <image> trash: @image-url("../../../assets/ui/trash.svg");
+    out property <image> steam: @image-url("../../../assets/ui/steam.svg");
+    out property <image> window-minimize: @image-url("../../../assets/ui/window-minimize.svg");
+    out property <image> window-maximize: @image-url("../../../assets/ui/window-maximize.svg");
+    out property <image> window-restore: @image-url("../../../assets/ui/window-restore.svg");
+    out property <image> window-close: @image-url("../../../assets/ui/window-close.svg");
+}
