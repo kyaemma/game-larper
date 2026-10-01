@@ -1,0 +1,36 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  windows:
+    name: Windows x64
+    runs-on: windows-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install pinned Rust toolchain
+        shell: pwsh
+        run: |
+          rustup toolchain install 1.98.1 --profile minimal --component rustfmt,clippy
+          rustup override set 1.98.1
+          rustc --version
+          cargo --version
+
+      - name: Format, lint, and test
+        shell: pwsh
+        run: .\scripts\check.ps1
+
+      - name: Release build
+        shell: pwsh
+        run: cargo build --workspace --release
