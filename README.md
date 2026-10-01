@@ -34,6 +34,17 @@ If nothing shows up, the log in `%LOCALAPPDATA%\GameLarper\logs` has the process
 
 You can line up a few games with durations, or arm the whole queue for a local time. The app has to be running. If it was closed when that time passed, the schedule is marked missed and nothing starts late.
 
+## download
+
+Grab the latest `GameLarper-win-x64.zip` from [Releases](https://github.com/kyaemma/game-larper-rust/releases), extract it, and keep both executables together:
+
+```text
+GameLarper.exe
+GameLarper.Runner.exe
+```
+
+Windows may show an unknown-publisher / SmartScreen warning because the binaries are not code-signed yet.
+
 ## build, if you're weird
 
 Windows x64, Rust stable 1.98, then:
@@ -43,3 +54,8 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\build-release.ps1
 ```
 
 Run `artifacts\release\win-x64\GameLarper.exe`. Keep `GameLarper.Runner.exe` beside it.
+
+
+## license
+
+Game Larper is licensed under the [MIT License](LICENSE).
