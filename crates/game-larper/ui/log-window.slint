@@ -34,7 +34,7 @@ component LogTitleBar inherits Rectangle {
 }
 
 component LogLine inherits Rectangle {
-    in property <LogRow> row;
+    in property <LogRow> entry;
 
     min-height: 28px;
     background: transparent;
@@ -47,7 +47,7 @@ component LogLine inherits Rectangle {
         spacing: 12px;
 
         Text {
-            text: root.row.time;
+            text: root.entry.time;
             color: Theme.text-3;
             font-size: Theme.text-s;
             font-family: "Consolas";
@@ -55,8 +55,8 @@ component LogLine inherits Rectangle {
             vertical-alignment: top;
         }
         Text {
-            text: root.row.level;
-            color: root.row.tone;
+            text: root.entry.level;
+            color: root.entry.tone;
             font-size: Theme.text-s;
             font-family: "Consolas";
             font-weight: 700;
@@ -64,7 +64,7 @@ component LogLine inherits Rectangle {
             vertical-alignment: top;
         }
         Text {
-            text: root.row.message;
+            text: root.entry.message;
             color: Theme.text-2;
             font-size: Theme.text-s;
             font-family: "Consolas";
@@ -124,13 +124,13 @@ export component LogWindow inherits Window {
 
             if root.rows.length > 0: Flickable {
                 vertical-stretch: 1;
-                viewport-height: lines.preferred-height;
+                content-height: lines.preferred-height;
 
                 lines := VerticalLayout {
                     width: parent.width;
                     spacing: 0px;
-                    for row in root.rows: LogLine {
-                        row: row;
+                    for entry in root.rows: LogLine {
+                        entry: entry;
                         width: parent.width;
                     }
                 }
