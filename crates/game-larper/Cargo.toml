@@ -29,6 +29,8 @@ ureq = "2.12"
 image = { version = "0.25", default-features = false, features = ["png", "jpeg"] }
 chrono = { version = "0.4", default-features = false, features = ["clock", "std"] }
 raw-window-handle = "0.6"
+
+[target.'cfg(windows)'.dependencies]
 windows-sys = { workspace = true, features = [
     "Win32_Foundation",
     "Win32_Graphics_Dwm",
@@ -44,6 +46,10 @@ windows-sys = { workspace = true, features = [
     "Win32_UI_Shell",
     "Win32_UI_WindowsAndMessaging",
 ] }
+
+[target.'cfg(not(windows))'.dependencies]
+libc.workspace = true
+arboard = "3"
 
 [build-dependencies]
 slint-build = { version = "~1.18.1", default-features = false, features = ["compat-1-18"] }

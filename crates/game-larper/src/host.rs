@@ -1,27 +1,45 @@
+//! Stages the native runner into the private runtime directory and keeps it running.
+//!
+//! Staging, cleanup, and the public types are shared. Starting, watching, and stopping
+//! the process is not: Win32 uses a job object, a window handle, and a duplicated
+//! process handle, while Unix uses a parent-death signal, a pipe, and `SIGTERM`.
+
 use std::fs::{self, File};
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use game_larper_core::{Error as CoreError, resolve_executable};
+
+use crate::platform::{self, integrity_of};
+
+#[cfg(windows)]
 use windows_sys::Win32::Foundation::{CloseHandle, FALSE, HANDLE, HWND};
+#[cfg(windows)]
 use windows_sys::Win32::System::JobObjects::{
     AssignProcessToJobObject, CreateJobObjectW, JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE,
     JOBOBJECT_EXTENDED_LIMIT_INFORMATION, JobObjectExtendedLimitInformation,
     SetInformationJobObject,
 };
+#[cfg(windows)]
 use windows_sys::Win32::System::Threading::{
     CreateProcessW, GetExitCodeProcess, PROCESS_INFORMATION, STARTUPINFOW, TerminateProcess,
     WaitForInputIdle, WaitForSingleObject,
 };
+#[cfg(windows)]
 use windows_sys::Win32::UI::WindowsAndMessaging::{
     EnumWindows, GW_OWNER, GetWindow, GetWindowTextW, GetWindowThreadProcessId, IsWindowVisible,
     PostMessageW, WM_CLOSE,
 };
 
-use crate::platform::{self, integrity_of};
-
+#[cfg(windows)]
 const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
+/// How long the starter waits for the runner to prove it is up.
+const STARTUP_BUDGET: Duration = Duration::from_millis(1500);
+#[cfg(windows)]
+const RUNNER_NOT_UP: &str = "The native runner did not create its game window.";
+#[cfg(not(windows))]
+const RUNNER_NOT_UP: &str = "The native runner did not stay running.";
 
 pub struct Staged {
     pub path: PathBuf,
@@ -41,8 +59,12 @@ pub struct LaunchReport {
 }
 
 struct Running {
+    #[cfg(windows)]
     process: isize,
+    #[cfg(windows)]
     hwnd: isize,
+    #[cfg(not(windows))]
+    child: std::process::Child,
     icon: isize,
     staged: Staged,
     generation: u64,
@@ -50,6 +72,7 @@ struct Running {
 
 pub struct RunnerHost {
     runtime: PathBuf,
+    #[cfg(windows)]
     job: isize,
     current: Option<Running>,
     next_generation: u64,
@@ -60,6 +83,7 @@ impl RunnerHost {
     pub fn new(runtime: PathBuf) -> Self {
         Self {
             runtime,
+            #[cfg(windows)]
             job: create_kill_on_close_job(),
             current: None,
             next_generation: 1,
@@ -79,12 +103,10 @@ impl RunnerHost {
         }
         let staged = stage_runner(template, &self.runtime, application_id, remote_name)
             .map_err(|error| error.to_string())?;
-        match self.spawn_staged(staged, icon) {
-            Ok(report) => Ok(report),
-            Err(error) => Err(error),
-        }
+        self.spawn_staged(staged, icon)
     }
 
+    #[cfg(windows)]
     fn spawn_staged(
         &mut self,
         staged: Staged,
@@ -130,8 +152,8 @@ impl RunnerHost {
                 AssignProcessToJobObject(self.job as HANDLE, info.hProcess);
             }
         }
-        let idle = unsafe { WaitForInputIdle(info.hProcess, 1500) };
-        let hwnd = find_owned_window(info.dwProcessId, Duration::from_millis(1500));
+        let idle = unsafe { WaitForInputIdle(info.hProcess, STARTUP_BUDGET.as_millis() as u32) };
+        let hwnd = find_owned_window(info.dwProcessId, STARTUP_BUDGET);
         let alive = process_alive(info.hProcess);
         if !alive || hwnd == 0 {
             unsafe {
@@ -140,7 +162,7 @@ impl RunnerHost {
                 CloseHandle(info.hProcess);
             }
             cleanup_staged(&self.runtime, &staged);
-            return Err("The native runner did not create its game window.".into());
+            return Err(RUNNER_NOT_UP.into());
         }
         let waiter = match duplicate_handle(info.hProcess) {
             Ok(waiter) => waiter,
@@ -187,30 +209,117 @@ impl RunnerHost {
         Ok(report)
     }
 
+    /// Start the staged runner and wait until `/proc` shows it running as itself.
+    #[cfg(not(windows))]
+    fn spawn_staged(
+        &mut self,
+        staged: Staged,
+        _icon: Option<&Path>,
+    ) -> Result<LaunchReport, String> {
+        let directory = staged
+            .path
+            .parent()
+            .ok_or_else(|| "The runner path has no directory.".to_string())?;
+        let basename = staged
+            .path
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_else(|| "game".into());
+        let mut pipe: [libc::c_int; 2] = [-1, -1];
+        // SAFETY: the pipe writes two fresh descriptors into our own array.
+        if unsafe { libc::pipe(pipe.as_mut_ptr()) } != 0 {
+            cleanup_staged(&self.runtime, &staged);
+            return Err(format!(
+                "The runner did not start: {}",
+                io::Error::last_os_error()
+            ));
+        }
+        let mut command = std::process::Command::new(&staged.path);
+        command.current_dir(directory);
+        use std::os::unix::process::CommandExt;
+        // The Win32 job object took the runner down with us; the kernel does it here.
+        // SAFETY: prctl only arms a signal for this child, before it execs.
+        unsafe {
+            command.pre_exec(|| {
+                if libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM, 0, 0, 0) != 0 {
+                    return Err(io::Error::last_os_error());
+                }
+                Ok(())
+            });
+        }
+        let mut child = match command.spawn() {
+            Ok(child) => child,
+            Err(error) => {
+                // SAFETY: both ends come from the pipe above and are closed exactly once.
+                unsafe {
+                    libc::close(pipe[0]);
+                    libc::close(pipe[1]);
+                }
+                cleanup_staged(&self.runtime, &staged);
+                return Err(format!("The runner did not start: {error}"));
+            }
+        };
+        // Our copy of the write end closes here, so the read end reaches EOF exactly
+        // when the runner is gone. That fd is handed to the exit watcher on success.
+        unsafe {
+            libc::close(pipe[1]);
+        }
+        let waiter = pipe[0];
+        let deadline = std::time::Instant::now() + STARTUP_BUDGET;
+        loop {
+            if child.try_wait().ok().flatten().is_some() {
+                unsafe {
+                    libc::close(waiter);
+                }
+                cleanup_staged(&self.runtime, &staged);
+                return Err(RUNNER_NOT_UP.into());
+            }
+            if runner_identity(child.id(), &basename) {
+                break;
+            }
+            if std::time::Instant::now() >= deadline {
+                let _ = child.kill();
+                let _ = child.wait();
+                unsafe {
+                    libc::close(waiter);
+                }
+                cleanup_staged(&self.runtime, &staged);
+                return Err(RUNNER_NOT_UP.into());
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        let generation = self.next_generation;
+        self.next_generation = self.next_generation.saturating_add(1);
+        let pid = child.id();
+        let title = window_title_of(&basename);
+        let report = LaunchReport {
+            generation,
+            pid,
+            executable: staged.path.clone(),
+            basename,
+            working_directory: directory.to_path_buf(),
+            hwnd: 0,
+            title,
+            integrity: integrity_of(pid),
+            waiter: waiter as isize,
+        };
+        self.current = Some(Running {
+            child,
+            icon: 0,
+            staged,
+            generation,
+        });
+        self.stopping = false;
+        Ok(report)
+    }
+
     pub fn stop(&mut self) -> Result<(), String> {
         let Some(running) = self.current.take() else {
             return Ok(());
         };
         self.stopping = true;
-        let process = running.process as HANDLE;
-        if running.hwnd != 0 {
-            unsafe {
-                PostMessageW(running.hwnd as HWND, WM_CLOSE, 0, 0);
-            }
-            unsafe {
-                WaitForSingleObject(process, 2000);
-            }
-        }
-        if process_alive(process) {
-            unsafe {
-                TerminateProcess(process, 0);
-                WaitForSingleObject(process, 5000);
-            }
-        }
-        let exited = !process_alive(process);
-        unsafe {
-            CloseHandle(process);
-        }
+        let mut running = running;
+        let exited = stop_process(&mut running);
         platform::destroy_icon(running.icon);
         cleanup_staged(&self.runtime, &running.staged);
         self.stopping = false;
@@ -226,16 +335,21 @@ impl RunnerHost {
         if self.stopping {
             return false;
         }
-        let Some(running) = self.current.take() else {
+        // Unix reaps the exit status below; Win32 only reads the handle.
+        #[cfg_attr(windows, allow(unused_mut))]
+        let Some(mut running) = self.current.take() else {
             return false;
         };
         if running.generation != generation {
             self.current = Some(running);
             return false;
         }
+        #[cfg(windows)]
         unsafe {
             CloseHandle(running.process as HANDLE);
         }
+        #[cfg(not(windows))]
+        reap(&mut running);
         platform::destroy_icon(running.icon);
         cleanup_staged(&self.runtime, &running.staged);
         true
@@ -245,12 +359,104 @@ impl RunnerHost {
 impl Drop for RunnerHost {
     fn drop(&mut self) {
         let _ = self.stop();
+        #[cfg(windows)]
         if self.job != 0 {
             unsafe {
                 CloseHandle(self.job as HANDLE);
             }
         }
     }
+}
+
+/// Collect the runner's exit status if it has already reported one.
+#[cfg(not(windows))]
+fn reap(running: &mut Running) {
+    // The watcher only sees EOF once every writer is gone, so the runner has
+    // exited; a non-blocking reap is enough to keep it from lingering as a zombie.
+    match running.child.try_wait() {
+        Ok(Some(status)) => eprintln!("GL-DEBUG runner exit status: {status}"),
+        Ok(None) => eprintln!("GL-DEBUG runner still running at reap?!"),
+        Err(error) => eprintln!("GL-DEBUG runner try_wait error: {error}"),
+    }
+}
+
+#[cfg(windows)]
+fn stop_process(running: &mut Running) -> bool {
+    let process = running.process as HANDLE;
+    if running.hwnd != 0 {
+        unsafe {
+            PostMessageW(running.hwnd as HWND, WM_CLOSE, 0, 0);
+        }
+        unsafe {
+            WaitForSingleObject(process, 2000);
+        }
+    }
+    if process_alive(process) {
+        unsafe {
+            TerminateProcess(process, 0);
+            WaitForSingleObject(process, 5000);
+        }
+    }
+    let exited = !process_alive(process);
+    unsafe {
+        CloseHandle(process);
+    }
+    exited
+}
+
+#[cfg(not(windows))]
+fn stop_process(running: &mut Running) -> bool {
+    let pid = running.child.id() as libc::pid_t;
+    // SIGTERM is the polite WM_CLOSE, SIGKILL the TerminateProcess after it.
+    // SAFETY: signalling our own child with a standard signal.
+    unsafe {
+        libc::kill(pid, libc::SIGTERM);
+    }
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    loop {
+        if running.child.try_wait().ok().flatten().is_some() {
+            return true;
+        }
+        if std::time::Instant::now() >= deadline {
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let _ = running.child.kill();
+    running.child.wait().is_ok()
+}
+
+/// What `/proc` says this process is: its `comm`, or a command line argument
+/// naming the staged file — a script is executed as `sh <path>`, so only the
+/// real binary carries the name in `argv[0]`. Stands in for enumerating its windows.
+#[cfg(not(windows))]
+fn runner_identity(pid: u32, expected: &str) -> bool {
+    use std::os::unix::ffi::OsStrExt;
+    if fs::read_to_string(format!("/proc/{pid}/comm"))
+        .is_ok_and(|comm| comm.trim_end() == expected)
+    {
+        return true;
+    }
+    let Ok(command) = fs::read(format!("/proc/{pid}/cmdline")) else {
+        return false;
+    };
+    command
+        .split(|byte| *byte == 0)
+        .filter(|argument| !argument.is_empty())
+        .any(|argument| {
+            Path::new(std::ffi::OsStr::from_bytes(argument))
+                .file_name()
+                .is_some_and(|name| name == std::ffi::OsStr::new(expected))
+        })
+}
+
+/// The title the Linux runner gives its window: the executable name without `.exe`.
+#[cfg(not(windows))]
+fn window_title_of(basename: &str) -> String {
+    basename
+        .strip_suffix(".exe")
+        .unwrap_or(basename)
+        .to_string()
 }
 
 pub fn stage_runner(
@@ -279,7 +485,7 @@ fn place_file(
     destination: &Path,
 ) -> io::Result<Option<Staged>> {
     if destination.exists() {
-        if is_reparse_path(destination)? {
+        if is_reparse_path(runtime_root, destination)? {
             return Err(io::Error::other("The selected runtime path is a link."));
         }
         if same_bytes(destination, template)? {
@@ -303,7 +509,7 @@ fn place_file(
 fn ensure_private_dirs(runtime_root: &Path, target: &Path) -> io::Result<()> {
     let root = std::path::absolute(runtime_root)?;
     fs::create_dir_all(&root)?;
-    if is_reparse_path(&root)? {
+    if is_reparse_path(&root, &root)? {
         return Err(io::Error::other(
             "A runtime directory is a link or junction.",
         ));
@@ -315,13 +521,13 @@ fn ensure_private_dirs(runtime_root: &Path, target: &Path) -> io::Result<()> {
         ));
     }
     let relative = target.strip_prefix(&root).unwrap_or(&target);
-    let mut current = root;
+    let mut current = root.clone();
     for component in relative.components() {
         current.push(component);
         if !current.exists() {
             fs::create_dir(&current)?;
         }
-        if is_reparse_path(&current)? {
+        if is_reparse_path(&root, &current)? {
             return Err(io::Error::other(
                 "A runtime directory is a link or junction.",
             ));
@@ -362,7 +568,7 @@ pub fn cleanup_staged(runtime_root: &Path, staged: &Staged) {
         if !current.starts_with(&root) || current == root {
             break;
         }
-        if is_reparse_path(&current).unwrap_or(true) {
+        if is_reparse_path(&root, &current).unwrap_or(true) {
             break;
         }
         if fs::read_dir(&current)
@@ -381,7 +587,7 @@ pub fn cleanup_staged(runtime_root: &Path, staged: &Staged) {
 fn chain_has_reparse(root: &Path, file: &Path) -> bool {
     let mut directory = file.parent();
     while let Some(current) = directory {
-        if is_reparse_path(current).unwrap_or(true) {
+        if is_reparse_path(root, current).unwrap_or(true) {
             return true;
         }
         if current == root {
@@ -395,9 +601,24 @@ fn chain_has_reparse(root: &Path, file: &Path) -> bool {
     true
 }
 
-fn is_reparse_path(path: &Path) -> io::Result<bool> {
+/// Windows: any reparse point, whatever it points at.
+#[cfg(windows)]
+fn is_reparse_path(_root: &Path, path: &Path) -> io::Result<bool> {
     use std::os::windows::fs::MetadataExt;
     Ok(fs::symlink_metadata(path)?.file_attributes() & FILE_ATTRIBUTE_REPARSE_POINT != 0)
+}
+
+/// Unix: a link only matters when it leads out of the private runtime directory,
+/// so a data directory behind a symlink of one's own still works.
+#[cfg(not(windows))]
+fn is_reparse_path(root: &Path, path: &Path) -> io::Result<bool> {
+    if !fs::symlink_metadata(path)?.file_type().is_symlink() {
+        return Ok(false);
+    }
+    let (Ok(root), Ok(path)) = (fs::canonicalize(root), fs::canonicalize(path)) else {
+        return Ok(true);
+    };
+    Ok(!path.starts_with(&root))
 }
 
 fn same_bytes(left: &Path, right: &Path) -> io::Result<bool> {
@@ -422,6 +643,7 @@ fn same_bytes(left: &Path, right: &Path) -> io::Result<bool> {
     }
 }
 
+#[cfg(windows)]
 fn find_owned_window(process_id: u32, budget: Duration) -> isize {
     let deadline = std::time::Instant::now() + budget;
     loop {
@@ -443,11 +665,13 @@ fn find_owned_window(process_id: u32, budget: Duration) -> isize {
     }
 }
 
+#[cfg(windows)]
 struct EnumState<'a> {
     process_id: u32,
     found: &'a mut HWND,
 }
 
+#[cfg(windows)]
 unsafe extern "system" fn enum_window(window: HWND, context: isize) -> i32 {
     let state = unsafe { &mut *(context as *mut EnumState) };
     let mut owner = 0u32;
@@ -462,6 +686,7 @@ unsafe extern "system" fn enum_window(window: HWND, context: isize) -> i32 {
     1
 }
 
+#[cfg(windows)]
 fn window_title(hwnd: isize) -> String {
     if hwnd == 0 {
         return String::new();
@@ -474,12 +699,14 @@ fn window_title(hwnd: isize) -> String {
     String::from_utf16_lossy(&buffer[..length as usize])
 }
 
+#[cfg(windows)]
 fn process_alive(process: HANDLE) -> bool {
     let mut code = 0u32;
     let read = unsafe { GetExitCodeProcess(process, &mut code) };
     read != 0 && code == 259
 }
 
+#[cfg(windows)]
 fn duplicate_handle(process: HANDLE) -> Result<HANDLE, String> {
     use windows_sys::Win32::Foundation::{DUPLICATE_SAME_ACCESS, DuplicateHandle};
     use windows_sys::Win32::System::Threading::GetCurrentProcess;
@@ -505,6 +732,7 @@ fn duplicate_handle(process: HANDLE) -> Result<HANDLE, String> {
     }
 }
 
+#[cfg(windows)]
 fn create_kill_on_close_job() -> isize {
     let job = unsafe { CreateJobObjectW(std::ptr::null(), std::ptr::null()) };
     if job.is_null() {
@@ -528,10 +756,12 @@ fn create_kill_on_close_job() -> isize {
     }
 }
 
+#[cfg(windows)]
 fn wide(text: &str) -> Vec<u16> {
     text.encode_utf16().chain(std::iter::once(0)).collect()
 }
 
+#[cfg(windows)]
 fn wide_path(path: &Path) -> Vec<u16> {
     use std::os::windows::ffi::OsStrExt;
     path.as_os_str()
@@ -553,10 +783,9 @@ mod tests {
     use std::fs;
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    #[test]
-    fn stage_reuses_identical_bytes_and_isolates_a_different_file() {
+    fn scratch(name: &str) -> std::path::PathBuf {
         let root = std::env::temp_dir().join(format!(
-            "gl-stage-{}-{}",
+            "gl-{name}-{}-{}",
             std::process::id(),
             SystemTime::now()
                 .duration_since(UNIX_EPOCH)
@@ -564,6 +793,12 @@ mod tests {
                 .as_nanos()
         ));
         fs::create_dir_all(&root).unwrap();
+        root
+    }
+
+    #[test]
+    fn stage_reuses_identical_bytes_and_isolates_a_different_file() {
+        let root = scratch("stage");
         let template = root.join("template.exe");
         fs::write(&template, b"runner-a").unwrap();
         let runtime = root.join("runtime");
@@ -595,5 +830,73 @@ mod tests {
         );
         assert!(!first.path.exists());
         let _ = fs::remove_dir_all(root);
+    }
+
+    /// Stage, start, watch, and stop a stand-in runner: the whole Linux host path.
+    /// The template is a script so the test does not depend on the runner being built.
+    #[cfg(not(windows))]
+    #[test]
+    fn host_starts_watches_and_stops_a_staged_process() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let root = scratch("host");
+        let template = root.join("template");
+        fs::write(&template, "#!/bin/sh\nwhile :; do sleep 1; done\n").unwrap();
+        fs::set_permissions(&template, fs::Permissions::from_mode(0o755)).unwrap();
+        let runtime = root.join("runtime");
+        let mut host = super::RunnerHost::new(runtime);
+
+        let report = host
+            .launch(&template, "10", "game/eldenring.exe", None)
+            .expect("the staged process did not start");
+        assert_eq!(report.basename, "eldenring.exe");
+        assert_eq!(report.title, "eldenring");
+        assert_eq!(report.hwnd, 0, "there is no window handle on Unix");
+        assert!(report.integrity.starts_with("uid:"), "{}", report.integrity);
+        assert!(report.pid > 0);
+        assert!(report.executable.exists());
+
+        // A crash: the watcher's pipe reaches EOF, the host cleans up after it.
+        // SAFETY: signalling the process this test owns.
+        unsafe {
+            libc::kill(report.pid as libc::pid_t, libc::SIGKILL);
+        }
+        assert!(pipe_ends_at_eof(report.waiter), "the exit watcher would hang");
+        assert!(host.take_unexpected_exit(report.generation));
+        assert!(!report.executable.exists(), "the staged copy was left behind");
+
+        // A deliberate stop is not an unexpected exit.
+        let second = host
+            .launch(&template, "10", "game/eldenring.exe", None)
+            .expect("the staged process did not restart");
+        host.stop().expect("the staged process did not stop");
+        assert!(pipe_ends_at_eof(second.waiter));
+        assert!(!host.take_unexpected_exit(second.generation));
+        assert!(!second.executable.exists());
+        let _ = fs::remove_dir_all(root);
+    }
+
+    /// Read the watcher's pipe: it only ends when every writer is gone.
+    #[cfg(not(windows))]
+    fn pipe_ends_at_eof(waiter: isize) -> bool {
+        use std::io::Read;
+        use std::os::fd::FromRawFd;
+        // SAFETY: the test owns this read end; nothing else closes it.
+        let mut pipe = unsafe { std::fs::File::from_raw_fd(waiter as i32) };
+        let mut buffer = [0u8; 8];
+        let mut ended = false;
+        loop {
+            match pipe.read(&mut buffer) {
+                Ok(0) => {
+                    ended = true;
+                    break;
+                }
+                Ok(_) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+                Err(_) => break,
+            }
+        }
+        drop(pipe);
+        ended
     }
 }

@@ -1,6 +1,9 @@
 use std::path::PathBuf;
 
-/// Files under `%LOCALAPPDATA%\GameLarper`.
+/// The per-user directory that holds config, cache, runtime copies, and logs.
+///
+/// Windows: `%LOCALAPPDATA%\GameLarper`. Unix: `$XDG_DATA_HOME/GameLarper`,
+/// falling back to `~/.local/share/GameLarper`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AppPaths {
     pub root: PathBuf,
@@ -11,6 +14,7 @@ impl AppPaths {
         Self { root: root.into() }
     }
 
+    #[cfg(windows)]
     pub fn system() -> Self {
         if let Some(local) = std::env::var_os("LOCALAPPDATA") {
             return Self::from_root(PathBuf::from(local).join("GameLarper"));
@@ -20,6 +24,26 @@ impl AppPaths {
                 PathBuf::from(profile)
                     .join("AppData")
                     .join("Local")
+                    .join("GameLarper"),
+            );
+        }
+        Self::from_root(std::env::temp_dir().join("GameLarper"))
+    }
+
+    #[cfg(not(windows))]
+    pub fn system() -> Self {
+        if let Some(data) = std::env::var_os("XDG_DATA_HOME")
+            && !data.is_empty()
+        {
+            return Self::from_root(PathBuf::from(data).join("GameLarper"));
+        }
+        if let Some(home) = std::env::var_os("HOME")
+            && !home.is_empty()
+        {
+            return Self::from_root(
+                PathBuf::from(home)
+                    .join(".local")
+                    .join("share")
                     .join("GameLarper"),
             );
         }

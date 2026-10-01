@@ -9,7 +9,6 @@ use std::rc::Rc;
 use std::time::Duration;
 
 use slint::winit_030::winit::event::WindowEvent;
-use slint::winit_030::winit::platform::windows::WindowExtWindows;
 use slint::winit_030::{EventResult, WinitWindowAccessor};
 use slint::{ComponentHandle, PhysicalPosition, PhysicalSize, Timer, TimerMode, Weak};
 
@@ -144,16 +143,9 @@ impl Dock {
         if self.styled.replace(true) {
             return;
         }
-        panel
-            .window()
-            .with_winit_window(|window| window.set_skip_taskbar(true));
-        if let (Some(owner), Some(hwnd)) = (
-            platform::hwnd_of(main.window()),
-            platform::hwnd_of(panel.window()),
-        ) {
-            platform::set_owner(hwnd, owner);
-            platform::style_frame(hwnd);
-        }
+        platform::set_skip_taskbar(panel.window(), true);
+        platform::set_owner(panel.window(), main.window());
+        platform::style_frame(panel.window());
     }
 
     fn place(&self) {
@@ -170,7 +162,7 @@ impl Dock {
         let width = (WIDTH * scale).round() as i32;
         let gap = (GAP * scale).round() as i32;
         let height = size.height as i32;
-        let area = platform::hwnd_of(window).and_then(platform::work_area);
+        let area = platform::work_area(window);
         let right = position.x + size.width as i32 + gap;
         let left = position.x - gap - width;
         let fits_right = area.is_none_or(|area| right + width <= area.right);

@@ -1,8 +1,10 @@
+//! Win32 implementation of the platform glue.
+
 use std::ffi::c_void;
 use std::path::Path;
 use std::process::Command;
 
-use game_larper_core::format_startup_command;
+use game_larper_core::{AppPaths, format_startup_command};
 use windows_sys::Win32::Foundation::{
     CloseHandle, ERROR_ALREADY_EXISTS, GetLastError, HANDLE, HWND, LPARAM, WPARAM,
 };
@@ -31,6 +33,8 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     SendMessageW, SetWindowLongPtrW, WM_SETICON,
 };
 
+use crate::platform::WorkArea;
+
 const RUN_KEY: &str = "Software\\Microsoft\\Windows\\CurrentVersion\\Run";
 const STARTUP_VALUE: &str = "GameLarper";
 const MUTEX_NAME: &str = "Local\\GameLarper.SingleInstance";
@@ -39,7 +43,7 @@ const CF_UNICODETEXT: u32 = 13;
 /// DWM draws this 1px outline around both windows on Windows 11 (COLORREF, 0x00BBGGRR).
 const BORDER_COLOR: u32 = 0x003A_2F26;
 
-pub fn claim_primary_instance() -> bool {
+pub fn claim_primary_instance(_paths: &AppPaths) -> bool {
     let name = wide(MUTEX_NAME);
     let mutex = unsafe { CreateMutexW(std::ptr::null(), 1, name.as_ptr()) };
     if mutex.is_null() {
@@ -131,7 +135,7 @@ pub fn open_in_explorer(path: &Path) -> Result<(), String> {
 }
 
 /// The Win32 handle behind a shown Slint window.
-pub fn hwnd_of(window: &slint::Window) -> Option<HWND> {
+fn hwnd_of(window: &slint::Window) -> Option<HWND> {
     use raw_window_handle::{HasWindowHandle, RawWindowHandle};
     let handle = window.window_handle();
     let handle = handle.window_handle().ok()?;
@@ -142,7 +146,10 @@ pub fn hwnd_of(window: &slint::Window) -> Option<HWND> {
 }
 
 /// Small system corners and a quiet outline, so the frameless window still reads as native.
-pub fn style_frame(hwnd: HWND) {
+pub fn style_frame(window: &slint::Window) {
+    let Some(hwnd) = hwnd_of(window) else {
+        return;
+    };
     let corners = DWMWCP_ROUNDSMALL as u32;
     let border = BORDER_COLOR;
     unsafe {
@@ -162,18 +169,21 @@ pub fn style_frame(hwnd: HWND) {
 }
 
 /// Owned windows stay above their owner, minimize with it, and skip the taskbar.
-pub fn set_owner(window: HWND, owner: HWND) {
-    unsafe { SetWindowLongPtrW(window, GWLP_HWNDPARENT, owner as isize) };
+pub fn set_owner(window: &slint::Window, owner: &slint::Window) {
+    if let (Some(window), Some(owner)) = (hwnd_of(window), hwnd_of(owner)) {
+        unsafe { SetWindowLongPtrW(window, GWLP_HWNDPARENT, owner as isize) };
+    }
 }
 
-#[derive(Debug, Clone, Copy)]
-pub struct WorkArea {
-    pub left: i32,
-    pub right: i32,
+/// The docked panel is part of the main window, not a second app in the taskbar.
+pub fn set_skip_taskbar(window: &slint::Window, skip: bool) {
+    use slint::winit_030::WinitWindowAccessor;
+    let _ = window.with_winit_window(|window| window.set_skip_taskbar(skip));
 }
 
-/// The usable horizontal span (without the taskbar) of the monitor showing `hwnd`.
-pub fn work_area(hwnd: HWND) -> Option<WorkArea> {
+/// The usable horizontal span (without the taskbar) of the monitor showing `window`.
+pub fn work_area(window: &slint::Window) -> Option<WorkArea> {
+    let hwnd = hwnd_of(window)?;
     let monitor = unsafe { MonitorFromWindow(hwnd, MONITOR_DEFAULTTONEAREST) };
     if monitor.is_null() {
         return None;

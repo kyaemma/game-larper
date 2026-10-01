@@ -157,7 +157,14 @@ pub fn clear_artwork(directory: &Path) -> Result<usize, String> {
     Ok(removed)
 }
 
+#[cfg(windows)]
 fn is_reparse(metadata: &fs::Metadata) -> bool {
     use std::os::windows::fs::MetadataExt;
     metadata.file_attributes() & 0x400 != 0
+}
+
+/// The artwork cache may not be a link: clearing it would follow the link out.
+#[cfg(not(windows))]
+fn is_reparse(metadata: &fs::Metadata) -> bool {
+    metadata.file_type().is_symlink()
 }

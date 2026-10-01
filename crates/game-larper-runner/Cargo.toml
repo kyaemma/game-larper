@@ -11,7 +11,7 @@ repository.workspace = true
 name = "game-larper-runner"
 path = "src/main.rs"
 
-[dependencies]
+[target.'cfg(windows)'.dependencies]
 windows-sys = { workspace = true, features = [
     "Win32_Foundation",
     "Win32_Graphics_Gdi",
@@ -19,6 +19,13 @@ windows-sys = { workspace = true, features = [
     "Win32_System_Threading",
     "Win32_UI_WindowsAndMessaging",
 ] }
+
+[target.'cfg(not(windows))'.dependencies]
+libc.workspace = true
+winit = "0.30"
+
+[target.'cfg(not(windows))'.dev-dependencies]
+x11rb = "0.13"
 
 [lints]
 workspace = true

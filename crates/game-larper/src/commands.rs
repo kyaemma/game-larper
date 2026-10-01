@@ -230,12 +230,13 @@ fn spawn_launch_blocking(
                 .launch(&template, &game.id, &relative, icon.as_deref())
         }
         (Err(error), _) => Err(error),
-        (_, None) => Err("This game has no safe Windows executable.".into()),
+        (_, None) => Err("This game has no safe executable path.".into()),
     };
     let _ = tx.send(Msg::Launch(result));
     wake();
 }
 
+#[cfg(windows)]
 fn watch_exit(generation: u64, waiter: isize, tx: mpsc::Sender<Msg>) {
     std::thread::spawn(move || {
         unsafe {
@@ -249,6 +250,27 @@ fn watch_exit(generation: u64, waiter: isize, tx: mpsc::Sender<Msg>) {
         }
         let _ = tx.send(Msg::Exited { generation });
     });
+}
+
+/// Watch the runner's pipe: the read end hits EOF once the runner has exited.
+#[cfg(not(windows))]
+fn watch_exit(generation: u64, waiter: isize, tx: mpsc::Sender<Msg>) {
+    use std::io::Read;
+    use std::os::fd::FromRawFd;
+    // SAFETY: the host hands over its pipe read end, which nobody else closes.
+    let mut pipe = unsafe { std::fs::File::from_raw_fd(waiter as i32) };
+    let mut buffer = [0u8; 8];
+    loop {
+        match pipe.read(&mut buffer) {
+            Ok(0) => break,
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::Interrupted => {}
+            Err(_) => break,
+        }
+    }
+    // Closing here (the file drops) releases the descriptor for good.
+    drop(pipe);
+    let _ = tx.send(Msg::Exited { generation });
 }
 
 fn spawn_refresh(
@@ -402,7 +424,7 @@ fn save_settings(session: &Arc<Mutex<Session>>, panel: &Weak<SidePanel>, log: &L
             &executable,
         )
     {
-        log.info(format!("Startup registry error: {error}"));
+        log.info(format!("Startup setting error: {error}"));
         toast_err(&mut session, error);
         return false;
     }
@@ -927,7 +949,12 @@ fn runner_template() -> Result<PathBuf, String> {
     let directory = executable
         .parent()
         .ok_or_else(|| "Cannot locate Game Larper.".to_string())?;
-    for name in ["GameLarper.Runner.exe", "game-larper-runner.exe"] {
+    let names: [&str; 2] = if cfg!(windows) {
+        ["GameLarper.Runner.exe", "game-larper-runner.exe"]
+    } else {
+        ["game-larper-runner", "game-larper-runner.exe"]
+    };
+    for name in names {
         let path = directory.join(name);
         if path.exists() {
             return Ok(path);
@@ -937,9 +964,7 @@ fn runner_template() -> Result<PathBuf, String> {
 }
 
 fn style_main(ui: &MainWindow) {
-    if let Some(hwnd) = platform::hwnd_of(ui.window()) {
-        platform::style_frame(hwnd);
-    }
+    platform::style_frame(ui.window());
 }
 
 /// Show the main window. The first show creates the native window, so style it each time.

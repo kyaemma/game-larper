@@ -14,7 +14,7 @@ Discord gets lied to
 
 ## what
 
-Game Larper is a small Windows tray app. You pick a game Discord already knows how to recognize. It starts a tiny local stand-in whose path matches that game. Discord does the rest: the name, the timer, the icon, the profile.
+Game Larper is a small tray app for Windows and Linux. You pick a game Discord already knows how to recognize. It starts a tiny local stand-in whose path matches that game. Discord does the rest: the name, the timer, the icon, the profile.
 
 It does not launch the real game. It does not touch your Steam library. It does not log into Discord, and it does not farm Quests or rewards.
 
@@ -28,7 +28,7 @@ Sometimes. Discord's detector is undocumented and it moves. The useful manual te
 
 Pause should make the activity go away. Resume should bring it back. Quit should leave no extra process behind.
 
-If nothing shows up, the log in `%LOCALAPPDATA%\GameLarper\logs` has the process id, the fake path, and the window handle. The checklist lives in [docs/DETECTION.md](docs/DETECTION.md).
+If nothing shows up, the log has the process id, the fake path, and the window handle. It lives in `%LOCALAPPDATA%\GameLarper\logs` on Windows and `~/.local/share/GameLarper/logs` on Linux (`$XDG_DATA_HOME/GameLarper/logs` if that is set). The checklist lives in [docs/DETECTION.md](docs/DETECTION.md).
 
 ## a queue, because of course
 
@@ -45,6 +45,8 @@ GameLarper.Runner.exe
 
 Windows may show an unknown-publisher / SmartScreen warning because the binaries are not code-signed yet.
 
+There is no Linux release artifact yet. On Linux, build from source (below) and keep the two binaries together the same way.
+
 ## build, if you're weird
 
 Windows x64, Rust stable 1.98, then:
@@ -55,6 +57,15 @@ powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\build-release.ps1
 
 Run `artifacts\release\win-x64\GameLarper.exe`. Keep `GameLarper.Runner.exe` beside it.
 
+Linux x64, Rust stable 1.98, then:
+
+```bash
+sudo apt-get install libfontconfig1-dev   # Debian/Ubuntu; other distros: fontconfig headers
+./scripts/check.sh                        # fmt + clippy + test
+cargo run -p game-larper
+```
+
+`cargo run` looks for `game-larper-runner` next to itself; keep the runner beside `game-larper` when you move them. Everything except fontconfig is dlopened at runtime, so a machine with `DISPLAY` (X11 or XWayland) or a Wayland session can run it as-is.
 
 ## license
 

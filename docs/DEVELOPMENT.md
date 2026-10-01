@@ -22,6 +22,26 @@ The runner test copies the binary to `eldenring.exe`, checks the extended style,
 
 Config is camelCase JSON so a file written by the older C# build still loads. The catalog cache is `cache/catalog.json`. If that file is missing, a legacy `cache/discord-detectables.json` is read once.
 
+## Linux
+
+Linux x64, Rust stable 1.98.1, edition 2024. `scripts/check.sh` is the counterpart of `check.ps1` (fmt check, clippy, test) and is what CI runs:
+
+```bash
+cargo fmt --all
+cargo clippy --workspace --all-targets -- -D warnings
+cargo test --workspace
+cargo run -p game-larper
+```
+
+Only fontconfig is needed at build time (`libfontconfig1-dev` on Debian/Ubuntu); the rest of the stack, X11 and Wayland included, is loaded at runtime. The CI workflow has a Windows job and a Linux job, both pinned to 1.98.1, both running the check script.
+
+Platform-specific code lives in `crates/game-larper/src/platform/` (`windows.rs` / `unix.rs`) and `crates/game-larper/src/host.rs` (process spawn/stop per target). On Linux:
+
+- Data lives in `$XDG_DATA_HOME/GameLarper`, falling back to `~/.local/share/GameLarper`.
+- Single instance is a Unix socket at `runtime/activate.sock`; a second copy knocks on it and exits.
+- Startup is an XDG autostart entry (`~/.config/autostart/game-larper.desktop`), and "open folder" goes through `xdg-open`.
+- The runner test is `crates/game-larper-runner/tests/proc.rs`: it checks the `/proc` identity, and when `DISPLAY` is set to a reachable X server, the X11 window (title, `WM_CLASS`, off-screen position) plus a clean `SIGTERM`. It skips the window assertions headless.
+
 
 ## Publishing a release
 

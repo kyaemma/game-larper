@@ -14,10 +14,10 @@ use game_larper_core::AppPaths;
 
 fn main() -> ExitCode {
     let minimized = std::env::args().any(|arg| arg.eq_ignore_ascii_case("--minimized"));
-    if !platform::claim_primary_instance() {
+    let paths = AppPaths::system();
+    if !platform::claim_primary_instance(&paths) {
         return ExitCode::SUCCESS;
     }
-    let paths = AppPaths::system();
     let log = log::Log::new(paths.logs());
     log.info(format!("Game Larper {} started", env!("CARGO_PKG_VERSION")));
     if let Err(error) = slint::BackendSelector::new()
