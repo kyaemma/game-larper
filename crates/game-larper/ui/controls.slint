@@ -145,6 +145,8 @@ export component IconButton inherits Rectangle {
     in property <length> icon-size: 16px;
     in property <color> tint: Theme.text-2;
     in property <color> hover-tint: Theme.text;
+    // Keep the accessible label while allowing specific icon buttons to hide hover text.
+    in property <bool> show-tip: true;
     // Draw the tooltip above, right-aligned, for buttons along the bottom edge.
     in property <bool> tip-above;
     out property <bool> has-focus: focus.has-focus;
@@ -198,15 +200,15 @@ export component IconButton inherits Rectangle {
         width: root.width + 6px;
         height: root.height + 6px;
     }
-    if root.tip != "" && !root.tip-above: Tooltip {
+    if root.show-tip && root.tip != "" && !root.tip-above: Tooltip {
         Tip { text: root.tip; }
     }
     Timer {
         interval: 500ms;
-        running: root.tip-above && touch.has-hover && !root.tip-ready;
+        running: root.show-tip && root.tip-above && touch.has-hover && !root.tip-ready;
         triggered => { root.tip-ready = true; }
     }
-    if root.tip-above && root.tip-ready && touch.has-hover: Tip {
+    if root.show-tip && root.tip-above && root.tip-ready && touch.has-hover: Tip {
         text: root.tip;
         x: root.width - self.width;
         y: -self.height - 6px;
