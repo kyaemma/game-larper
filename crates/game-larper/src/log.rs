@@ -11,7 +11,6 @@ const MAX_HISTORY: usize = 1_000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LogLevel {
-    Debug,
     Info,
     Success,
     Warn,
@@ -21,7 +20,6 @@ pub enum LogLevel {
 impl LogLevel {
     pub fn label(self) -> &'static str {
         match self {
-            Self::Debug => "DEBUG",
             Self::Info => "INFO",
             Self::Success => "SUCCESS",
             Self::Warn => "WARN",
@@ -56,10 +54,6 @@ impl Log {
             gate: Mutex::new(()),
             history: Mutex::new(VecDeque::with_capacity(MAX_HISTORY)),
         }
-    }
-
-    pub fn debug(&self, message: impl AsRef<str>) {
-        self.record(LogLevel::Debug, message.as_ref());
     }
 
     pub fn info(&self, message: impl AsRef<str>) {
