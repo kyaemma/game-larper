@@ -321,17 +321,9 @@ fn spawn_launch_blocking(
     wake();
 }
 
-fn watch_exit(generation: u64, waiter: isize, tx: mpsc::Sender<Msg>) {
-    std::thread::spawn(move || {
-        unsafe {
-            windows_sys::Win32::System::Threading::WaitForSingleObject(
-                waiter as windows_sys::Win32::Foundation::HANDLE,
-                windows_sys::Win32::System::Threading::INFINITE,
-            );
-            windows_sys::Win32::Foundation::CloseHandle(
-                waiter as windows_sys::Win32::Foundation::HANDLE,
-            );
-        }
+/// Report the runner's exit, requested or not, once its exit watch fires.
+fn watch_exit(generation: u64, watch: ExitWatch, tx: mpsc::Sender<Msg>) {
+    host::watch_exit(watch, move || {
         let _ = tx.send(Msg::Exited { generation });
     });
 }
