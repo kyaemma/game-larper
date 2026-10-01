@@ -18,6 +18,8 @@ use x11rb::protocol::xproto::{AtomEnum, ConnectionExt as _, MapState};
 
 const EXE: &str = "eldenring.exe";
 const TITLE: &str = "eldenring";
+const EXEC_RETRY_BUDGET: Duration = Duration::from_millis(250);
+const EXEC_RETRY_DELAY: Duration = Duration::from_millis(10);
 
 struct Staged {
     directory: PathBuf,
@@ -66,7 +68,7 @@ impl Runner {
             .stdout(Stdio::null())
             .stderr(Stdio::piped());
         configure(&mut command);
-        let mut child = command.spawn().expect("the runner did not start");
+        let mut child = spawn_runner(&mut command);
         let stderr = child.stderr.take().unwrap();
         let (sender, lines) = mpsc::channel();
         std::thread::spawn(move || {
@@ -113,6 +115,21 @@ impl Drop for Runner {
         if self.child.try_wait().ok().flatten().is_none() {
             let _ = self.child.kill();
             let _ = self.child.wait();
+        }
+    }
+}
+
+fn spawn_runner(command: &mut Command) -> Child {
+    let deadline = Instant::now() + EXEC_RETRY_BUDGET;
+    loop {
+        match command.spawn() {
+            Ok(child) => return child,
+            Err(error)
+                if error.raw_os_error() == Some(libc::ETXTBSY) && Instant::now() < deadline =>
+            {
+                std::thread::sleep(EXEC_RETRY_DELAY);
+            }
+            Err(error) => panic!("the runner did not start: {error}"),
         }
     }
 }
