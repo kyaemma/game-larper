@@ -265,7 +265,7 @@ impl Log {
             .unwrap_or_else(|poison| poison.into_inner())
     }
 
-    fn record(&self, level: LogLevel, area: Area, message: &str) {
+    pub fn record(&self, level: LogLevel, area: Area, message: &str) {
         let now = Local::now();
         self.history().push(
             now.format("%H:%M:%S%.3f").to_string(),

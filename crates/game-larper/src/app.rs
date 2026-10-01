@@ -8,8 +8,8 @@ use std::time::{Duration, Instant, SystemTime};
 use chrono::{Local, NaiveDate, NaiveTime, TimeZone};
 use game_larper_core::{
     AppConfig, AppPaths, CatalogCache, ConfigStore, DEFAULT_SEARCH_LIMIT, DEFAULT_TRANSITION_GAP,
-    GameDefinition, QueueAction, QueueActivity, QueueMachine, SessionClock, SessionState,
-    format_hms, load_catalog_with_legacy, load_queue, save_queue, unix_time_ms,
+    GameDefinition, QueueAction, QueueActivity, QueueItem, QueueMachine, SessionClock,
+    SessionState, format_hms, load_catalog_with_legacy, load_queue, save_queue, unix_time_ms,
 };
 use slint::{ComponentHandle, Model, ModelRc, SharedString, Timer, TimerMode, VecModel, Weak};
 
@@ -94,6 +94,7 @@ enum ToastKind {
 
 struct Session {
     paths: AppPaths,
+    log: Arc<Log>,
     config: AppConfig,
     games: Vec<GameDefinition>,
     loaded: bool,
@@ -330,10 +331,21 @@ fn load_session(paths: &AppPaths, log: &Arc<Log>) -> Session {
         (QueueMachine::new(DEFAULT_TRANSITION_GAP), Vec::new())
     };
     for warning in queue_warnings {
-        log.info(Area::Queue, warning);
+        log.warn(Area::Queue, warning);
+    }
+    if !queue.items().is_empty() {
+        log.debug(
+            Area::Queue,
+            format!(
+                "Restored {} queued item(s), {}",
+                queue.items().len(),
+                describe_activity(&queue.activity())
+            ),
+        );
     }
     Session {
         paths: paths.clone(),
+        log: log.clone(),
         config,
         games: Vec::new(),
         loaded: false,
@@ -521,10 +533,15 @@ fn wire(
         let tx = tx.clone();
         let wake = wake.clone();
         move || {
-            let action = session
-                .lock()
-                .ok()
-                .map(|mut session| session.queue.resume(Instant::now()));
+            let action = session.lock().ok().map(|mut session| {
+                let action = session.queue.resume(Instant::now());
+                if let Some(index) = action.launch_index {
+                    session
+                        .log
+                        .info(Area::Queue, format!("Resuming item {}", index + 1));
+                }
+                action
+            });
             if let Some(action) = action {
                 dispatch_queue_action(&session, &log, &tx, &wake, action);
             }
@@ -809,10 +826,25 @@ fn wire(
         let wake = wake.clone();
         move |index| {
             if let Ok(mut session) = session.lock() {
-                if let Err(error) = session.queue.remove(index as usize) {
-                    toast_err(&mut session, error.to_string());
-                } else {
-                    persist_queue(&mut session);
+                match session.queue.remove(index as usize) {
+                    Ok(item) => {
+                        session.log.info(
+                            Area::Queue,
+                            format!(
+                                "Removed item {} ({}); {} left",
+                                index + 1,
+                                item.name,
+                                session.queue.items().len()
+                            ),
+                        );
+                        persist_queue(&mut session);
+                    }
+                    Err(error) => {
+                        session
+                            .log
+                            .warn(Area::Queue, format!("Remove refused: {error}"));
+                        toast_err(&mut session, error.to_string());
+                    }
                 }
             }
             wake();
@@ -825,7 +857,11 @@ fn wire(
         let wake = wake.clone();
         move || {
             let action = session.lock().ok().map(|mut session| {
+                let count = session.queue.items().len();
                 let action = session.queue.clear();
+                session
+                    .log
+                    .info(Area::Queue, format!("Cleared {count} item(s)"));
                 persist_queue(&mut session);
                 action
             });
@@ -841,7 +877,7 @@ fn wire(
         let tx = tx.clone();
         let wake = wake.clone();
         move || {
-            queue_command(&session, &log, &tx, &wake, |queue| {
+            queue_command(&session, &log, &tx, &wake, "Queue start", |queue| {
                 queue.start_now(Instant::now())
             });
             wake();
@@ -856,6 +892,11 @@ fn wire(
             let action = session.lock().ok().map(|mut session| {
                 let action = session.queue.pause(Instant::now());
                 if action.stop_runner {
+                    if let QueueActivity::Paused { index } = session.queue.activity() {
+                        session
+                            .log
+                            .info(Area::Queue, format!("Paused on item {}", index + 1));
+                    }
                     session.clock.pause(Instant::now());
                 }
                 action
@@ -873,10 +914,21 @@ fn wire(
         let tx = tx.clone();
         let wake = wake.clone();
         move || {
-            let action = session
-                .lock()
-                .ok()
-                .map(|mut session| session.queue.skip(Instant::now()));
+            let action = session.lock().ok().map(|mut session| {
+                let from = session.queue.active_index();
+                let action = session.queue.skip(Instant::now());
+                if let Some(from) = from {
+                    session.log.info(
+                        Area::Queue,
+                        format!(
+                            "Skipped item {}; now {}",
+                            from + 1,
+                            describe_activity(&session.queue.activity())
+                        ),
+                    );
+                }
+                action
+            });
             if let Some(action) = action {
                 dispatch_queue_action(&session, &log, &tx, &wake, action);
             }
@@ -908,8 +960,12 @@ fn wire(
         move || {
             if let Ok(mut session) = session.lock() {
                 if let Err(error) = session.queue.disarm() {
+                    session
+                        .log
+                        .warn(Area::Queue, format!("Schedule clear refused: {error}"));
                     toast_err(&mut session, error.to_string());
                 } else {
+                    session.log.info(Area::Queue, "Schedule disarmed");
                     persist_queue(&mut session);
                     toast(&mut session, "Schedule cleared.");
                 }
@@ -1132,16 +1188,28 @@ fn tick(session: &Arc<Mutex<Session>>, log: &Arc<Log>, tx: &mpsc::Sender<Msg>, w
     if !session_guard.restored && session_guard.loaded {
         session_guard.restored = true;
         if session_guard.config.auto_resume && session_guard.selected.is_some() {
+            log.info(
+                Area::Session,
+                "Auto-resume is on; playing the restored selection",
+            );
             drop(session_guard);
             begin_play(session, log, tx, wake);
             return;
         }
     }
+    let before = session_guard.queue.activity();
     let action = {
         let now = Instant::now();
         let unix = unix_time_ms(SystemTime::now());
         session_guard.queue.tick(now, unix)
     };
+    let after = session_guard.queue.activity();
+    if after != before {
+        let queue = &session_guard.queue;
+        for (level, message) in queue_tick_events(&before, &after, queue.items(), queue.gap()) {
+            log.record(level, Area::Queue, &message);
+        }
+    }
     // The dock and the queue panel show artwork too; fetch what they miss.
     let wanted: Vec<GameDefinition> = {
         let session = &*session_guard;
@@ -1398,6 +1466,94 @@ mod tests {
         assert_eq!(model.iter().collect::<Vec<_>>(), vec![1, 5, 3]);
         sync_model(&model, vec![4]);
         assert_eq!(model.iter().collect::<Vec<_>>(), vec![4]);
+    }
+
+    fn queue_items() -> Vec<QueueItem> {
+        ["ELDEN RING", "Hades"]
+            .into_iter()
+            .enumerate()
+            .map(|(index, name)| QueueItem {
+                id: index as u64 + 1,
+                application_id: format!("{}", 100 + index),
+                name: name.into(),
+                duration: Duration::from_secs(30 * 60),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn queue_ticks_log_completion_gap_and_finish() {
+        let items = queue_items();
+        let gap = Duration::from_secs(2);
+
+        let to_gap = queue_tick_events(
+            &QueueActivity::Running { index: 0 },
+            &QueueActivity::Transition { next_index: 1 },
+            &items,
+            gap,
+        );
+        assert_eq!(
+            to_gap,
+            vec![
+                (
+                    LogLevel::Info,
+                    "Item 1 (ELDEN RING) completed its 30 min".to_string()
+                ),
+                (LogLevel::Debug, "Waiting 2000 ms before item 2".to_string()),
+            ]
+        );
+
+        let finished = queue_tick_events(
+            &QueueActivity::Running { index: 1 },
+            &QueueActivity::Idle,
+            &items,
+            gap,
+        );
+        assert_eq!(finished.len(), 2);
+        assert_eq!(
+            finished[1],
+            (
+                LogLevel::Success,
+                "Queue finished all 2 item(s)".to_string()
+            )
+        );
+
+        // The launch itself is logged when the runner is dispatched, not here.
+        let started = queue_tick_events(
+            &QueueActivity::Transition { next_index: 1 },
+            &QueueActivity::Running { index: 1 },
+            &items,
+            gap,
+        );
+        assert!(started.is_empty());
+    }
+
+    #[test]
+    fn scheduled_starts_are_logged_when_they_fire() {
+        let events = queue_tick_events(
+            &QueueActivity::Scheduled { at_unix_ms: 0 },
+            &QueueActivity::Running { index: 0 },
+            &queue_items(),
+            Duration::from_secs(2),
+        );
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].0, LogLevel::Info);
+        assert!(events[0].1.starts_with("Scheduled start ("));
+    }
+
+    #[test]
+    fn queue_activity_descriptions_count_from_one() {
+        assert_eq!(
+            describe_activity(&QueueActivity::Transition { next_index: 0 }),
+            "switching to item 1"
+        );
+        assert_eq!(
+            describe_activity(&QueueActivity::Failed {
+                index: 1,
+                message: "The runner exited.".into()
+            }),
+            "failed on item 2: The runner exited."
+        );
     }
 
     #[test]

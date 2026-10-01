@@ -213,6 +213,18 @@ fn dispatch_queue_action(
         guard.busy = false;
         return;
     }
+    if let (Some(index), Some(game)) = (action.launch_index, launch.as_ref()) {
+        log.info(
+            Area::Queue,
+            format!(
+                "Starting item {} of {}: {} ({})",
+                index + 1,
+                guard.queue.items().len(),
+                game.name,
+                game.id
+            ),
+        );
+    }
     if action.stop_runner || launch.is_some() {
         guard.busy = true;
     }
@@ -382,10 +394,15 @@ fn add_selected_to_queue(session: &Arc<Mutex<Session>>, panel: &Weak<SidePanel>)
         return;
     };
     if !(1..=24 * 60).contains(&minutes) {
+        session.log.debug(
+            Area::Queue,
+            format!("Add refused: {minutes} is not a 1-1440 minute duration"),
+        );
         toast_err(&mut session, "Duration must be between 1 and 1440 minutes.");
         return;
     }
     let Some(id) = session.selected.clone() else {
+        session.log.debug(Area::Queue, "Add ignored: no game selected");
         toast(&mut session, "Select a game first.");
         return;
     };
@@ -399,18 +416,38 @@ fn add_selected_to_queue(session: &Arc<Mutex<Session>>, panel: &Weak<SidePanel>)
         .add(&application_id, &name, Duration::from_secs(minutes * 60))
     {
         Ok(_) => {
+            session.log.info(
+                Area::Queue,
+                format!(
+                    "Added {name} ({application_id}) for {minutes} min; {} item(s) queued",
+                    session.queue.items().len()
+                ),
+            );
             persist_queue(&mut session);
             toast_ok(&mut session, format!("Queued {name} for {minutes} min."));
         }
-        Err(error) => toast_err(&mut session, error.to_string()),
+        Err(error) => {
+            session.log.warn(
+                Area::Queue,
+                format!("Adding {name} ({application_id}) refused: {error}"),
+            );
+            toast_err(&mut session, error.to_string());
+        }
     }
 }
 
 fn move_queue(session: &Arc<Mutex<Session>>, from: usize, to: usize) {
     if let Ok(mut session) = session.lock() {
         if let Err(error) = session.queue.move_item(from, to) {
+            session
+                .log
+                .warn(Area::Queue, format!("Reorder refused: {error}"));
             toast_err(&mut session, error.to_string());
         } else {
+            session.log.debug(
+                Area::Queue,
+                format!("Moved item {} to position {}", from + 1, to + 1),
+            );
             persist_queue(&mut session);
         }
     }
@@ -437,12 +474,31 @@ fn arm_schedule(session: &Arc<Mutex<Session>>, panel: &Weak<SidePanel>) {
     match parsed {
         Ok(at) => match session.queue.arm(at, unix_time_ms(SystemTime::now())) {
             Ok(()) => {
+                session.log.info(
+                    Area::Queue,
+                    format!(
+                        "Schedule armed for {} ({} item(s))",
+                        format_unix(at),
+                        session.queue.items().len()
+                    ),
+                );
                 persist_queue(&mut session);
                 toast_ok(&mut session, "Queue armed.");
             }
-            Err(error) => toast_err(&mut session, error.to_string()),
+            Err(error) => {
+                session
+                    .log
+                    .warn(Area::Queue, format!("Schedule refused: {error}"));
+                toast_err(&mut session, error.to_string());
+            }
         },
-        Err(error) => toast_err(&mut session, error),
+        Err(error) => {
+            session.log.debug(
+                Area::Queue,
+                format!("Schedule input {date:?} {time:?} rejected: {error}"),
+            );
+            toast_err(&mut session, error);
+        }
     }
 }
 
@@ -497,30 +553,116 @@ fn save_settings(session: &Arc<Mutex<Session>>, panel: &Weak<SidePanel>, log: &L
 }
 
 fn persist_queue(session: &mut Session) {
-    if session.config.preserve_queue {
-        let _ = save_queue(&session.paths.queue(), &session.queue);
+    if session.config.preserve_queue
+        && let Err(error) = save_queue(&session.paths.queue(), &session.queue)
+    {
+        session
+            .log
+            .error(Area::Files, format!("Queue save failed: {error}"));
     }
 }
 
+/// Run a queue command named `label` (for the log) and apply what it asks of the runner.
 fn queue_command(
     session: &Arc<Mutex<Session>>,
     log: &Arc<Log>,
     tx: &mpsc::Sender<Msg>,
     wake: &Arc<dyn Fn() + Send + Sync>,
+    label: &str,
     command: impl FnOnce(&mut QueueMachine) -> Result<QueueAction, game_larper_core::Error>,
 ) {
     let action = session
         .lock()
         .ok()
         .and_then(|mut guard| match command(&mut guard.queue) {
-            Ok(action) => Some(action),
+            Ok(action) => {
+                log.info(
+                    Area::Queue,
+                    format!("{label}: {} item(s)", guard.queue.items().len()),
+                );
+                Some(action)
+            }
             Err(error) => {
+                log.warn(Area::Queue, format!("{label} refused: {error}"));
                 toast_err(&mut guard, error.to_string());
                 None
             }
         });
     if let Some(action) = action {
         dispatch_queue_action(session, log, tx, wake, action);
+    }
+}
+
+/// Log lines for a queue state change made by the clock, oldest first.
+///
+/// Commands log themselves; this covers what happens on its own: a schedule firing, an item
+/// running out its time, the gap between items, and the queue finishing.
+fn queue_tick_events(
+    before: &QueueActivity,
+    after: &QueueActivity,
+    items: &[QueueItem],
+    gap: Duration,
+) -> Vec<(LogLevel, String)> {
+    let mut events = Vec::new();
+    match before {
+        QueueActivity::Scheduled { at_unix_ms } => events.push((
+            LogLevel::Info,
+            format!("Scheduled start ({}) reached", format_unix(*at_unix_ms)),
+        )),
+        QueueActivity::Running { index } => {
+            let item = items.get(*index);
+            events.push((
+                LogLevel::Info,
+                format!(
+                    "Item {} ({}) completed its {}",
+                    index + 1,
+                    item.map_or("unknown", |item| item.name.as_str()),
+                    item.map_or_else(|| "time".to_string(), |item| format_minutes(item.duration))
+                ),
+            ));
+        }
+        _ => {}
+    }
+    match after {
+        QueueActivity::Transition { next_index } => events.push((
+            LogLevel::Debug,
+            format!(
+                "Waiting {} ms before item {}",
+                gap.as_millis(),
+                next_index + 1
+            ),
+        )),
+        QueueActivity::Idle if matches!(before, QueueActivity::Running { .. }) => events.push((
+            LogLevel::Success,
+            format!("Queue finished all {} item(s)", items.len()),
+        )),
+        QueueActivity::Running { .. } => {}
+        other => events.push((
+            LogLevel::Debug,
+            format!("Queue is now {}", describe_activity(other)),
+        )),
+    }
+    events
+}
+
+/// A queue state for the log, with 1-based item numbers.
+fn describe_activity(activity: &QueueActivity) -> String {
+    match activity {
+        QueueActivity::Idle => "idle".into(),
+        QueueActivity::Scheduled { at_unix_ms } => {
+            format!("scheduled for {}", format_unix(*at_unix_ms))
+        }
+        QueueActivity::Missed { at_unix_ms } => {
+            format!("waiting after a missed start ({})", format_unix(*at_unix_ms))
+        }
+        QueueActivity::Running { index } => format!("running item {}", index + 1),
+        QueueActivity::Paused { index } => format!("paused on item {}", index + 1),
+        QueueActivity::Transition { next_index } => {
+            format!("switching to item {}", next_index + 1)
+        }
+        QueueActivity::Failed { index, message } => {
+            format!("failed on item {}: {message}", index + 1)
+        }
     }
 }
 
