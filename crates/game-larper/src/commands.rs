@@ -652,6 +652,15 @@ fn selected_game(session: &Session) -> Option<&GameDefinition> {
 
 /// The game the dock shows: the one running or paused, else the selection.
 fn session_game(session: &Session) -> Option<&GameDefinition> {
+    if let QueueActivity::Transition { next_index } = session.queue.activity()
+        && let Some(item) = session.queue.items().get(next_index)
+    {
+        return session
+            .games
+            .iter()
+            .find(|game| game.id == item.application_id)
+            .or_else(|| selected_game(session));
+    }
     if session.clock.state() == SessionState::Stopped {
         return selected_game(session);
     }
@@ -717,13 +726,12 @@ fn controls(session: &Session) -> Controls {
 }
 
 fn displayed_time(session: &Session, now: Instant) -> String {
-    if matches!(
-        session.queue.activity(),
-        QueueActivity::Running { .. } | QueueActivity::Paused { .. }
-    ) {
-        format_hms(session.queue.elapsed_in_item(now).unwrap_or_default())
-    } else {
-        format_hms(session.clock.elapsed(now))
+    match session.queue.activity() {
+        QueueActivity::Running { .. } | QueueActivity::Paused { .. } => {
+            format_hms(session.queue.elapsed_in_item(now).unwrap_or_default())
+        }
+        QueueActivity::Transition { .. } => String::new(),
+        _ => format_hms(session.clock.elapsed(now)),
     }
 }
 
