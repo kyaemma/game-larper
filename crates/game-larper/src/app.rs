@@ -922,10 +922,17 @@ fn render_main(ui: &MainWindow, session: &Session, now: Instant) {
     ui.set_db_color(color.into());
 
     let state = session.clock.state();
-    let (label, mode, tone) = match state {
-        SessionState::Playing => ("Playing", "playing", Tone::Success),
-        SessionState::Paused => ("Paused", "paused", Tone::Warning),
-        SessionState::Stopped => ("Ready", "stopped", Tone::Muted),
+    let (label, mode, tone) = if matches!(
+        session.queue.activity(),
+        QueueActivity::Transition { .. }
+    ) {
+        ("Switching…", "switching", Tone::Muted)
+    } else {
+        match state {
+            SessionState::Playing => ("Playing", "playing", Tone::Success),
+            SessionState::Paused => ("Paused", "paused", Tone::Warning),
+            SessionState::Stopped => ("Ready", "stopped", Tone::Muted),
+        }
     };
     let current = session_game(session);
     ui.set_session_visible(current.is_some());
@@ -1278,5 +1285,43 @@ mod tests {
         assert_eq!(model.iter().collect::<Vec<_>>(), vec![1, 5, 3]);
         sync_model(&model, vec![4]);
         assert_eq!(model.iter().collect::<Vec<_>>(), vec![4]);
+    }
+
+    #[test]
+    fn transport_sync_stops_false_playing_but_preserves_real_pauses() {
+        let stop = QueueAction {
+            stop_runner: true,
+            launch_index: None,
+        };
+        let launch = QueueAction {
+            stop_runner: true,
+            launch_index: Some(1),
+        };
+
+        assert!(should_stop_clock_for_dispatch(
+            &QueueActivity::Idle,
+            SessionState::Playing,
+            &stop
+        ));
+        assert!(should_stop_clock_for_dispatch(
+            &QueueActivity::Transition { next_index: 1 },
+            SessionState::Playing,
+            &stop
+        ));
+        assert!(!should_stop_clock_for_dispatch(
+            &QueueActivity::Paused { index: 0 },
+            SessionState::Paused,
+            &stop
+        ));
+        assert!(!should_stop_clock_for_dispatch(
+            &QueueActivity::Idle,
+            SessionState::Paused,
+            &stop
+        ));
+        assert!(should_stop_clock_for_dispatch(
+            &QueueActivity::Running { index: 1 },
+            SessionState::Playing,
+            &launch
+        ));
     }
 }
