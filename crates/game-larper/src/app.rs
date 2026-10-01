@@ -392,6 +392,7 @@ fn drain(
 fn wire(
     ui: &MainWindow,
     panel: &SidePanel,
+    log_window: &LogWindow,
     tray: &TrayIcon,
     dock: &Rc<Dock>,
     session: &Arc<Mutex<Session>>,
@@ -691,6 +692,48 @@ fn wire(
         }
     });
     panel.on_open_logs({
+        let log_window = log_window.as_weak();
+        let log = log.clone();
+        move || {
+            if let Some(log_window) = log_window.upgrade() {
+                show_log_window(&log_window, &log);
+            }
+        }
+    });
+    log_window.on_close_requested({
+        let log_window = log_window.as_weak();
+        move || {
+            if let Some(log_window) = log_window.upgrade() {
+                let _ = log_window.hide();
+            }
+        }
+    });
+    log_window.on_copy({
+        let session = session.clone();
+        let log = log.clone();
+        let wake = wake.clone();
+        move || {
+            let text = log.history_text();
+            if text.is_empty() {
+                return;
+            }
+            if let Ok(mut session) = session.lock() {
+                match platform::copy_text(&text) {
+                    Ok(()) => toast_ok(&mut session, "Logs copied"),
+                    Err(error) => toast_err(&mut session, error),
+                }
+            }
+            wake();
+        }
+    });
+    log_window.on_clear({
+        let log = log.clone();
+        move || {
+            log.clear_history();
+            render_logs(&log);
+        }
+    });
+    log_window.on_open_folder({
         let session = session.clone();
         move || {
             if let Ok(session) = session.lock() {
