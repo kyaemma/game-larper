@@ -934,9 +934,7 @@ fn show_log_window(window: &LogWindow, log: &Log) {
             if !reopening {
                 log.debug(Area::App, "Log console opened");
             }
-            if let Some(hwnd) = platform::hwnd_of(window.window()) {
-                platform::style_frame(hwnd);
-            }
+            platform::style_frame(window.window());
         }
         Err(error) => log.error(Area::App, format!("Log console failed to open: {error}")),
     }
@@ -1304,9 +1302,7 @@ fn runner_template() -> Result<PathBuf, String> {
 }
 
 fn style_main(ui: &MainWindow) {
-    if let Some(hwnd) = platform::hwnd_of(ui.window()) {
-        platform::style_frame(hwnd);
-    }
+    platform::style_frame(ui.window());
 }
 
 /// Show the main window. The first show creates the native window, so style it each time.
