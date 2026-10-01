@@ -1,5 +1,6 @@
 // Settings content for the side panel. Values stay staged until Save.
 
+import { AboutSlint } from "std-widgets.slint";
 import { Theme } from "theme.slint";
 import { LogoMark, Button, Toggle, SectionLabel } from "controls.slint";
 
@@ -202,5 +203,13 @@ export component SettingsView inherits VerticalLayout {
                 wrap: word-wrap;
             }
         }
+    }
+
+    // Required attribution for Slint's royalty-free desktop license.
+    HorizontalLayout {
+        padding-left: 10px;
+        padding-top: 12px;
+        padding-bottom: 4px;
+        AboutSlint { }
     }
 }
