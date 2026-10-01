@@ -39,8 +39,9 @@ component LogTitleBar inherits Rectangle {
 
 component LogLine inherits Rectangle {
     in property <LogRow> entry;
-    // Shared column width, measured once by the window from the widest level label.
+    // Shared column widths, measured once by the window from the widest labels.
     in property <length> level-width;
+    in property <length> area-width;
 
     HorizontalLayout {
         padding-left: 12px;
@@ -66,8 +67,16 @@ component LogLine inherits Rectangle {
             vertical-alignment: top;
         }
         Text {
+            text: root.entry.area;
+            color: Theme.text-3;
+            font-size: Theme.text-s;
+            font-family: Theme.mono;
+            min-width: root.area-width;
+            vertical-alignment: top;
+        }
+        Text {
             text: root.entry.message;
-            color: Theme.text-2;
+            color: root.entry.quiet ? Theme.text-3 : Theme.text-2;
             font-size: Theme.text-s;
             font-family: Theme.mono;
             wrap: word-wrap;
@@ -103,12 +112,18 @@ export component LogWindow inherits Window {
 
     forward-focus: keys;
 
-    // Measures the level column; never shown.
+    // Measure the level and area columns; never shown. "settings" is the widest area label.
     level-probe := Text {
         text: "SUCCESS";
         font-size: Theme.text-s;
         font-family: Theme.mono;
         font-weight: 700;
+        visible: false;
+    }
+    area-probe := Text {
+        text: "settings";
+        font-size: Theme.text-s;
+        font-family: Theme.mono;
         visible: false;
     }
 
@@ -159,6 +174,7 @@ export component LogWindow inherits Window {
                         for entry in root.rows: LogLine {
                             entry: entry;
                             level-width: level-probe.preferred-width;
+                            area-width: area-probe.preferred-width;
                         }
                     }
                 }

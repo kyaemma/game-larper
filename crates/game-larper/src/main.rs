@@ -19,13 +19,16 @@ fn main() -> ExitCode {
     }
     let paths = AppPaths::system();
     let log = log::Log::new(paths.logs());
-    log.info(format!("Game Larper {} started", env!("CARGO_PKG_VERSION")));
+    log.info(
+        log::Area::App,
+        format!("Game Larper {} started", env!("CARGO_PKG_VERSION")),
+    );
     if let Err(error) = slint::BackendSelector::new()
         .backend_name("winit".into())
         .renderer_name("femtovg".into())
         .select()
     {
-        log.error(format!("UI backend failed: {error}"));
+        log.error(log::Area::App, format!("UI backend failed: {error}"));
         return ExitCode::from(1);
     }
     match app::run(paths, log, minimized) {

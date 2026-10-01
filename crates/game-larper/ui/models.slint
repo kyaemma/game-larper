@@ -17,10 +17,14 @@ export struct QueueRow {
     active: bool,
 }
 
-
 export struct LogRow {
     time: string,
     level: string,
+    // Which part of the app wrote the line, such as "runner" or "queue".
+    area: string,
     message: string,
+    // Level color.
     tone: color,
+    // Debug detail reads quieter than the events around it.
+    quiet: bool,
 }

@@ -1,4 +1,4 @@
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::rc::Rc;
@@ -14,7 +14,7 @@ use game_larper_core::{
 use slint::{ComponentHandle, Model, ModelRc, SharedString, Timer, TimerMode, VecModel, Weak};
 
 use crate::host::{LaunchReport, RunnerHost};
-use crate::log::{Log, LogLevel};
+use crate::log::{Area, Log, LogChanges, LogCursor, LogEntry, LogLevel, MAX_HISTORY};
 use crate::net;
 use crate::panel::{Dock, Mode};
 use crate::platform;
@@ -37,6 +37,8 @@ struct Models {
     hits: Rc<VecModel<Hit>>,
     rows: Rc<VecModel<QueueRow>>,
     logs: Rc<VecModel<LogRow>>,
+    /// How far `logs` has caught up with the live history.
+    log_cursor: Cell<LogCursor>,
 }
 
 thread_local! {
@@ -140,7 +142,14 @@ pub fn run(
     ui.set_hits(ModelRc::from(hits.clone()));
     panel.set_queue_rows(ModelRc::from(rows.clone()));
     log_window.set_rows(ModelRc::from(logs.clone()));
-    MODELS.with(|slot| *slot.borrow_mut() = Some(Models { hits, rows, logs }));
+    MODELS.with(|slot| {
+        *slot.borrow_mut() = Some(Models {
+            hits,
+            rows,
+            logs,
+            log_cursor: Cell::default(),
+        })
+    });
     panel.set_version_label(env!("CARGO_PKG_VERSION").into());
     sync_settings_from_config(
         &panel,
@@ -278,11 +287,13 @@ pub fn run(
             slint::CloseRequestResponse::KeepWindowShown
         }
     });
+    // The console is created once and only hidden, so reopening shows the same window.
     log_window.window().on_close_requested({
         let log_window = log_window.as_weak();
+        let log = log.clone();
         move || {
             if let Some(log_window) = log_window.upgrade() {
-                let _ = log_window.hide();
+                hide_log_window(&log_window, &log);
             }
             slint::CloseRequestResponse::KeepWindowShown
         }
@@ -297,7 +308,7 @@ pub fn run(
     {
         let _ = host.stop();
     }
-    log.info("Game Larper stopped");
+    log.info(Area::App, "Game Larper stopped");
     Ok(())
 }
 
@@ -305,7 +316,7 @@ pub fn run(
 fn load_session(paths: &AppPaths, log: &Log) -> Session {
     let (config, warnings) = ConfigStore::new(paths.config()).load();
     for warning in warnings {
-        log.warn(warning);
+        log.warn(Area::Settings, warning);
     }
     let now_ms = unix_time_ms(SystemTime::now());
     let (queue, queue_warnings) = if config.preserve_queue {
@@ -319,7 +330,7 @@ fn load_session(paths: &AppPaths, log: &Log) -> Session {
         (QueueMachine::new(DEFAULT_TRANSITION_GAP), Vec::new())
     };
     for warning in queue_warnings {
-        log.info(warning);
+        log.info(Area::Queue, warning);
     }
     Session {
         paths: paths.clone(),
@@ -357,7 +368,7 @@ fn spawn_load(tx: mpsc::Sender<Msg>, paths: AppPaths, log: Arc<Log>, wake: Wake)
         let legacy = CatalogCache::new(paths.legacy_catalog());
         let (games, warning) = load_catalog_with_legacy(&current, &legacy);
         if let Some(warning) = warning {
-            log.warn(warning);
+            log.warn(Area::Catalog, warning);
         }
         let games = games
             .unwrap_or_default()
@@ -680,10 +691,11 @@ fn wire(
                     Ok(count) => {
                         ART.with(|art| art.borrow_mut().clear());
                         session.art_failed.clear();
+                        log.info(Area::Art, format!("Cleared {count} cached images"));
                         toast_ok(&mut session, format!("Cleared {count} cached images."));
                     }
                     Err(error) => {
-                        log.error(&error);
+                        log.error(Area::Art, format!("Artwork cache clear failed: {error}"));
                         toast_err(&mut session, error);
                     }
                 }
@@ -702,9 +714,10 @@ fn wire(
     });
     log_window.on_close_requested({
         let log_window = log_window.as_weak();
+        let log = log.clone();
         move || {
             if let Some(log_window) = log_window.upgrade() {
-                let _ = log_window.hide();
+                hide_log_window(&log_window, &log);
             }
         }
     });
@@ -719,8 +732,17 @@ fn wire(
             }
             if let Ok(mut session) = session.lock() {
                 match platform::copy_text(&text) {
-                    Ok(()) => toast_ok(&mut session, "Logs copied"),
-                    Err(error) => toast_err(&mut session, error),
+                    Ok(()) => {
+                        log.debug(
+                            Area::App,
+                            format!("Copied {} console lines", text.lines().count()),
+                        );
+                        toast_ok(&mut session, "Logs copied");
+                    }
+                    Err(error) => {
+                        log.error(Area::App, format!("Copying the console failed: {error}"));
+                        toast_err(&mut session, error);
+                    }
                 }
             }
             wake();
@@ -735,9 +757,15 @@ fn wire(
     });
     log_window.on_open_folder({
         let session = session.clone();
+        let log = log.clone();
         move || {
-            if let Ok(session) = session.lock() {
-                let _ = platform::open_in_explorer(&session.paths.logs());
+            if let Ok(session) = session.lock()
+                && let Err(error) = platform::open_in_explorer(&session.paths.logs())
+            {
+                log.error(
+                    Area::Files,
+                    format!("Opening the log folder failed: {error}"),
+                );
             }
         }
     });
@@ -1160,7 +1188,10 @@ fn apply_message(
     };
     match message {
         Msg::Loaded { games, updated } => {
-            log.info(format!("Catalog loaded: {} supported games", games.len()));
+            log.info(
+                Area::Catalog,
+                format!("Catalog loaded: {} supported games", games.len()),
+            );
             session.games = games;
             session.loaded = true;
             session.catalog_updated = updated;
@@ -1200,7 +1231,10 @@ fn apply_message(
                     session.loaded = true;
                     session.offline = false;
                     session.catalog_updated = Some(SystemTime::now());
-                    log.success(format!("Catalog refreshed: {count} supported games"));
+                    log.success(
+                        Area::Catalog,
+                        format!("Catalog refreshed: {count} supported games"),
+                    );
                     if session
                         .selected
                         .as_ref()
@@ -1222,7 +1256,7 @@ fn apply_message(
                     }
                 }
                 Err(error) => {
-                    log.error(format!("Metadata refresh failed: {error}"));
+                    log.error(Area::Catalog, format!("Metadata refresh failed: {error}"));
                     session.offline = !session.games.is_empty();
                     toast_err(
                         &mut session,
@@ -1250,7 +1284,9 @@ fn apply_message(
             match result {
                 Ok(report) => {
                     session.clock.play(Instant::now());
-                    log.success(format!(
+                    log.success(
+                        Area::Runner,
+                        format!(
                         "Runner diagnostic: PID={}, path={}, basename={}, workingDirectory={}, alive=true, HWND=0x{:X}, title={}, integrity={}",
                         report.pid,
                         report.executable.display(),
@@ -1263,7 +1299,7 @@ fn apply_message(
                     watch_exit(report.generation, report.waiter, tx.clone());
                 }
                 Err(error) => {
-                    log.error(format!("Launch failed: {error}"));
+                    log.error(Area::Runner, format!("Launch failed: {error}"));
                     session.clock.stop();
                     if matches!(
                         session.queue.activity(),
@@ -1287,7 +1323,7 @@ fn apply_message(
         Msg::Stopped(result) => {
             session.busy = false;
             if let Err(error) = result {
-                log.error(format!("Stop failed: {error}"));
+                log.error(Area::Runner, format!("Stop failed: {error}"));
                 toast_err(&mut session, error);
             }
             if session.quitting {
@@ -1301,9 +1337,10 @@ fn apply_message(
                 .map(|mut host| host.take_unexpected_exit(generation))
                 .unwrap_or(false);
             if unexpected {
-                log.warn(format!(
-                    "Runner exited unexpectedly (generation {generation})"
-                ));
+                log.warn(
+                    Area::Runner,
+                    format!("Runner exited unexpectedly (generation {generation})"),
+                );
                 session.clock.unexpected_exit();
                 if let QueueActivity::Running { index } | QueueActivity::Paused { index } =
                     session.queue.activity()
