@@ -13,13 +13,16 @@ use std::sync::Arc;
 
 use game_larper_core::AppPaths;
 
-use crate::log::{Area, Log};
+use crate::log::{Area, Log, redact};
+
+#[cfg(not(any(windows, target_os = "linux")))]
+compile_error!("Game Larper supports Windows and Linux only.");
 
 fn main() -> ExitCode {
     let minimized = std::env::args().any(|arg| arg.eq_ignore_ascii_case("--minimized"));
     let paths = AppPaths::system();
     let log = Arc::new(Log::new(paths.logs()));
-    if !platform::claim_primary_instance() {
+    if !platform::claim_primary_instance(&paths, &log) {
         log.info(
             Area::App,
             "Another instance is already running; asked it to show its window",
@@ -27,6 +30,18 @@ fn main() -> ExitCode {
         return ExitCode::SUCCESS;
     }
     log_panics(&log);
+    if let Some(session) = platform::describe_session() {
+        log.debug(Area::App, session);
+    }
+    if paths.is_fallback() {
+        log.warn(
+            Area::Files,
+            format!(
+                "No per-user data folder could be found; using {}",
+                redact(&paths.root)
+            ),
+        );
+    }
     log.info(
         Area::App,
         format!(

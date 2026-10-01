@@ -1,3 +1,6 @@
+//! The Win32 runner's window contract. The Linux counterpart is `linux.rs`.
+#![cfg(windows)]
+
 use std::os::windows::io::AsRawHandle;
 use std::path::PathBuf;
 use std::process::{Child, Command};

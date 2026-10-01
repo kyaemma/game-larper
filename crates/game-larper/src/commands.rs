@@ -321,17 +321,9 @@ fn spawn_launch_blocking(
     wake();
 }
 
-fn watch_exit(generation: u64, waiter: isize, tx: mpsc::Sender<Msg>) {
-    std::thread::spawn(move || {
-        unsafe {
-            windows_sys::Win32::System::Threading::WaitForSingleObject(
-                waiter as windows_sys::Win32::Foundation::HANDLE,
-                windows_sys::Win32::System::Threading::INFINITE,
-            );
-            windows_sys::Win32::Foundation::CloseHandle(
-                waiter as windows_sys::Win32::Foundation::HANDLE,
-            );
-        }
+/// Report the runner's exit, requested or not, once its exit watch fires.
+fn watch_exit(generation: u64, watch: ExitWatch, tx: mpsc::Sender<Msg>) {
+    host::watch_exit(watch, move || {
         let _ = tx.send(Msg::Exited { generation });
     });
 }
@@ -934,9 +926,7 @@ fn show_log_window(window: &LogWindow, log: &Log) {
             if !reopening {
                 log.debug(Area::App, "Log console opened");
             }
-            if let Some(hwnd) = platform::hwnd_of(window.window()) {
-                platform::style_frame(hwnd);
-            }
+            platform::style_frame(window.window());
         }
         Err(error) => log.error(Area::App, format!("Log console failed to open: {error}")),
     }
@@ -1294,7 +1284,12 @@ fn runner_template() -> Result<PathBuf, String> {
     let directory = executable
         .parent()
         .ok_or_else(|| "Cannot locate Game Larper.".to_string())?;
-    for name in ["GameLarper.Runner.exe", "game-larper-runner.exe"] {
+    // The release name first, then what `cargo build` produces.
+    #[cfg(windows)]
+    let names = ["GameLarper.Runner.exe", "game-larper-runner.exe"];
+    #[cfg(target_os = "linux")]
+    let names = ["GameLarper.Runner", "game-larper-runner"];
+    for name in names {
         let path = directory.join(name);
         if path.exists() {
             return Ok(path);
@@ -1304,9 +1299,7 @@ fn runner_template() -> Result<PathBuf, String> {
 }
 
 fn style_main(ui: &MainWindow) {
-    if let Some(hwnd) = platform::hwnd_of(ui.window()) {
-        platform::style_frame(hwnd);
-    }
+    platform::style_frame(ui.window());
 }
 
 /// Show the main window. The first show creates the native window, so style it each time.

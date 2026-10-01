@@ -54,3 +54,32 @@ fn path_rejects_absolute_traversal_and_device_names() {
     let error = resolve_executable(Path::new(r"C:\temp"), "../1", "game.exe").unwrap_err();
     assert!(matches!(error, Error::InvalidApplicationId));
 }
+
+#[test]
+fn xdg_data_home_prefers_an_absolute_xdg_value_then_home() {
+    use game_larper_core::xdg_data_home;
+    let some = |value: &str| Some(std::ffi::OsString::from(value));
+    assert_eq!(
+        xdg_data_home(some("/data/kya"), some("/home/kya")),
+        Some(PathBuf::from("/data/kya"))
+    );
+    // The base-directory spec says relative and empty values are invalid and ignored.
+    for ignored in ["relative/data", ""] {
+        assert_eq!(
+            xdg_data_home(some(ignored), some("/home/kya")),
+            Some(Path::new("/home/kya").join(".local").join("share"))
+        );
+    }
+    assert_eq!(xdg_data_home(None, some("relative-home")), None);
+    assert_eq!(xdg_data_home(None, None), None);
+}
+
+#[test]
+fn only_the_temporary_root_counts_as_a_fallback() {
+    use game_larper_core::AppPaths;
+    let temp = std::env::temp_dir();
+    assert!(AppPaths::from_root(temp.join("GameLarper")).is_fallback());
+    // A real per-user root that merely lives under the temp folder is not the fallback.
+    assert!(!AppPaths::from_root(temp.join("claude").join("GameLarper")).is_fallback());
+    assert!(!AppPaths::from_root(PathBuf::from("/home/kya/.local/share/GameLarper")).is_fallback());
+}

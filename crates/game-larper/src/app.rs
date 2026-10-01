@@ -13,7 +13,7 @@ use game_larper_core::{
 };
 use slint::{ComponentHandle, Model, ModelRc, SharedString, Timer, TimerMode, VecModel, Weak};
 
-use crate::host::{LaunchReport, RunnerHost};
+use crate::host::{self, ExitWatch, LaunchReport, RunnerHost};
 use crate::log::{Area, Log, LogChanges, LogCursor, LogEntry, LogLevel, MAX_HISTORY, redact};
 use crate::net;
 use crate::panel::{Dock, Mode};
@@ -1458,8 +1458,9 @@ fn apply_message(
                     log.success(
                         Area::Runner,
                         format!(
-                            "Running PID={} HWND=0x{:X} title=\"{}\" integrity={} basename={} path={} cwd={} (generation {})",
+                            "Running PID={} {}=0x{:X} title=\"{}\" integrity={} basename={} path={} cwd={} (generation {})",
                             report.pid,
+                            host::WINDOW_LABEL,
                             report.hwnd,
                             report.title,
                             report.integrity,
@@ -1469,7 +1470,7 @@ fn apply_message(
                             report.generation
                         ),
                     );
-                    watch_exit(report.generation, report.waiter, tx.clone());
+                    watch_exit(report.generation, report.exit_watch, tx.clone());
                 }
                 Err(error) => {
                     // The cause is logged where the launch failed; this is what it means here.

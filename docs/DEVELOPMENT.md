@@ -20,6 +20,12 @@ cargo run -p game-larper
 
 The runner test copies the binary to `eldenring.exe`, checks the extended style, the off-screen position, the title, and a clean `WM_CLOSE`. It does not prove that Discord Desktop will show the game.
 
+## Linux (experimental)
+
+Linux x64, same toolchain. Build dependencies on Debian/Ubuntu: `build-essential pkg-config libfontconfig1-dev`. X11, Wayland, GL and xkbcommon are loaded at runtime. `scripts/check.sh` is the counterpart of `check.ps1`. CI runs the tests under `xvfb-run` with `GAME_LARPER_REQUIRE_X11=1`, so the X11 runner test cannot be skipped there. Locally it runs whenever `DISPLAY` reaches an X server.
+
+Platform code stays behind target modules: `platform/{windows,linux}.rs` for desktop glue, `host/{windows,linux}.rs` for runner process mechanics under the shared `host/mod.rs`, and `game-larper-runner/src/{windows,linux}.rs`. Anything Linux-specific is gated on `target_os = "linux"`, and other targets fail to compile on purpose. See [LINUX.md](LINUX.md) for the design and the manual test.
+
 Config is camelCase JSON so a file written by the older C# build still loads. The catalog cache is `cache/catalog.json`. If that file is missing, a legacy `cache/discord-detectables.json` is read once.
 
 

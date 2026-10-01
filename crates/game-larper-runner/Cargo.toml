@@ -11,7 +11,7 @@ repository.workspace = true
 name = "game-larper-runner"
 path = "src/main.rs"
 
-[dependencies]
+[target.'cfg(windows)'.dependencies]
 windows-sys = { workspace = true, features = [
     "Win32_Foundation",
     "Win32_Graphics_Gdi",
@@ -19,6 +19,16 @@ windows-sys = { workspace = true, features = [
     "Win32_System_Threading",
     "Win32_UI_WindowsAndMessaging",
 ] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+game-larper-core = { path = "../game-larper-core" }
+# Pure-Rust X11 client (no libxcb). Already in the tree through winit, so no new crates.
+x11rb = "0.13"
+
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+game-larper-core = { path = "../game-larper-core" }
+x11rb = "0.13"
+libc.workspace = true
 
 [lints]
 workspace = true

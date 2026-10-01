@@ -255,7 +255,14 @@ pub fn clear_artwork(directory: &Path) -> Result<usize, String> {
     Ok(removed)
 }
 
+#[cfg(windows)]
 fn is_reparse(metadata: &fs::Metadata) -> bool {
     use std::os::windows::fs::MetadataExt;
     metadata.file_attributes() & 0x400 != 0
+}
+
+/// Clearing through a symlink would delete files outside the cache.
+#[cfg(target_os = "linux")]
+fn is_reparse(metadata: &fs::Metadata) -> bool {
+    metadata.file_type().is_symlink()
 }

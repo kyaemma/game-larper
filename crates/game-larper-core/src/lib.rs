@@ -9,6 +9,7 @@ mod config;
 mod error;
 mod paths;
 mod queue;
+pub mod runner_protocol;
 mod safe_path;
 mod search;
 mod session;
@@ -20,7 +21,7 @@ pub use catalog::{
 };
 pub use config::{AppConfig, ConfigStore, SCHEMA_VERSION, format_startup_command};
 pub use error::Error;
-pub use paths::AppPaths;
+pub use paths::{AppPaths, xdg_data_home};
 pub use queue::{
     DEFAULT_TRANSITION_GAP, MAX_QUEUE_ITEMS, QueueAction, QueueActivity, QueueItem, QueueMachine,
     QueueSnapshot, load_queue, save_queue, unix_time_ms,

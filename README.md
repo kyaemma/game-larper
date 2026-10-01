@@ -34,6 +34,10 @@ If nothing shows up, the log has the process id, the fake path, and the window h
 
 You can line up a few games with durations, or arm the whole queue for a local time. The app has to be running. If it was closed when that time passed, the schedule is marked missed and nothing starts late.
 
+## linux, experimentally
+
+There is experimental Linux code on the `integrate/linux-support` branch. It builds and its mechanics are tested in CI, but nobody has checked yet that Discord on Linux shows the game. There is no Linux download. The details, what is and is not known, and the test procedure live in [docs/LINUX.md](docs/LINUX.md).
+
 ## download
 
 Grab the latest `GameLarper-win-x64.zip` from [Releases](https://github.com/kyaemma/game-larper-rust/releases), extract it, and keep both executables together:
