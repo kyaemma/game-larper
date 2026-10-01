@@ -14,8 +14,12 @@ use game_larper_core::{Error as CoreError, resolve_executable};
 
 use crate::log::{Area, Log, redact};
 
+#[cfg(target_os = "linux")]
+mod linux;
 #[cfg(windows)]
 mod windows;
+#[cfg(target_os = "linux")]
+use self::linux as sys;
 #[cfg(windows)]
 use self::windows as sys;
 
@@ -228,7 +232,7 @@ fn ensure_private_dirs(runtime_root: &Path, target: &Path) -> io::Result<()> {
     for component in relative.components() {
         current.push(component);
         if !current.exists() {
-            fs::create_dir(&current)?;
+            create_private_dir(&current)?;
         }
         if is_reparse_path(&current)? {
             return Err(io::Error::other(
@@ -239,6 +243,25 @@ fn ensure_private_dirs(runtime_root: &Path, target: &Path) -> io::Result<()> {
     Ok(())
 }
 
+#[cfg(windows)]
+fn create_private_dir(path: &Path) -> io::Result<()> {
+    fs::create_dir(path)
+}
+
+/// Owner-only, like the runner copies inside it.
+#[cfg(target_os = "linux")]
+fn create_private_dir(path: &Path) -> io::Result<()> {
+    use std::os::unix::fs::DirBuilderExt;
+    fs::DirBuilder::new().mode(0o700).create(path)
+}
+
+/// Linux paths are case-sensitive: compare whole components exactly.
+#[cfg(target_os = "linux")]
+fn is_under(path: &Path, root: &Path) -> bool {
+    path.starts_with(root)
+}
+
+#[cfg(windows)]
 fn is_under(path: &Path, root: &Path) -> bool {
     let path = path.to_string_lossy().to_ascii_lowercase();
     let root = root.to_string_lossy().to_ascii_lowercase();
