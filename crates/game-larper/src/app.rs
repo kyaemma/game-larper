@@ -399,6 +399,14 @@ fn load_session(paths: &AppPaths, log: &Arc<Log>) -> Session {
     }
 }
 
+/// Keep the games Discord can match on Windows. Over half of the catalog cannot be matched,
+/// so the vector is trimmed to what stays rather than holding on to the larger buffer.
+fn supported_only(mut games: Vec<GameDefinition>) -> Vec<GameDefinition> {
+    games.retain(|game| game.supported_path().is_some());
+    games.shrink_to_fit();
+    games
+}
+
 fn spawn_load(tx: mpsc::Sender<Msg>, paths: AppPaths, log: Arc<Log>, wake: Wake) {
     std::thread::spawn(move || {
         let started = Instant::now();
@@ -423,11 +431,7 @@ fn spawn_load(tx: mpsc::Sender<Msg>, paths: AppPaths, log: Arc<Log>, wake: Wake)
             log.warn(Area::Catalog, warning);
         }
         let parsed = games.as_ref().map(Vec::len);
-        let games: Vec<GameDefinition> = games
-            .unwrap_or_default()
-            .into_iter()
-            .filter(|game| game.supported_path().is_some())
-            .collect();
+        let games = supported_only(games.unwrap_or_default());
         let updated = current.last_updated().or_else(|| legacy.last_updated());
         match parsed {
             Some(parsed) => log.info(
@@ -1367,10 +1371,7 @@ fn apply_message(
             session.refreshing = false;
             match result {
                 Ok(games) => {
-                    session.games = games
-                        .into_iter()
-                        .filter(|game| game.supported_path().is_some())
-                        .collect();
+                    session.games = supported_only(games);
                     let count = session.games.len();
                     session.loaded = true;
                     session.offline = false;

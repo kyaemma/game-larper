@@ -14,7 +14,7 @@ use std::fmt;
 use serde::Deserialize;
 use serde::de::{Deserializer, Error, IgnoredAny, MapAccess, SeqAccess, Visitor};
 
-use crate::catalog::{ExecutableDefinition, GameDefinition};
+use crate::catalog::{ExecutableChoice, GameDefinition};
 
 /// What a catalog document turned out to be.
 pub(crate) enum Catalog {
@@ -122,21 +122,19 @@ impl<'de> Visitor<'de> for EntryVisitor {
         let mut id = None;
         let mut name = None;
         let mut aliases = Vec::new();
-        let mut executables = Vec::new();
+        let mut executable = ExecutableChoice::default();
         let mut steam_app_id = None;
         let mut icon_hash = None;
         let mut icon = None;
-        let mut cover_image_hash = None;
         while let Some(field) = map.next_key()? {
             match field {
                 Field::Id => id = map.next_value::<Text>()?.0,
                 Field::Name => name = map.next_value::<Text>()?.0,
                 Field::Aliases => aliases = map.next_value::<Aliases>()?.0,
-                Field::Executables => executables = map.next_value::<Executables>()?.0,
+                Field::Executables => executable = map.next_value::<Executables>()?.0,
                 Field::ThirdPartySkus => steam_app_id = map.next_value::<SteamSku>()?.0,
                 Field::IconHash => icon_hash = map.next_value::<Text>()?.0,
                 Field::Icon => icon = map.next_value::<Text>()?.0,
-                Field::CoverImageHash => cover_image_hash = map.next_value::<Text>()?.0,
                 Field::Other => {
                     map.next_value::<IgnoredAny>()?;
                 }
@@ -146,10 +144,9 @@ impl<'de> Visitor<'de> for EntryVisitor {
             id,
             name,
             aliases,
-            executables,
+            executable,
             steam_app_id,
             icon_hash.or(icon),
-            cover_image_hash,
         )))
     }
 }
@@ -158,10 +155,9 @@ fn build_game(
     id: Option<String>,
     name: Option<String>,
     aliases: Vec<String>,
-    executables: Vec<ExecutableDefinition>,
+    executable: ExecutableChoice,
     steam_app_id: Option<String>,
     icon_hash: Option<String>,
-    cover_image_hash: Option<String>,
 ) -> Option<GameDefinition> {
     let id = id?;
     if id.is_empty() || !id.bytes().all(|byte| byte.is_ascii_digit()) {
@@ -175,10 +171,9 @@ fn build_game(
         id,
         name,
         aliases,
-        executables,
         steam_app_id,
         icon_hash,
-        cover_image_hash,
+        executable,
     })
 }
 
@@ -190,7 +185,6 @@ enum Field {
     ThirdPartySkus,
     IconHash,
     Icon,
-    CoverImageHash,
     Other,
 }
 
@@ -213,7 +207,6 @@ impl<'de> Deserialize<'de> for Field {
                     "third_party_skus" => Field::ThirdPartySkus,
                     "icon_hash" => Field::IconHash,
                     "icon" => Field::Icon,
-                    "cover_image_hash" => Field::CoverImageHash,
                     _ => Field::Other,
                 })
             }
@@ -352,8 +345,8 @@ impl<'de> Visitor<'de> for AliasesVisitor {
     }
 }
 
-/// The Windows rules of an `executables` array.
-struct Executables(Vec<ExecutableDefinition>);
+/// The best Windows executable of an `executables` array, and how many rules it listed.
+struct Executables(ExecutableChoice);
 
 impl<'de> Deserialize<'de> for Executables {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
@@ -370,28 +363,30 @@ impl<'de> Visitor<'de> for ExecutablesVisitor {
         formatter.write_str("an array of executables")
     }
 
-    skip_scalars!(Executables(Vec::new()));
+    skip_scalars!(Executables(ExecutableChoice::default()));
 
     fn visit_str<E: Error>(self, _: &str) -> Result<Executables, E> {
-        Ok(Executables(Vec::new()))
+        Ok(Executables(ExecutableChoice::default()))
     }
 
     fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Executables, A::Error> {
         drain_map(&mut map)?;
-        Ok(Executables(Vec::new()))
+        Ok(Executables(ExecutableChoice::default()))
     }
 
     fn visit_seq<A: SeqAccess<'de>>(self, mut seq: A) -> Result<Executables, A::Error> {
-        let mut executables = Vec::new();
-        while let Some(Executable(executable)) = seq.next_element()? {
-            executables.extend(executable);
+        let mut choice = ExecutableChoice::default();
+        while let Some(Executable(rule)) = seq.next_element()? {
+            if let Some((name, is_launcher)) = rule {
+                choice.offer(&name, is_launcher);
+            }
         }
-        Ok(Executables(executables))
+        Ok(Executables(choice))
     }
 }
 
-/// One `executables` element, kept only when it is a named Windows rule.
-struct Executable(Option<ExecutableDefinition>);
+/// One `executables` element as (name, is_launcher), only when it is a named Windows rule.
+struct Executable(Option<(String, bool)>);
 
 impl<'de> Deserialize<'de> for Executable {
     fn deserialize<D: Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
@@ -433,10 +428,7 @@ impl<'de> Visitor<'de> for ExecutableVisitor {
         }
         let windows = os.is_some_and(|os| os.eq_ignore_ascii_case("win32"));
         Ok(Executable(match name {
-            Some(name) if windows => Some(ExecutableDefinition {
-                name,
-                is_launcher: is_launcher == Some(true),
-            }),
+            Some(name) if windows => Some((name, is_launcher == Some(true))),
             _ => None,
         }))
     }

@@ -16,9 +16,8 @@ mod search;
 mod session;
 
 pub use catalog::{
-    CATALOG_TTL, CatalogCache, DETECTABLE_ENDPOINTS, ExecutableDefinition, GameDefinition,
-    MAX_CATALOG_BYTES, USER_AGENT, is_catalog_stale, load_catalog_with_legacy, merge_games,
-    parse_catalog,
+    CATALOG_TTL, CatalogCache, DETECTABLE_ENDPOINTS, GameDefinition, MAX_CATALOG_BYTES, USER_AGENT,
+    is_catalog_stale, load_catalog_with_legacy, merge_games, parse_catalog,
 };
 pub use config::{AppConfig, ConfigStore, SCHEMA_VERSION, format_startup_command};
 pub use error::Error;

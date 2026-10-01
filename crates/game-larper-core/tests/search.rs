@@ -1,18 +1,7 @@
-use game_larper_core::{DEFAULT_SEARCH_LIMIT, ExecutableDefinition, GameDefinition, search};
+use game_larper_core::{DEFAULT_SEARCH_LIMIT, GameDefinition, search};
 
 fn game(id: &str, name: &str) -> GameDefinition {
-    GameDefinition {
-        id: id.into(),
-        name: name.into(),
-        aliases: Vec::new(),
-        executables: vec![ExecutableDefinition {
-            name: "game.exe".into(),
-            is_launcher: false,
-        }],
-        steam_app_id: None,
-        icon_hash: None,
-        cover_image_hash: None,
-    }
+    GameDefinition::new(id, name).with_executable("game.exe", false)
 }
 
 #[test]

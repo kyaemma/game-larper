@@ -294,7 +294,7 @@ fn spawn_launch_blocking(
                 format!(
                     "Template {}; {} Windows executable rule(s) in the catalog",
                     redact(&template),
-                    game.executables.len()
+                    game.executable_rules()
                 ),
             );
             let icon = net::ensure_artwork(&images, &game, &log);
