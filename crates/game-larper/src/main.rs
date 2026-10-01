@@ -9,33 +9,63 @@ mod panel;
 mod platform;
 
 use std::process::ExitCode;
+use std::sync::Arc;
 
 use game_larper_core::AppPaths;
 
+use crate::log::{Area, Log};
+
 fn main() -> ExitCode {
     let minimized = std::env::args().any(|arg| arg.eq_ignore_ascii_case("--minimized"));
+    let paths = AppPaths::system();
+    let log = Arc::new(Log::new(paths.logs()));
     if !platform::claim_primary_instance() {
+        log.info(
+            Area::App,
+            "Another instance is already running; asked it to show its window",
+        );
         return ExitCode::SUCCESS;
     }
-    let paths = AppPaths::system();
-    let log = log::Log::new(paths.logs());
+    log_panics(&log);
     log.info(
-        log::Area::App,
-        format!("Game Larper {} started", env!("CARGO_PKG_VERSION")),
+        Area::App,
+        format!(
+            "Game Larper {} started (pid {})",
+            env!("CARGO_PKG_VERSION"),
+            std::process::id()
+        ),
     );
     if let Err(error) = slint::BackendSelector::new()
         .backend_name("winit".into())
         .renderer_name("femtovg".into())
         .select()
     {
-        log.error(log::Area::App, format!("UI backend failed: {error}"));
+        log.error(Area::App, format!("UI backend failed: {error}"));
         return ExitCode::from(1);
     }
-    match app::run(paths, log, minimized) {
+    match app::run(paths, log.clone(), minimized) {
         Ok(()) => ExitCode::SUCCESS,
         Err(error) => {
+            log.error(Area::App, format!("UI failed: {error}"));
             eprintln!("{error}");
             ExitCode::from(1)
         }
     }
+}
+
+/// A windowed app has no console, so panics go to the log file as well as stderr.
+fn log_panics(log: &Arc<Log>) {
+    let log = Arc::clone(log);
+    let previous = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let thread = std::thread::current();
+        log.error(
+            Area::App,
+            format!(
+                "Panic on thread '{}': {info}",
+                thread.name().unwrap_or("unnamed")
+            ),
+        );
+        previous(info);
+    }));
 }

@@ -125,10 +125,10 @@ struct Session {
 
 pub fn run(
     paths: AppPaths,
-    log: Log,
+    log: Arc<Log>,
     start_minimized_flag: bool,
 ) -> Result<(), slint::PlatformError> {
-    let log = Arc::new(log);
+    log.debug(Area::App, format!("Data folder {}", redact(&paths.root)));
     let ui = MainWindow::new()?;
     let panel = SidePanel::new()?;
     let log_window = LogWindow::new()?;
@@ -210,7 +210,12 @@ pub fn run(
     );
     platform::watch_activation({
         let ui_weak = ui.as_weak();
+        let log = log.clone();
         move || {
+            log.info(
+                Area::App,
+                "A second launch asked this instance to show its window",
+            );
             let ui_weak = ui_weak.clone();
             let _ = slint::invoke_from_event_loop(move || {
                 if let Some(ui) = ui_weak.upgrade() {
@@ -222,13 +227,22 @@ pub fn run(
 
     render(&ui, &panel, &tray, &session);
     render_logs(&log);
-    let minimized = start_minimized_flag
-        || session
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .config
-            .start_minimized;
-    if !minimized {
+    let start_minimized_setting = session
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .config
+        .start_minimized;
+    let minimized = start_minimized_flag || start_minimized_setting;
+    if minimized {
+        log.info(
+            Area::App,
+            if start_minimized_flag {
+                "Starting minimized to the tray (--minimized)"
+            } else {
+                "Starting minimized to the tray (setting)"
+            },
+        );
+    } else {
         ui.show()?;
         style_main(&ui);
     }
@@ -271,6 +285,7 @@ pub fn run(
                 .config
                 .close_to_tray;
             if close_to_tray {
+                log.debug(Area::App, "Main window closed to the tray");
                 dock.dismiss();
                 if let Some(ui) = ui_weak.upgrade() {
                     let _ = ui.hide();
@@ -300,7 +315,9 @@ pub fn run(
         }
     });
 
+    log.debug(Area::App, "Event loop running");
     slint::run_event_loop()?;
+    log.info(Area::App, "Event loop ended; releasing the runner");
     if let Ok(mut host) = session
         .lock()
         .unwrap_or_else(|p| p.into_inner())
@@ -319,6 +336,10 @@ fn load_session(paths: &AppPaths, log: &Arc<Log>) -> Session {
     for warning in warnings {
         log.warn(Area::Settings, warning);
     }
+    log.debug(
+        Area::Settings,
+        format!("Settings: {}", describe_settings(&config)),
+    );
     let now_ms = unix_time_ms(SystemTime::now());
     let (queue, queue_warnings) = if config.preserve_queue {
         load_queue(&paths.queue(), now_ms, DEFAULT_TRANSITION_GAP).unwrap_or_else(|error| {
@@ -702,6 +723,7 @@ fn wire(
                 .map(|session| session.config.close_to_tray)
                 .unwrap_or(true);
             if close_to_tray {
+                log.debug(Area::App, "Main window closed to the tray");
                 dock.dismiss();
                 if let Some(ui) = ui.upgrade() {
                     let _ = ui.hide();
@@ -821,8 +843,13 @@ fn wire(
     panel.on_open_data({
         let session = session.clone();
         move || {
-            if let Ok(session) = session.lock() {
-                let _ = platform::open_in_explorer(&session.paths.root);
+            if let Ok(session) = session.lock()
+                && let Err(error) = platform::open_in_explorer(&session.paths.root)
+            {
+                session.log.error(
+                    Area::Files,
+                    format!("Opening the data folder failed: {error}"),
+                );
             }
         }
     });
@@ -1476,7 +1503,7 @@ fn apply_message(
                 toast_err(&mut session, error);
             }
             if session.quitting {
-                log.info(Area::App, "Runner released; leaving the event loop");
+                log.info(Area::App, "Shutting down");
                 let _ = slint::quit_event_loop();
             }
         }

@@ -533,19 +533,51 @@ fn save_settings(session: &Arc<Mutex<Session>>, panel: &Weak<SidePanel>, log: &L
             .last_selected_discord_application_id
             .clone(),
     };
-    if let Ok(executable) = executable
-        && let Err(error) = platform::set_run_at_startup(
+    match executable {
+        Ok(executable) => match platform::set_run_at_startup(
             next.launch_with_windows,
             next.start_minimized,
             &executable,
-        )
-    {
-        log.error(Area::Settings, format!("Startup registry error: {error}"));
-        toast_err(&mut session, error);
-        return false;
+        ) {
+            Ok(()) => log.debug(
+                Area::Settings,
+                if next.launch_with_windows {
+                    format!(
+                        "Startup entry registered for {}{}",
+                        redact(&executable),
+                        if next.start_minimized {
+                            " --minimized"
+                        } else {
+                            ""
+                        }
+                    )
+                } else {
+                    "No startup entry (launch with Windows is off)".to_string()
+                },
+            ),
+            Err(error) => {
+                log.error(
+                    Area::Settings,
+                    format!("Startup registration failed: {error}"),
+                );
+                toast_err(&mut session, error);
+                return false;
+            }
+        },
+        Err(error) => log.warn(
+            Area::Settings,
+            format!("Startup entry left unchanged; executable path unknown: {error}"),
+        ),
     }
     if !next.preserve_queue {
-        let _ = std::fs::remove_file(session.paths.queue());
+        match std::fs::remove_file(session.paths.queue()) {
+            Ok(()) => log.debug(Area::Queue, "Saved queue removed (preserve queue is off)"),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => log.warn(
+                Area::Files,
+                format!("Could not remove the saved queue: {error}"),
+            ),
+        }
     }
     session.config = next;
     if let Err(error) = ConfigStore::new(session.paths.config()).save(&session.config) {
@@ -553,6 +585,10 @@ fn save_settings(session: &Arc<Mutex<Session>>, panel: &Weak<SidePanel>, log: &L
         toast_err(&mut session, "Settings could not be saved.");
         return false;
     }
+    log.info(
+        Area::Settings,
+        format!("Saved: {}", describe_settings(&session.config)),
+    );
     if session.config.preserve_queue {
         persist_queue(&mut session);
     }
@@ -673,6 +709,20 @@ fn describe_activity(activity: &QueueActivity) -> String {
             format!("failed on item {}: {message}", index + 1)
         }
     }
+}
+
+/// The user-facing switches, for the log. The last selected game is logged where it changes.
+fn describe_settings(config: &AppConfig) -> String {
+    let flag = |value: bool| if value { "on" } else { "off" };
+    format!(
+        "launch with Windows {}, start minimized {}, close to tray {}, restore last game {}, auto-resume {}, preserve queue {}",
+        flag(config.launch_with_windows),
+        flag(config.start_minimized),
+        flag(config.close_to_tray),
+        flag(config.restore_last_selected_game),
+        flag(config.auto_resume),
+        flag(config.preserve_queue)
+    )
 }
 
 fn sync_settings_from_config(panel: &SidePanel, config: &AppConfig) {
