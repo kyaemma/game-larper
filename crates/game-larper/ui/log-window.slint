@@ -105,10 +105,6 @@ export component LogWindow inherits Window {
                 root.close-requested();
                 return accept;
             }
-            if (event.modifiers.control && event.text.to-lowercase() == "c") {
-                root.copy();
-                return accept;
-            }
             reject
         }
 
