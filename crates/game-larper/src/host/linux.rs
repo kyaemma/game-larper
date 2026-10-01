@@ -652,12 +652,17 @@ exec cat >/dev/null";
             .expect("the exit watch did not fire after stop");
         assert!(!host.take_unexpected_exit(second.generation));
         assert!(!second.executable.exists());
+        let lines = scratch.runner_lines();
         assert!(
-            !scratch
-                .runner_lines()
-                .iter()
-                .any(|line| line.contains("SIGTERM") || line.contains("SIGKILL")),
-            "closing the lifeline should have been enough"
+            !lines.iter().any(|line| line.contains("sending SIG")),
+            "closing the lifeline should have been enough: {lines:#?}"
+        );
+        assert!(
+            lines.iter().any(|line| {
+                line.starts_with(&format!("PID={} exited after", second.pid))
+                    && line.ends_with("exit code 0")
+            }),
+            "the requested stop was not a clean exit: {lines:#?}"
         );
     }
 
