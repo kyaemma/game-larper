@@ -31,7 +31,7 @@ Do not treat a green test run as proof that Discord Desktop recognized the game.
 1. Start Discord Desktop with activity sharing / game detection enabled.
 2. Start the Rust build of Game Larper.
 3. Search for ELDEN RING and press Play.
-4. Confirm the log shows a live PID, a path ending in `game\eldenring.exe`, and a non-zero HWND.
+4. Confirm the log (Settings → Logs → View) shows a `[SUCCESS] [runner] Running PID=…` line with a path ending in `game\eldenring.exe` and a non-zero HWND.
 5. Wait for Discord's scan.
 6. Open your profile activity / Registered Games.
 7. Confirm ELDEN RING is the detected game, including the native profile if Discord offers one.

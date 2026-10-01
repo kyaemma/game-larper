@@ -1,4 +1,4 @@
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::rc::Rc;
@@ -8,13 +8,13 @@ use std::time::{Duration, Instant, SystemTime};
 use chrono::{Local, NaiveDate, NaiveTime, TimeZone};
 use game_larper_core::{
     AppConfig, AppPaths, CatalogCache, ConfigStore, DEFAULT_SEARCH_LIMIT, DEFAULT_TRANSITION_GAP,
-    GameDefinition, QueueAction, QueueActivity, QueueMachine, SessionClock, SessionState,
-    format_hms, load_catalog_with_legacy, load_queue, save_queue, unix_time_ms,
+    GameDefinition, QueueAction, QueueActivity, QueueItem, QueueMachine, SessionClock,
+    SessionState, format_hms, load_catalog_with_legacy, load_queue, save_queue, unix_time_ms,
 };
 use slint::{ComponentHandle, Model, ModelRc, SharedString, Timer, TimerMode, VecModel, Weak};
 
 use crate::host::{LaunchReport, RunnerHost};
-use crate::log::{Log, LogLevel};
+use crate::log::{Area, Log, LogChanges, LogCursor, LogEntry, LogLevel, MAX_HISTORY, redact};
 use crate::net;
 use crate::panel::{Dock, Mode};
 use crate::platform;
@@ -37,6 +37,8 @@ struct Models {
     hits: Rc<VecModel<Hit>>,
     rows: Rc<VecModel<QueueRow>>,
     logs: Rc<VecModel<LogRow>>,
+    /// How far `logs` has caught up with the live history.
+    log_cursor: Cell<LogCursor>,
 }
 
 thread_local! {
@@ -92,6 +94,7 @@ enum ToastKind {
 
 struct Session {
     paths: AppPaths,
+    log: Arc<Log>,
     config: AppConfig,
     games: Vec<GameDefinition>,
     loaded: bool,
@@ -122,10 +125,10 @@ struct Session {
 
 pub fn run(
     paths: AppPaths,
-    log: Log,
+    log: Arc<Log>,
     start_minimized_flag: bool,
 ) -> Result<(), slint::PlatformError> {
-    let log = Arc::new(log);
+    log.debug(Area::App, format!("Data folder {}", redact(&paths.root)));
     let ui = MainWindow::new()?;
     let panel = SidePanel::new()?;
     let log_window = LogWindow::new()?;
@@ -140,7 +143,14 @@ pub fn run(
     ui.set_hits(ModelRc::from(hits.clone()));
     panel.set_queue_rows(ModelRc::from(rows.clone()));
     log_window.set_rows(ModelRc::from(logs.clone()));
-    MODELS.with(|slot| *slot.borrow_mut() = Some(Models { hits, rows, logs }));
+    MODELS.with(|slot| {
+        *slot.borrow_mut() = Some(Models {
+            hits,
+            rows,
+            logs,
+            log_cursor: Cell::default(),
+        })
+    });
     panel.set_version_label(env!("CARGO_PKG_VERSION").into());
     sync_settings_from_config(
         &panel,
@@ -200,7 +210,12 @@ pub fn run(
     );
     platform::watch_activation({
         let ui_weak = ui.as_weak();
+        let log = log.clone();
         move || {
+            log.info(
+                Area::App,
+                "A second launch asked this instance to show its window",
+            );
             let ui_weak = ui_weak.clone();
             let _ = slint::invoke_from_event_loop(move || {
                 if let Some(ui) = ui_weak.upgrade() {
@@ -212,13 +227,22 @@ pub fn run(
 
     render(&ui, &panel, &tray, &session);
     render_logs(&log);
-    let minimized = start_minimized_flag
-        || session
-            .lock()
-            .unwrap_or_else(|p| p.into_inner())
-            .config
-            .start_minimized;
-    if !minimized {
+    let start_minimized_setting = session
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .config
+        .start_minimized;
+    let minimized = start_minimized_flag || start_minimized_setting;
+    if minimized {
+        log.info(
+            Area::App,
+            if start_minimized_flag {
+                "Starting minimized to the tray (--minimized)"
+            } else {
+                "Starting minimized to the tray (setting)"
+            },
+        );
+    } else {
         ui.show()?;
         style_main(&ui);
     }
@@ -261,6 +285,7 @@ pub fn run(
                 .config
                 .close_to_tray;
             if close_to_tray {
+                log.debug(Area::App, "Main window closed to the tray");
                 dock.dismiss();
                 if let Some(ui) = ui_weak.upgrade() {
                     let _ = ui.hide();
@@ -278,17 +303,21 @@ pub fn run(
             slint::CloseRequestResponse::KeepWindowShown
         }
     });
+    // The console is created once and only hidden, so reopening shows the same window.
     log_window.window().on_close_requested({
         let log_window = log_window.as_weak();
+        let log = log.clone();
         move || {
             if let Some(log_window) = log_window.upgrade() {
-                let _ = log_window.hide();
+                hide_log_window(&log_window, &log);
             }
             slint::CloseRequestResponse::KeepWindowShown
         }
     });
 
+    log.debug(Area::App, "Event loop running");
     slint::run_event_loop()?;
+    log.info(Area::App, "Event loop ended; releasing the runner");
     if let Ok(mut host) = session
         .lock()
         .unwrap_or_else(|p| p.into_inner())
@@ -297,16 +326,20 @@ pub fn run(
     {
         let _ = host.stop();
     }
-    log.info("Game Larper stopped");
+    log.info(Area::App, "Game Larper stopped");
     Ok(())
 }
 
 /// Config and queue load at once. The catalog is large, so it loads on a worker.
-fn load_session(paths: &AppPaths, log: &Log) -> Session {
+fn load_session(paths: &AppPaths, log: &Arc<Log>) -> Session {
     let (config, warnings) = ConfigStore::new(paths.config()).load();
     for warning in warnings {
-        log.warn(warning);
+        log.warn(Area::Settings, warning);
     }
+    log.debug(
+        Area::Settings,
+        format!("Settings: {}", describe_settings(&config)),
+    );
     let now_ms = unix_time_ms(SystemTime::now());
     let (queue, queue_warnings) = if config.preserve_queue {
         load_queue(&paths.queue(), now_ms, DEFAULT_TRANSITION_GAP).unwrap_or_else(|error| {
@@ -319,10 +352,21 @@ fn load_session(paths: &AppPaths, log: &Log) -> Session {
         (QueueMachine::new(DEFAULT_TRANSITION_GAP), Vec::new())
     };
     for warning in queue_warnings {
-        log.info(warning);
+        log.warn(Area::Queue, warning);
+    }
+    if !queue.items().is_empty() {
+        log.debug(
+            Area::Queue,
+            format!(
+                "Restored {} queued item(s), {}",
+                queue.items().len(),
+                describe_activity(&queue.activity())
+            ),
+        );
     }
     Session {
         paths: paths.clone(),
+        log: log.clone(),
         config,
         games: Vec::new(),
         loaded: false,
@@ -339,7 +383,7 @@ fn load_session(paths: &AppPaths, log: &Log) -> Session {
         active: None,
         clock: SessionClock::new(),
         queue,
-        host: Arc::new(Mutex::new(RunnerHost::new(paths.runtime()))),
+        host: Arc::new(Mutex::new(RunnerHost::new(paths.runtime(), log.clone()))),
         toast: String::new(),
         toast_kind: ToastKind::Info,
         toast_until: None,
@@ -353,18 +397,47 @@ fn load_session(paths: &AppPaths, log: &Log) -> Session {
 
 fn spawn_load(tx: mpsc::Sender<Msg>, paths: AppPaths, log: Arc<Log>, wake: Wake) {
     std::thread::spawn(move || {
+        let started = Instant::now();
         let current = CatalogCache::new(paths.catalog());
         let legacy = CatalogCache::new(paths.legacy_catalog());
+        if current.path().exists() {
+            log.debug(
+                Area::Catalog,
+                format!("Loading cached database {}", redact(current.path())),
+            );
+        } else if legacy.path().exists() {
+            log.info(
+                Area::Catalog,
+                format!(
+                    "No current cache; falling back to the legacy {}",
+                    redact(legacy.path())
+                ),
+            );
+        }
         let (games, warning) = load_catalog_with_legacy(&current, &legacy);
         if let Some(warning) = warning {
-            log.warn(warning);
+            log.warn(Area::Catalog, warning);
         }
-        let games = games
+        let parsed = games.as_ref().map(Vec::len);
+        let games: Vec<GameDefinition> = games
             .unwrap_or_default()
             .into_iter()
             .filter(|game| game.supported_path().is_some())
             .collect();
         let updated = current.last_updated().or_else(|| legacy.last_updated());
+        match parsed {
+            Some(parsed) => log.info(
+                Area::Catalog,
+                format!(
+                    "Loaded {} supported games from {} entries in {} ms ({})",
+                    group_digits(games.len()),
+                    group_digits(parsed),
+                    started.elapsed().as_millis(),
+                    catalog_age(updated)
+                ),
+            ),
+            None => log.info(Area::Catalog, "No cached game database yet"),
+        }
         let _ = tx.send(Msg::Loaded { games, updated });
         wake();
     });
@@ -510,10 +583,15 @@ fn wire(
         let tx = tx.clone();
         let wake = wake.clone();
         move || {
-            let action = session
-                .lock()
-                .ok()
-                .map(|mut session| session.queue.resume(Instant::now()));
+            let action = session.lock().ok().map(|mut session| {
+                let action = session.queue.resume(Instant::now());
+                if let Some(index) = action.launch_index {
+                    session
+                        .log
+                        .info(Area::Queue, format!("Resuming item {}", index + 1));
+                }
+                action
+            });
             if let Some(action) = action {
                 dispatch_queue_action(&session, &log, &tx, &wake, action);
             }
@@ -623,7 +701,10 @@ fn wire(
                 Some(session.paths.clone())
             });
             if let Some(paths) = paths {
+                log.info(Area::Catalog, "Manual refresh requested");
                 spawn_refresh(tx.clone(), paths, log.clone(), wake.clone());
+            } else {
+                log.debug(Area::Catalog, "Refresh ignored: one is already running");
             }
             wake();
         }
@@ -642,6 +723,7 @@ fn wire(
                 .map(|session| session.config.close_to_tray)
                 .unwrap_or(true);
             if close_to_tray {
+                log.debug(Area::App, "Main window closed to the tray");
                 dock.dismiss();
                 if let Some(ui) = ui.upgrade() {
                     let _ = ui.hide();
@@ -680,10 +762,11 @@ fn wire(
                     Ok(count) => {
                         ART.with(|art| art.borrow_mut().clear());
                         session.art_failed.clear();
+                        log.info(Area::Art, format!("Cleared {count} cached images"));
                         toast_ok(&mut session, format!("Cleared {count} cached images."));
                     }
                     Err(error) => {
-                        log.error(&error);
+                        log.error(Area::Art, format!("Artwork cache clear failed: {error}"));
                         toast_err(&mut session, error);
                     }
                 }
@@ -702,9 +785,10 @@ fn wire(
     });
     log_window.on_close_requested({
         let log_window = log_window.as_weak();
+        let log = log.clone();
         move || {
             if let Some(log_window) = log_window.upgrade() {
-                let _ = log_window.hide();
+                hide_log_window(&log_window, &log);
             }
         }
     });
@@ -719,8 +803,17 @@ fn wire(
             }
             if let Ok(mut session) = session.lock() {
                 match platform::copy_text(&text) {
-                    Ok(()) => toast_ok(&mut session, "Logs copied"),
-                    Err(error) => toast_err(&mut session, error),
+                    Ok(()) => {
+                        log.debug(
+                            Area::App,
+                            format!("Copied {} console lines", text.lines().count()),
+                        );
+                        toast_ok(&mut session, "Logs copied");
+                    }
+                    Err(error) => {
+                        log.error(Area::App, format!("Copying the console failed: {error}"));
+                        toast_err(&mut session, error);
+                    }
                 }
             }
             wake();
@@ -735,17 +828,28 @@ fn wire(
     });
     log_window.on_open_folder({
         let session = session.clone();
+        let log = log.clone();
         move || {
-            if let Ok(session) = session.lock() {
-                let _ = platform::open_in_explorer(&session.paths.logs());
+            if let Ok(session) = session.lock()
+                && let Err(error) = platform::open_in_explorer(&session.paths.logs())
+            {
+                log.error(
+                    Area::Files,
+                    format!("Opening the log folder failed: {error}"),
+                );
             }
         }
     });
     panel.on_open_data({
         let session = session.clone();
         move || {
-            if let Ok(session) = session.lock() {
-                let _ = platform::open_in_explorer(&session.paths.root);
+            if let Ok(session) = session.lock()
+                && let Err(error) = platform::open_in_explorer(&session.paths.root)
+            {
+                session.log.error(
+                    Area::Files,
+                    format!("Opening the data folder failed: {error}"),
+                );
             }
         }
     });
@@ -781,10 +885,25 @@ fn wire(
         let wake = wake.clone();
         move |index| {
             if let Ok(mut session) = session.lock() {
-                if let Err(error) = session.queue.remove(index as usize) {
-                    toast_err(&mut session, error.to_string());
-                } else {
-                    persist_queue(&mut session);
+                match session.queue.remove(index as usize) {
+                    Ok(item) => {
+                        session.log.info(
+                            Area::Queue,
+                            format!(
+                                "Removed item {} ({}); {} left",
+                                index + 1,
+                                item.name,
+                                session.queue.items().len()
+                            ),
+                        );
+                        persist_queue(&mut session);
+                    }
+                    Err(error) => {
+                        session
+                            .log
+                            .warn(Area::Queue, format!("Remove refused: {error}"));
+                        toast_err(&mut session, error.to_string());
+                    }
                 }
             }
             wake();
@@ -797,7 +916,11 @@ fn wire(
         let wake = wake.clone();
         move || {
             let action = session.lock().ok().map(|mut session| {
+                let count = session.queue.items().len();
                 let action = session.queue.clear();
+                session
+                    .log
+                    .info(Area::Queue, format!("Cleared {count} item(s)"));
                 persist_queue(&mut session);
                 action
             });
@@ -813,7 +936,7 @@ fn wire(
         let tx = tx.clone();
         let wake = wake.clone();
         move || {
-            queue_command(&session, &log, &tx, &wake, |queue| {
+            queue_command(&session, &log, &tx, &wake, "Queue start", |queue| {
                 queue.start_now(Instant::now())
             });
             wake();
@@ -828,6 +951,11 @@ fn wire(
             let action = session.lock().ok().map(|mut session| {
                 let action = session.queue.pause(Instant::now());
                 if action.stop_runner {
+                    if let QueueActivity::Paused { index } = session.queue.activity() {
+                        session
+                            .log
+                            .info(Area::Queue, format!("Paused on item {}", index + 1));
+                    }
                     session.clock.pause(Instant::now());
                 }
                 action
@@ -845,10 +973,21 @@ fn wire(
         let tx = tx.clone();
         let wake = wake.clone();
         move || {
-            let action = session
-                .lock()
-                .ok()
-                .map(|mut session| session.queue.skip(Instant::now()));
+            let action = session.lock().ok().map(|mut session| {
+                let from = session.queue.active_index();
+                let action = session.queue.skip(Instant::now());
+                if let Some(from) = from {
+                    session.log.info(
+                        Area::Queue,
+                        format!(
+                            "Skipped item {}; now {}",
+                            from + 1,
+                            describe_activity(&session.queue.activity())
+                        ),
+                    );
+                }
+                action
+            });
             if let Some(action) = action {
                 dispatch_queue_action(&session, &log, &tx, &wake, action);
             }
@@ -880,8 +1019,12 @@ fn wire(
         move || {
             if let Ok(mut session) = session.lock() {
                 if let Err(error) = session.queue.disarm() {
+                    session
+                        .log
+                        .warn(Area::Queue, format!("Schedule clear refused: {error}"));
                     toast_err(&mut session, error.to_string());
                 } else {
+                    session.log.info(Area::Queue, "Schedule disarmed");
                     persist_queue(&mut session);
                     toast(&mut session, "Schedule cleared.");
                 }
@@ -1104,16 +1247,28 @@ fn tick(session: &Arc<Mutex<Session>>, log: &Arc<Log>, tx: &mpsc::Sender<Msg>, w
     if !session_guard.restored && session_guard.loaded {
         session_guard.restored = true;
         if session_guard.config.auto_resume && session_guard.selected.is_some() {
+            log.info(
+                Area::Session,
+                "Auto-resume is on; playing the restored selection",
+            );
             drop(session_guard);
             begin_play(session, log, tx, wake);
             return;
         }
     }
+    let before = session_guard.queue.activity();
     let action = {
         let now = Instant::now();
         let unix = unix_time_ms(SystemTime::now());
         session_guard.queue.tick(now, unix)
     };
+    let after = session_guard.queue.activity();
+    if after != before {
+        let queue = &session_guard.queue;
+        for (level, message) in queue_tick_events(&before, &after, queue.items(), queue.gap()) {
+            log.record(level, Area::Queue, &message);
+        }
+    }
     // The dock and the queue panel show artwork too; fetch what they miss.
     let wanted: Vec<GameDefinition> = {
         let session = &*session_guard;
@@ -1160,16 +1315,24 @@ fn apply_message(
     };
     match message {
         Msg::Loaded { games, updated } => {
-            log.info(format!("Catalog loaded: {} supported games", games.len()));
             session.games = games;
             session.loaded = true;
             session.catalog_updated = updated;
-            if session.config.restore_last_selected_game {
-                session.selected = session
-                    .config
-                    .last_selected_discord_application_id
-                    .clone()
-                    .filter(|id| session.games.iter().any(|game| game.id == *id));
+            if session.config.restore_last_selected_game
+                && let Some(id) = session.config.last_selected_discord_application_id.clone()
+            {
+                match session.games.iter().find(|game| game.id == id) {
+                    Some(game) => log.debug(
+                        Area::Session,
+                        format!("Restored selection {id} / {}", game.name),
+                    ),
+                    None => log.warn(
+                        Area::Session,
+                        format!("Last selection {id} is not a supported game; not restored"),
+                    ),
+                }
+                session.selected =
+                    Some(id).filter(|id| session.games.iter().any(|game| game.id == *id));
             }
             let plan = plan_results(&mut session);
             fetch_art(&mut session, &plan.first, tx, wake, true);
@@ -1178,6 +1341,14 @@ fn apply_message(
                 SystemTime::now().duration_since(time).unwrap_or_default() > CATALOG_STALE
             });
             if (stale || session.games.is_empty()) && !session.refreshing {
+                log.info(
+                    Area::Catalog,
+                    if session.games.is_empty() {
+                        "No usable database; downloading it".to_string()
+                    } else {
+                        format!("Database is stale ({}); refreshing", catalog_age(updated))
+                    },
+                );
                 session.refreshing = true;
                 spawn_refresh(tx.clone(), session.paths.clone(), log.clone(), wake.clone());
             }
@@ -1200,15 +1371,26 @@ fn apply_message(
                     session.loaded = true;
                     session.offline = false;
                     session.catalog_updated = Some(SystemTime::now());
-                    log.success(format!("Catalog refreshed: {count} supported games"));
-                    if session
+                    log.success(
+                        Area::Catalog,
+                        format!("Refreshed: {} supported games", group_digits(count)),
+                    );
+                    if let Some(id) = session
                         .selected
-                        .as_ref()
-                        .is_some_and(|id| !session.games.iter().any(|game| &game.id == id))
+                        .clone()
+                        .filter(|id| !session.games.iter().any(|game| &game.id == id))
                     {
+                        log.warn(
+                            Area::Session,
+                            format!("Selected game {id} is no longer supported; cleared"),
+                        );
                         session.selected = None;
                         session.config.last_selected_discord_application_id = None;
-                        let _ = ConfigStore::new(session.paths.config()).save(&session.config);
+                        if let Err(error) =
+                            ConfigStore::new(session.paths.config()).save(&session.config)
+                        {
+                            log.error(Area::Settings, format!("Config save failed: {error}"));
+                        }
                     }
                     session.art_failed.clear();
                     let plan = plan_results(&mut session);
@@ -1222,7 +1404,20 @@ fn apply_message(
                     }
                 }
                 Err(error) => {
-                    log.error(format!("Metadata refresh failed: {error}"));
+                    if session.games.is_empty() {
+                        log.error(
+                            Area::Catalog,
+                            format!("Refresh failed and no database is available: {error}"),
+                        );
+                    } else {
+                        log.warn(
+                            Area::Catalog,
+                            format!(
+                                "Refresh failed; offline with the cached {} games: {error}",
+                                group_digits(session.games.len())
+                            ),
+                        );
+                    }
                     session.offline = !session.games.is_empty();
                     toast_err(
                         &mut session,
@@ -1233,7 +1428,17 @@ fn apply_message(
         }
         Msg::Art { id, path } => {
             session.art_inflight.remove(&id);
-            match path.and_then(|path| slint::Image::load_from_path(&path).ok()) {
+            let image = path.and_then(|path| {
+                slint::Image::load_from_path(&path)
+                    .inspect_err(|error| {
+                        log.warn(
+                            Area::Art,
+                            format!("Could not load {}: {error}", redact(&path)),
+                        );
+                    })
+                    .ok()
+            });
+            match image {
                 Some(image) => ART.with(|art| {
                     art.borrow_mut().insert(id.clone(), image);
                 }),
@@ -1250,20 +1455,24 @@ fn apply_message(
             match result {
                 Ok(report) => {
                     session.clock.play(Instant::now());
-                    log.success(format!(
-                        "Runner diagnostic: PID={}, path={}, basename={}, workingDirectory={}, alive=true, HWND=0x{:X}, title={}, integrity={}",
-                        report.pid,
-                        report.executable.display(),
-                        report.basename,
-                        report.working_directory.display(),
-                        report.hwnd,
-                        report.title,
-                        report.integrity
-                    ));
+                    log.success(
+                        Area::Runner,
+                        format!(
+                            "Running PID={} HWND=0x{:X} title=\"{}\" integrity={} basename={} path={} cwd={} (generation {})",
+                            report.pid,
+                            report.hwnd,
+                            report.title,
+                            report.integrity,
+                            report.basename,
+                            redact(&report.executable),
+                            redact(&report.working_directory),
+                            report.generation
+                        ),
+                    );
                     watch_exit(report.generation, report.waiter, tx.clone());
                 }
                 Err(error) => {
-                    log.error(format!("Launch failed: {error}"));
+                    // The cause is logged where the launch failed; this is what it means here.
                     session.clock.stop();
                     if matches!(
                         session.queue.activity(),
@@ -1278,6 +1487,10 @@ fn apply_message(
                             QueueActivity::Transition { next_index } => next_index,
                             _ => 0,
                         };
+                        log.error(
+                            Area::Queue,
+                            format!("Item {} failed to launch; queue stopped", index + 1),
+                        );
                         session.queue.fail(index, error.clone());
                     }
                     toast_err(&mut session, error);
@@ -1287,10 +1500,10 @@ fn apply_message(
         Msg::Stopped(result) => {
             session.busy = false;
             if let Err(error) = result {
-                log.error(format!("Stop failed: {error}"));
                 toast_err(&mut session, error);
             }
             if session.quitting {
+                log.info(Area::App, "Shutting down");
                 let _ = slint::quit_event_loop();
             }
         }
@@ -1301,13 +1514,17 @@ fn apply_message(
                 .map(|mut host| host.take_unexpected_exit(generation))
                 .unwrap_or(false);
             if unexpected {
-                log.warn(format!(
-                    "Runner exited unexpectedly (generation {generation})"
-                ));
                 session.clock.unexpected_exit();
                 if let QueueActivity::Running { index } | QueueActivity::Paused { index } =
                     session.queue.activity()
                 {
+                    log.error(
+                        Area::Queue,
+                        format!(
+                            "Item {} failed: the runner exited; queue stopped",
+                            index + 1
+                        ),
+                    );
                     session.queue.fail(index, "The runner exited.");
                 }
                 session.busy = false;
@@ -1352,6 +1569,94 @@ mod tests {
         assert_eq!(model.iter().collect::<Vec<_>>(), vec![1, 5, 3]);
         sync_model(&model, vec![4]);
         assert_eq!(model.iter().collect::<Vec<_>>(), vec![4]);
+    }
+
+    fn queue_items() -> Vec<QueueItem> {
+        ["ELDEN RING", "Hades"]
+            .into_iter()
+            .enumerate()
+            .map(|(index, name)| QueueItem {
+                id: index as u64 + 1,
+                application_id: format!("{}", 100 + index),
+                name: name.into(),
+                duration: Duration::from_secs(30 * 60),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn queue_ticks_log_completion_gap_and_finish() {
+        let items = queue_items();
+        let gap = Duration::from_secs(2);
+
+        let to_gap = queue_tick_events(
+            &QueueActivity::Running { index: 0 },
+            &QueueActivity::Transition { next_index: 1 },
+            &items,
+            gap,
+        );
+        assert_eq!(
+            to_gap,
+            vec![
+                (
+                    LogLevel::Info,
+                    "Item 1 (ELDEN RING) completed its 30 min".to_string()
+                ),
+                (LogLevel::Debug, "Waiting 2000 ms before item 2".to_string()),
+            ]
+        );
+
+        let finished = queue_tick_events(
+            &QueueActivity::Running { index: 1 },
+            &QueueActivity::Idle,
+            &items,
+            gap,
+        );
+        assert_eq!(finished.len(), 2);
+        assert_eq!(
+            finished[1],
+            (
+                LogLevel::Success,
+                "Queue finished all 2 item(s)".to_string()
+            )
+        );
+
+        // The launch itself is logged when the runner is dispatched, not here.
+        let started = queue_tick_events(
+            &QueueActivity::Transition { next_index: 1 },
+            &QueueActivity::Running { index: 1 },
+            &items,
+            gap,
+        );
+        assert!(started.is_empty());
+    }
+
+    #[test]
+    fn scheduled_starts_are_logged_when_they_fire() {
+        let events = queue_tick_events(
+            &QueueActivity::Scheduled { at_unix_ms: 0 },
+            &QueueActivity::Running { index: 0 },
+            &queue_items(),
+            Duration::from_secs(2),
+        );
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].0, LogLevel::Info);
+        assert!(events[0].1.starts_with("Scheduled start ("));
+    }
+
+    #[test]
+    fn queue_activity_descriptions_count_from_one() {
+        assert_eq!(
+            describe_activity(&QueueActivity::Transition { next_index: 0 }),
+            "switching to item 1"
+        );
+        assert_eq!(
+            describe_activity(&QueueActivity::Failed {
+                index: 1,
+                message: "The runner exited.".into()
+            }),
+            "failed on item 2: The runner exited."
+        );
     }
 
     #[test]

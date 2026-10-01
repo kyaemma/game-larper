@@ -1,7 +1,8 @@
 use std::fs::{self, File};
 use std::io::{self, Read};
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::sync::Arc;
+use std::time::{Duration, Instant};
 
 use game_larper_core::{Error as CoreError, resolve_executable};
 use windows_sys::Win32::Foundation::{CloseHandle, FALSE, HANDLE, HWND};
@@ -19,6 +20,7 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     PostMessageW, WM_CLOSE,
 };
 
+use crate::log::{Area, Log, redact};
 use crate::platform::{self, integrity_of};
 
 const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
@@ -26,6 +28,18 @@ const FILE_ATTRIBUTE_REPARSE_POINT: u32 = 0x400;
 pub struct Staged {
     pub path: PathBuf,
     pub created: bool,
+    /// The usual path held a different file, so this copy lives in a private session folder.
+    pub isolated: bool,
+}
+
+/// What `cleanup_staged` did with a staged runner copy.
+#[derive(Debug)]
+pub enum Cleanup {
+    Removed,
+    /// An identical copy was already there before launch, so it is left for the next one.
+    Kept,
+    Refused(&'static str),
+    Failed(io::Error),
 }
 
 pub struct LaunchReport {
@@ -41,6 +55,7 @@ pub struct LaunchReport {
 }
 
 struct Running {
+    pid: u32,
     process: isize,
     hwnd: isize,
     icon: isize,
@@ -50,6 +65,7 @@ struct Running {
 
 pub struct RunnerHost {
     runtime: PathBuf,
+    log: Arc<Log>,
     job: isize,
     current: Option<Running>,
     next_generation: u64,
@@ -57,10 +73,21 @@ pub struct RunnerHost {
 }
 
 impl RunnerHost {
-    pub fn new(runtime: PathBuf) -> Self {
+    pub fn new(runtime: PathBuf, log: Arc<Log>) -> Self {
+        let job = create_kill_on_close_job();
+        if job == 0 {
+            log.warn(
+                Area::Runner,
+                format!(
+                    "Kill-on-close job unavailable ({}); runners may outlive Game Larper",
+                    io::Error::last_os_error()
+                ),
+            );
+        }
         Self {
             runtime,
-            job: create_kill_on_close_job(),
+            log,
+            job,
             current: None,
             next_generation: 1,
             stopping: false,
@@ -74,15 +101,41 @@ impl RunnerHost {
         remote_name: &str,
         icon: Option<&Path>,
     ) -> Result<LaunchReport, String> {
-        if self.current.is_some() {
+        if let Some(running) = &self.current {
+            self.log.info(
+                Area::Runner,
+                format!("Replacing the running runner PID={} first", running.pid),
+            );
             self.stop()?;
         }
-        let staged = stage_runner(template, &self.runtime, application_id, remote_name)
-            .map_err(|error| error.to_string())?;
-        match self.spawn_staged(staged, icon) {
-            Ok(report) => Ok(report),
-            Err(error) => Err(error),
+        let staged = stage_runner(template, &self.runtime, application_id, remote_name).map_err(
+            |error| {
+                self.log.error(
+                    Area::Runner,
+                    format!("Staging {remote_name} for {application_id} failed: {error}"),
+                );
+                error.to_string()
+            },
+        )?;
+        if staged.isolated {
+            self.log.warn(
+                Area::Runner,
+                "A different file already uses the usual runtime path; staging in a private session folder",
+            );
         }
+        self.log.info(
+            Area::Runner,
+            format!(
+                "Staged {} ({})",
+                redact(&staged.path),
+                if staged.created {
+                    "new copy"
+                } else {
+                    "identical copy already present"
+                }
+            ),
+        );
+        self.spawn_staged(staged, icon)
     }
 
     fn spawn_staged(
@@ -96,9 +149,13 @@ impl RunnerHost {
             .ok_or_else(|| "The runner path has no directory.".to_string())?;
         let mut command = wide(&format!("\"{}\"", staged.path.display()));
         if command.iter().filter(|unit| **unit == b'"' as u16).count() != 2 {
-            cleanup_staged(&self.runtime, &staged);
-            return Err("The runtime path cannot be quoted safely.".into());
+            self.cleanup(&staged);
+            return self.fail("The runtime path cannot be quoted safely.".into());
         }
+        self.log.debug(
+            Area::Runner,
+            format!("CreateProcess in {}", redact(directory)),
+        );
         let directory_wide = wide_path(directory);
         let mut startup: STARTUPINFOW = unsafe { std::mem::zeroed() };
         startup.cb = std::mem::size_of::<STARTUPINFOW>() as u32;
@@ -119,28 +176,53 @@ impl RunnerHost {
         };
         if created == 0 {
             let error = io::Error::last_os_error();
-            cleanup_staged(&self.runtime, &staged);
-            return Err(format!("The runner did not start: {error}"));
+            self.cleanup(&staged);
+            return self.fail(format!("The runner did not start: {error}"));
         }
+        self.log.debug(
+            Area::Runner,
+            format!("Process created PID={}", info.dwProcessId),
+        );
         unsafe {
             CloseHandle(info.hThread);
         }
-        if self.job != 0 {
-            unsafe {
-                AssignProcessToJobObject(self.job as HANDLE, info.hProcess);
-            }
+        if self.job != 0
+            && unsafe { AssignProcessToJobObject(self.job as HANDLE, info.hProcess) } == 0
+        {
+            self.log.warn(
+                Area::Runner,
+                format!(
+                    "PID={} could not join the kill-on-close job: {}",
+                    info.dwProcessId,
+                    io::Error::last_os_error()
+                ),
+            );
         }
+        let waited = Instant::now();
         let idle = unsafe { WaitForInputIdle(info.hProcess, 1500) };
         let hwnd = find_owned_window(info.dwProcessId, Duration::from_millis(1500));
         let alive = process_alive(info.hProcess);
+        self.log.debug(
+            Area::Runner,
+            format!(
+                "Window search took {} ms: HWND=0x{hwnd:X} alive={alive} input-idle={}",
+                waited.elapsed().as_millis(),
+                if idle == 0 { "ready" } else { "timed out" }
+            ),
+        );
         if !alive || hwnd == 0 {
+            let exit = exit_code(info.hProcess);
             unsafe {
                 TerminateProcess(info.hProcess, 1);
                 WaitForSingleObject(info.hProcess, 2000);
                 CloseHandle(info.hProcess);
             }
-            cleanup_staged(&self.runtime, &staged);
-            return Err("The native runner did not create its game window.".into());
+            self.cleanup(&staged);
+            return self.fail(if alive {
+                "The native runner did not create its game window.".into()
+            } else {
+                format!("The native runner exited during startup (exit code {exit}).")
+            });
         }
         let waiter = match duplicate_handle(info.hProcess) {
             Ok(waiter) => waiter,
@@ -150,8 +232,8 @@ impl RunnerHost {
                     WaitForSingleObject(info.hProcess, 2000);
                     CloseHandle(info.hProcess);
                 }
-                cleanup_staged(&self.runtime, &staged);
-                return Err(error);
+                self.cleanup(&staged);
+                return self.fail(error);
             }
         };
         let generation = self.next_generation;
@@ -172,11 +254,19 @@ impl RunnerHost {
             integrity: integrity_of(info.hProcess),
             waiter: waiter as isize,
         };
-        let _ = idle;
         let icon_handle = icon
             .and_then(|path| platform::apply_window_icon(hwnd, path))
             .unwrap_or(0);
+        self.log.debug(
+            Area::Runner,
+            match (icon, icon_handle) {
+                (None, _) => "No artwork for the window icon".to_string(),
+                (Some(_), 0) => "Window icon could not be applied".to_string(),
+                (Some(path), _) => format!("Window icon from {}", redact(path)),
+            },
+        );
         self.current = Some(Running {
+            pid: info.dwProcessId,
             process: info.hProcess as isize,
             hwnd,
             icon: icon_handle,
@@ -193,31 +283,68 @@ impl RunnerHost {
         };
         self.stopping = true;
         let process = running.process as HANDLE;
+        self.log.info(
+            Area::Runner,
+            format!(
+                "Stopping PID={} HWND=0x{:X} (generation {})",
+                running.pid, running.hwnd, running.generation
+            ),
+        );
+        let started = Instant::now();
         if running.hwnd != 0 {
-            unsafe {
-                PostMessageW(running.hwnd as HWND, WM_CLOSE, 0, 0);
+            if unsafe { PostMessageW(running.hwnd as HWND, WM_CLOSE, 0, 0) } == 0 {
+                self.log.warn(
+                    Area::Runner,
+                    format!(
+                        "WM_CLOSE could not be posted: {}",
+                        io::Error::last_os_error()
+                    ),
+                );
             }
             unsafe {
                 WaitForSingleObject(process, 2000);
             }
         }
         if process_alive(process) {
+            self.log.warn(
+                Area::Runner,
+                format!(
+                    "PID={} still running {} ms after WM_CLOSE; terminating it",
+                    running.pid,
+                    started.elapsed().as_millis()
+                ),
+            );
             unsafe {
                 TerminateProcess(process, 0);
                 WaitForSingleObject(process, 5000);
             }
+        } else {
+            self.log.debug(
+                Area::Runner,
+                format!(
+                    "PID={} closed gracefully in {} ms",
+                    running.pid,
+                    started.elapsed().as_millis()
+                ),
+            );
         }
         let exited = !process_alive(process);
         unsafe {
             CloseHandle(process);
         }
         platform::destroy_icon(running.icon);
-        cleanup_staged(&self.runtime, &running.staged);
+        self.cleanup(&running.staged);
         self.stopping = false;
         if !exited {
+            self.log.error(
+                Area::Runner,
+                format!("PID={} is still running after termination", running.pid),
+            );
             self.current = Some(running);
             return Err("The owned runner did not exit.".into());
         }
+        self.log
+            .info(Area::Runner, format!("PID={} stopped", running.pid));
         Ok(())
     }
 
@@ -233,12 +360,46 @@ impl RunnerHost {
             self.current = Some(running);
             return false;
         }
+        self.log.warn(
+            Area::Runner,
+            format!(
+                "PID={} exited on its own with code {} (generation {generation})",
+                running.pid,
+                exit_code(running.process as HANDLE)
+            ),
+        );
         unsafe {
             CloseHandle(running.process as HANDLE);
         }
         platform::destroy_icon(running.icon);
-        cleanup_staged(&self.runtime, &running.staged);
+        self.cleanup(&running.staged);
         true
+    }
+
+    fn cleanup(&self, staged: &Staged) {
+        match cleanup_staged(&self.runtime, staged) {
+            Cleanup::Removed => self.log.debug(
+                Area::Runner,
+                format!("Removed staged copy {}", redact(&staged.path)),
+            ),
+            Cleanup::Kept => self.log.debug(
+                Area::Runner,
+                format!("Kept pre-existing staged copy {}", redact(&staged.path)),
+            ),
+            Cleanup::Refused(reason) => self.log.warn(
+                Area::Runner,
+                format!("Left {} in place: {reason}", redact(&staged.path)),
+            ),
+            Cleanup::Failed(error) => self.log.warn(
+                Area::Files,
+                format!("Could not remove {}: {error}", redact(&staged.path)),
+            ),
+        }
+    }
+
+    fn fail<T>(&self, message: String) -> Result<T, String> {
+        self.log.error(Area::Runner, &message);
+        Err(message)
     }
 }
 
@@ -263,11 +424,16 @@ pub fn stage_runner(
     if let Some(staged) = place_file(template, runtime_root, &destination).map_err(CoreError::Io)? {
         return Ok(staged);
     }
+    // A different file holds the usual path (another build, or a real game). Leave it alone.
     let session = format!("session-{:08x}{:04x}", std::process::id(), millis_low());
     let nested = format!("{session}/{remote_name}");
     let destination = resolve_executable(runtime_root, application_id, &nested)?;
     place_file(template, runtime_root, &destination)
         .map_err(CoreError::Io)?
+        .map(|staged| Staged {
+            isolated: true,
+            ..staged
+        })
         .ok_or(CoreError::UnsafePath(
             "Could not isolate a runtime session.",
         ))
@@ -286,6 +452,7 @@ fn place_file(
             return Ok(Some(Staged {
                 path: destination.to_path_buf(),
                 created: false,
+                isolated: false,
             }));
         }
         return Ok(None);
@@ -297,6 +464,7 @@ fn place_file(
     Ok(Some(Staged {
         path: destination.to_path_buf(),
         created: true,
+        isolated: false,
     }))
 }
 
@@ -340,23 +508,25 @@ fn is_under(path: &Path, root: &Path) -> bool {
         || path.starts_with(&(root.to_string() + "/"))
 }
 
-pub fn cleanup_staged(runtime_root: &Path, staged: &Staged) {
+pub fn cleanup_staged(runtime_root: &Path, staged: &Staged) -> Cleanup {
     if !staged.created {
-        return;
+        return Cleanup::Kept;
     }
     let Ok(root) = std::path::absolute(runtime_root) else {
-        return;
+        return Cleanup::Refused("the runtime folder could not be resolved");
     };
     let Ok(file) = std::path::absolute(&staged.path) else {
-        return;
+        return Cleanup::Refused("the staged path could not be resolved");
     };
     if !file.starts_with(&root) {
-        return;
+        return Cleanup::Refused("it is outside the runtime folder");
     }
     if chain_has_reparse(&root, &file) {
-        return;
+        return Cleanup::Refused("its folder chain contains a link");
     }
-    let _ = fs::remove_file(&file);
+    if let Err(error) = fs::remove_file(&file) {
+        return Cleanup::Failed(error);
+    }
     let mut directory = file.parent().map(Path::to_path_buf);
     while let Some(current) = directory {
         if !current.starts_with(&root) || current == root {
@@ -376,6 +546,7 @@ pub fn cleanup_staged(runtime_root: &Path, staged: &Staged) {
         }
         directory = current.parent().map(Path::to_path_buf);
     }
+    Cleanup::Removed
 }
 
 fn chain_has_reparse(root: &Path, file: &Path) -> bool {
@@ -480,6 +651,15 @@ fn process_alive(process: HANDLE) -> bool {
     read != 0 && code == 259
 }
 
+/// The exit code as text, for diagnostics. 259 means the process is still running.
+fn exit_code(process: HANDLE) -> String {
+    let mut code = 0u32;
+    if unsafe { GetExitCodeProcess(process, &mut code) } == 0 {
+        return "unknown".into();
+    }
+    format!("{code} (0x{code:X})")
+}
+
 fn duplicate_handle(process: HANDLE) -> Result<HANDLE, String> {
     use windows_sys::Win32::Foundation::{DUPLICATE_SAME_ACCESS, DuplicateHandle};
     use windows_sys::Win32::System::Threading::GetCurrentProcess;
@@ -549,7 +729,7 @@ fn millis_low() -> u16 {
 
 #[cfg(test)]
 mod tests {
-    use super::{Staged, cleanup_staged, stage_runner};
+    use super::{Cleanup, Staged, cleanup_staged, stage_runner};
     use std::fs;
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -576,6 +756,7 @@ mod tests {
             )
         );
         assert!(first.created);
+        assert!(!first.isolated);
         let second = stage_runner(&template, &runtime, "10", "game/eldenring.exe").unwrap();
         assert_eq!(second.path, first.path);
         assert!(!second.created);
@@ -583,14 +764,18 @@ mod tests {
         let third = stage_runner(&template, &runtime, "10", "game/eldenring.exe").unwrap();
         assert_ne!(third.path, first.path);
         assert!(third.created);
+        assert!(third.isolated);
         assert_eq!(fs::read(&first.path).unwrap(), b"runner-a");
-        cleanup_staged(&runtime, &third);
+        assert!(matches!(cleanup_staged(&runtime, &second), Cleanup::Kept));
+        assert!(first.path.exists());
+        assert!(matches!(cleanup_staged(&runtime, &third), Cleanup::Removed));
         assert!(!third.path.exists());
         cleanup_staged(
             &runtime,
             &Staged {
                 path: first.path.clone(),
                 created: true,
+                isolated: false,
             },
         );
         assert!(!first.path.exists());

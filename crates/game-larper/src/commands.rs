@@ -1,6 +1,6 @@
 fn begin_play(
     session: &Arc<Mutex<Session>>,
-    _log: &Log,
+    log: &Arc<Log>,
     tx: &mpsc::Sender<Msg>,
     wake: &Arc<dyn Fn() + Send + Sync>,
 ) {
@@ -8,6 +8,7 @@ fn begin_play(
         return;
     };
     if guard.busy {
+        log.debug(Area::Session, "Play ignored: a launch or stop is in progress");
         return;
     }
     if matches!(
@@ -16,28 +17,38 @@ fn begin_play(
             | QueueActivity::Paused { .. }
             | QueueActivity::Transition { .. }
     ) {
+        log.debug(Area::Session, "Play ignored: the queue owns the runner");
         toast(&mut guard, "Stop the queue before playing one game.");
         return;
     }
     let Some(id) = guard.selected.clone() else {
+        log.debug(Area::Session, "Play ignored: no game selected");
         toast(&mut guard, "Select a game first.");
         return;
     };
     let Some(game) = guard.games.iter().find(|game| game.id == id).cloned() else {
+        log.warn(
+            Area::Session,
+            format!("Play refused: application {id} is not a supported game in the catalog"),
+        );
         toast_err(&mut guard, "That game is no longer supported.");
         return;
     };
+    log.info(
+        Area::Session,
+        format!("Play requested: {} ({})", game.name, game.id),
+    );
     guard.busy = true;
     guard.active = Some(game.id.clone());
     let host = guard.host.clone();
     let images = guard.paths.images();
     drop(guard);
-    spawn_launch(host, images, game, tx.clone(), wake.clone());
+    spawn_launch(host, images, game, log.clone(), tx.clone(), wake.clone());
 }
 
 fn begin_pause(
     session: &Arc<Mutex<Session>>,
-    log: &Log,
+    log: &Arc<Log>,
     tx: &mpsc::Sender<Msg>,
     wake: &Arc<dyn Fn() + Send + Sync>,
 ) {
@@ -50,10 +61,12 @@ fn begin_pause(
             QueueActivity::Running { .. } | QueueActivity::Transition { .. }
         );
         if queued {
+            log.info(Area::Queue, "Pause requested from the transport controls");
             let action = guard.queue.pause(Instant::now());
             guard.clock.pause(Instant::now());
             Some(action)
         } else if guard.clock.state() == SessionState::Playing {
+            log.info(Area::Session, "Pause requested");
             guard.clock.pause(Instant::now());
             Some(QueueAction {
                 stop_runner: true,
@@ -70,12 +83,19 @@ fn begin_pause(
 
 fn begin_stop(
     session: &Arc<Mutex<Session>>,
-    log: &Log,
+    log: &Arc<Log>,
     tx: &mpsc::Sender<Msg>,
     wake: &Arc<dyn Fn() + Send + Sync>,
     clear_manual: bool,
 ) {
     let action = session.lock().ok().map(|mut guard| {
+        let queue_active = guard.queue.active_index().is_some();
+        if clear_manual {
+            log.info(Area::Session, "Stop requested");
+        }
+        if queue_active {
+            log.info(Area::Queue, "Queue stopped");
+        }
         let mut action = guard.queue.stop();
         guard.clock.stop();
         // The queue only reports its own runner. A manual session owns one too.
@@ -89,7 +109,7 @@ fn begin_stop(
 
 fn begin_quit(
     session: &Arc<Mutex<Session>>,
-    log: &Log,
+    log: &Arc<Log>,
     tx: &mpsc::Sender<Msg>,
     wake: &Arc<dyn Fn() + Send + Sync>,
 ) {
@@ -97,7 +117,7 @@ fn begin_quit(
         guard.quitting = true;
         guard.queue.stop();
         guard.clock.stop();
-        log.info("Quit requested");
+        log.info(Area::App, "Quit requested");
     }
     dispatch_queue_action(
         session,
@@ -132,7 +152,7 @@ fn should_stop_clock_for_dispatch(
 
 fn dispatch_queue_action(
     session: &Arc<Mutex<Session>>,
-    _log: &Log,
+    log: &Arc<Log>,
     tx: &mpsc::Sender<Msg>,
     wake: &Arc<dyn Fn() + Send + Sync>,
     action: QueueAction,
@@ -140,6 +160,18 @@ fn dispatch_queue_action(
     let Ok(mut guard) = session.lock() else {
         return;
     };
+    if action.stop_runner || action.launch_index.is_some() {
+        log.debug(
+            Area::Session,
+            format!(
+                "Runner action: stop={} launch={}",
+                action.stop_runner,
+                action
+                    .launch_index
+                    .map_or("none".to_string(), |index| format!("item {}", index + 1))
+            ),
+        );
+    }
     let activity = guard.queue.activity();
     if should_stop_clock_for_dispatch(&activity, guard.clock.state(), &action) {
         guard.clock.stop();
@@ -156,9 +188,20 @@ fn dispatch_queue_action(
             .cloned();
         guard.selected = Some(item.application_id.clone());
         guard.active = Some(item.application_id.clone());
-        guard.config.last_selected_discord_application_id = Some(item.application_id);
-        let _ = ConfigStore::new(guard.paths.config()).save(&guard.config);
+        guard.config.last_selected_discord_application_id = Some(item.application_id.clone());
+        if let Err(error) = ConfigStore::new(guard.paths.config()).save(&guard.config) {
+            log.error(Area::Settings, format!("Config save failed: {error}"));
+        }
         game.or_else(|| {
+            log.warn(
+                Area::Queue,
+                format!(
+                    "Item {} ({}, {}) is not a supported game in the current catalog",
+                    index + 1,
+                    item.name,
+                    item.application_id
+                ),
+            );
             toast_err(
                 &mut guard,
                 format!("{} is not in the current catalog.", item.name),
@@ -169,6 +212,18 @@ fn dispatch_queue_action(
     if action.launch_index.is_some() && launch.is_none() {
         guard.busy = false;
         return;
+    }
+    if let (Some(index), Some(game)) = (action.launch_index, launch.as_ref()) {
+        log.info(
+            Area::Queue,
+            format!(
+                "Starting item {} of {}: {} ({})",
+                index + 1,
+                guard.queue.items().len(),
+                game.name,
+                game.id
+            ),
+        );
     }
     if action.stop_runner || launch.is_some() {
         guard.busy = true;
@@ -181,6 +236,7 @@ fn dispatch_queue_action(
     }
     let tx = tx.clone();
     let wake = wake.clone();
+    let log = log.clone();
     std::thread::spawn(move || {
         let stop_result = if action.stop_runner {
             host.lock().unwrap_or_else(|p| p.into_inner()).stop()
@@ -193,7 +249,7 @@ fn dispatch_queue_action(
             return;
         }
         if let Some(game) = launch {
-            spawn_launch_blocking(host, images, game, tx, wake);
+            spawn_launch_blocking(host, images, game, log, tx, wake);
         } else {
             let _ = tx.send(Msg::Stopped(Ok(())));
             wake();
@@ -205,16 +261,18 @@ fn spawn_launch(
     host: Arc<Mutex<RunnerHost>>,
     images: PathBuf,
     game: GameDefinition,
+    log: Arc<Log>,
     tx: mpsc::Sender<Msg>,
     wake: Arc<dyn Fn() + Send + Sync>,
 ) {
-    std::thread::spawn(move || spawn_launch_blocking(host, images, game, tx, wake));
+    std::thread::spawn(move || spawn_launch_blocking(host, images, game, log, tx, wake));
 }
 
 fn spawn_launch_blocking(
     host: Arc<Mutex<RunnerHost>>,
     images: PathBuf,
     game: GameDefinition,
+    log: Arc<Log>,
     tx: mpsc::Sender<Msg>,
     wake: Arc<dyn Fn() + Send + Sync>,
 ) {
@@ -224,13 +282,40 @@ fn spawn_launch_blocking(
         .map(|path| path.to_string_lossy().replace('\\', "/"));
     let result = match (template, relative) {
         (Ok(template), Some(relative)) => {
-            let icon = net::ensure_artwork(&images, &game);
+            log.info(
+                Area::Runner,
+                format!(
+                    "Launching {} for application {} as {relative}",
+                    game.name, game.id
+                ),
+            );
+            log.debug(
+                Area::Runner,
+                format!(
+                    "Template {}; {} Windows executable rule(s) in the catalog",
+                    redact(&template),
+                    game.executables.len()
+                ),
+            );
+            let icon = net::ensure_artwork(&images, &game, &log);
             host.lock()
                 .unwrap_or_else(|poison| poison.into_inner())
                 .launch(&template, &game.id, &relative, icon.as_deref())
         }
-        (Err(error), _) => Err(error),
-        (_, None) => Err("This game has no safe Windows executable.".into()),
+        (Err(error), _) => {
+            log.error(Area::Runner, format!("Cannot launch {}: {error}", game.name));
+            Err(error)
+        }
+        (_, None) => {
+            log.error(
+                Area::Runner,
+                format!(
+                    "Cannot launch {} ({}): no safe Windows executable rule",
+                    game.name, game.id
+                ),
+            );
+            Err("This game has no safe Windows executable.".into())
+        }
     };
     let _ = tx.send(Msg::Launch(result));
     wake();
@@ -259,10 +344,17 @@ fn spawn_refresh(
 ) {
     std::thread::spawn(move || {
         let cache = CatalogCache::new(paths.catalog());
-        let result = net::refresh_catalog(&cache);
-        if let Err(error) = &result {
-            log.error(format!("Metadata refresh failed: {error}"));
-        }
+        let started = Instant::now();
+        log.info(Area::Catalog, "Refreshing the game database from Discord");
+        let result = net::refresh_catalog(&cache, &log);
+        log.debug(
+            Area::Catalog,
+            format!(
+                "Refresh {} after {} ms",
+                if result.is_ok() { "finished" } else { "failed" },
+                started.elapsed().as_millis()
+            ),
+        );
         let _ = tx.send(Msg::Catalog(result));
         wake();
     });
@@ -270,7 +362,7 @@ fn spawn_refresh(
 
 fn select_index(
     session: &Arc<Mutex<Session>>,
-    log: &Log,
+    log: &Arc<Log>,
     tx: &mpsc::Sender<Msg>,
     wake: &Wake,
     index: usize,
@@ -292,10 +384,12 @@ fn select_index(
     }
     session.selected = Some(game.id.clone());
     session.config.last_selected_discord_application_id = Some(game.id.clone());
+    log.debug(
+        Area::Session,
+        format!("Selected {} / {}", game.id, game.name),
+    );
     if let Err(error) = ConfigStore::new(session.paths.config()).save(&session.config) {
-        log.error(format!("Config save failed: {error}"));
-    } else {
-        log.info(format!("Selected game: {} {}", game.id, game.name));
+        log.error(Area::Settings, format!("Config save failed: {error}"));
     }
     fetch_art(&mut session, std::slice::from_ref(&game), tx, wake, true);
 }
@@ -309,10 +403,15 @@ fn add_selected_to_queue(session: &Arc<Mutex<Session>>, panel: &Weak<SidePanel>)
         return;
     };
     if !(1..=24 * 60).contains(&minutes) {
+        session.log.debug(
+            Area::Queue,
+            format!("Add refused: {minutes} is not a 1-1440 minute duration"),
+        );
         toast_err(&mut session, "Duration must be between 1 and 1440 minutes.");
         return;
     }
     let Some(id) = session.selected.clone() else {
+        session.log.debug(Area::Queue, "Add ignored: no game selected");
         toast(&mut session, "Select a game first.");
         return;
     };
@@ -326,18 +425,38 @@ fn add_selected_to_queue(session: &Arc<Mutex<Session>>, panel: &Weak<SidePanel>)
         .add(&application_id, &name, Duration::from_secs(minutes * 60))
     {
         Ok(_) => {
+            session.log.info(
+                Area::Queue,
+                format!(
+                    "Added {name} ({application_id}) for {minutes} min; {} item(s) queued",
+                    session.queue.items().len()
+                ),
+            );
             persist_queue(&mut session);
             toast_ok(&mut session, format!("Queued {name} for {minutes} min."));
         }
-        Err(error) => toast_err(&mut session, error.to_string()),
+        Err(error) => {
+            session.log.warn(
+                Area::Queue,
+                format!("Adding {name} ({application_id}) refused: {error}"),
+            );
+            toast_err(&mut session, error.to_string());
+        }
     }
 }
 
 fn move_queue(session: &Arc<Mutex<Session>>, from: usize, to: usize) {
     if let Ok(mut session) = session.lock() {
         if let Err(error) = session.queue.move_item(from, to) {
+            session
+                .log
+                .warn(Area::Queue, format!("Reorder refused: {error}"));
             toast_err(&mut session, error.to_string());
         } else {
+            session.log.debug(
+                Area::Queue,
+                format!("Moved item {} to position {}", from + 1, to + 1),
+            );
             persist_queue(&mut session);
         }
     }
@@ -364,12 +483,31 @@ fn arm_schedule(session: &Arc<Mutex<Session>>, panel: &Weak<SidePanel>) {
     match parsed {
         Ok(at) => match session.queue.arm(at, unix_time_ms(SystemTime::now())) {
             Ok(()) => {
+                session.log.info(
+                    Area::Queue,
+                    format!(
+                        "Schedule armed for {} ({} item(s))",
+                        format_unix(at),
+                        session.queue.items().len()
+                    ),
+                );
                 persist_queue(&mut session);
                 toast_ok(&mut session, "Queue armed.");
             }
-            Err(error) => toast_err(&mut session, error.to_string()),
+            Err(error) => {
+                session
+                    .log
+                    .warn(Area::Queue, format!("Schedule refused: {error}"));
+                toast_err(&mut session, error.to_string());
+            }
         },
-        Err(error) => toast_err(&mut session, error),
+        Err(error) => {
+            session.log.debug(
+                Area::Queue,
+                format!("Schedule input {date:?} {time:?} rejected: {error}"),
+            );
+            toast_err(&mut session, error);
+        }
     }
 }
 
@@ -395,26 +533,62 @@ fn save_settings(session: &Arc<Mutex<Session>>, panel: &Weak<SidePanel>, log: &L
             .last_selected_discord_application_id
             .clone(),
     };
-    if let Ok(executable) = executable
-        && let Err(error) = platform::set_run_at_startup(
+    match executable {
+        Ok(executable) => match platform::set_run_at_startup(
             next.launch_with_windows,
             next.start_minimized,
             &executable,
-        )
-    {
-        log.info(format!("Startup registry error: {error}"));
-        toast_err(&mut session, error);
-        return false;
+        ) {
+            Ok(()) => log.debug(
+                Area::Settings,
+                if next.launch_with_windows {
+                    format!(
+                        "Startup entry registered for {}{}",
+                        redact(&executable),
+                        if next.start_minimized {
+                            " --minimized"
+                        } else {
+                            ""
+                        }
+                    )
+                } else {
+                    "No startup entry (launch with Windows is off)".to_string()
+                },
+            ),
+            Err(error) => {
+                log.error(
+                    Area::Settings,
+                    format!("Startup registration failed: {error}"),
+                );
+                toast_err(&mut session, error);
+                return false;
+            }
+        },
+        Err(error) => log.warn(
+            Area::Settings,
+            format!("Startup entry left unchanged; executable path unknown: {error}"),
+        ),
     }
     if !next.preserve_queue {
-        let _ = std::fs::remove_file(session.paths.queue());
+        match std::fs::remove_file(session.paths.queue()) {
+            Ok(()) => log.debug(Area::Queue, "Saved queue removed (preserve queue is off)"),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => log.warn(
+                Area::Files,
+                format!("Could not remove the saved queue: {error}"),
+            ),
+        }
     }
     session.config = next;
     if let Err(error) = ConfigStore::new(session.paths.config()).save(&session.config) {
-        log.info(format!("Config save failed: {error}"));
+        log.error(Area::Settings, format!("Config save failed: {error}"));
         toast_err(&mut session, "Settings could not be saved.");
         return false;
     }
+    log.info(
+        Area::Settings,
+        format!("Saved: {}", describe_settings(&session.config)),
+    );
     if session.config.preserve_queue {
         persist_queue(&mut session);
     }
@@ -424,24 +598,37 @@ fn save_settings(session: &Arc<Mutex<Session>>, panel: &Weak<SidePanel>, log: &L
 }
 
 fn persist_queue(session: &mut Session) {
-    if session.config.preserve_queue {
-        let _ = save_queue(&session.paths.queue(), &session.queue);
+    if session.config.preserve_queue
+        && let Err(error) = save_queue(&session.paths.queue(), &session.queue)
+    {
+        session
+            .log
+            .error(Area::Files, format!("Queue save failed: {error}"));
     }
 }
 
+/// Run a queue command named `label` (for the log) and apply what it asks of the runner.
 fn queue_command(
     session: &Arc<Mutex<Session>>,
-    log: &Log,
+    log: &Arc<Log>,
     tx: &mpsc::Sender<Msg>,
     wake: &Arc<dyn Fn() + Send + Sync>,
+    label: &str,
     command: impl FnOnce(&mut QueueMachine) -> Result<QueueAction, game_larper_core::Error>,
 ) {
     let action = session
         .lock()
         .ok()
         .and_then(|mut guard| match command(&mut guard.queue) {
-            Ok(action) => Some(action),
+            Ok(action) => {
+                log.info(
+                    Area::Queue,
+                    format!("{label}: {} item(s)", guard.queue.items().len()),
+                );
+                Some(action)
+            }
             Err(error) => {
+                log.warn(Area::Queue, format!("{label} refused: {error}"));
                 toast_err(&mut guard, error.to_string());
                 None
             }
@@ -449,6 +636,93 @@ fn queue_command(
     if let Some(action) = action {
         dispatch_queue_action(session, log, tx, wake, action);
     }
+}
+
+/// Log lines for a queue state change made by the clock, oldest first.
+///
+/// Commands log themselves; this covers what happens on its own: a schedule firing, an item
+/// running out its time, the gap between items, and the queue finishing.
+fn queue_tick_events(
+    before: &QueueActivity,
+    after: &QueueActivity,
+    items: &[QueueItem],
+    gap: Duration,
+) -> Vec<(LogLevel, String)> {
+    let mut events = Vec::new();
+    match before {
+        QueueActivity::Scheduled { at_unix_ms } => events.push((
+            LogLevel::Info,
+            format!("Scheduled start ({}) reached", format_unix(*at_unix_ms)),
+        )),
+        QueueActivity::Running { index } => {
+            let item = items.get(*index);
+            events.push((
+                LogLevel::Info,
+                format!(
+                    "Item {} ({}) completed its {}",
+                    index + 1,
+                    item.map_or("unknown", |item| item.name.as_str()),
+                    item.map_or_else(|| "time".to_string(), |item| format_minutes(item.duration))
+                ),
+            ));
+        }
+        _ => {}
+    }
+    match after {
+        QueueActivity::Transition { next_index } => events.push((
+            LogLevel::Debug,
+            format!(
+                "Waiting {} ms before item {}",
+                gap.as_millis(),
+                next_index + 1
+            ),
+        )),
+        QueueActivity::Idle if matches!(before, QueueActivity::Running { .. }) => events.push((
+            LogLevel::Success,
+            format!("Queue finished all {} item(s)", items.len()),
+        )),
+        QueueActivity::Running { .. } => {}
+        other => events.push((
+            LogLevel::Debug,
+            format!("Queue is now {}", describe_activity(other)),
+        )),
+    }
+    events
+}
+
+/// A queue state for the log, with 1-based item numbers.
+fn describe_activity(activity: &QueueActivity) -> String {
+    match activity {
+        QueueActivity::Idle => "idle".into(),
+        QueueActivity::Scheduled { at_unix_ms } => {
+            format!("scheduled for {}", format_unix(*at_unix_ms))
+        }
+        QueueActivity::Missed { at_unix_ms } => {
+            format!("waiting after a missed start ({})", format_unix(*at_unix_ms))
+        }
+        QueueActivity::Running { index } => format!("running item {}", index + 1),
+        QueueActivity::Paused { index } => format!("paused on item {}", index + 1),
+        QueueActivity::Transition { next_index } => {
+            format!("switching to item {}", next_index + 1)
+        }
+        QueueActivity::Failed { index, message } => {
+            format!("failed on item {}: {message}", index + 1)
+        }
+    }
+}
+
+/// The user-facing switches, for the log. The last selected game is logged where it changes.
+fn describe_settings(config: &AppConfig) -> String {
+    let flag = |value: bool| if value { "on" } else { "off" };
+    format!(
+        "launch with Windows {}, start minimized {}, close to tray {}, restore last game {}, auto-resume {}, preserve queue {}",
+        flag(config.launch_with_windows),
+        flag(config.start_minimized),
+        flag(config.close_to_tray),
+        flag(config.restore_last_selected_game),
+        flag(config.auto_resume),
+        flag(config.preserve_queue)
+    )
 }
 
 fn sync_settings_from_config(panel: &SidePanel, config: &AppConfig) {
@@ -569,10 +843,19 @@ fn fetch_art(
     for game in &todo {
         session.art_inflight.insert(game.id.clone());
     }
+    session.log.debug(
+        Area::Art,
+        format!(
+            "Fetching artwork for {} game(s){}",
+            todo.len(),
+            if parallel { " in parallel" } else { "" }
+        ),
+    );
     let images = session.paths.images();
+    let log = session.log.clone();
     let run = move |games: Vec<GameDefinition>, tx: mpsc::Sender<Msg>, wake: Wake| {
         for game in games {
-            let path = net::ensure_artwork(&images, &game);
+            let path = net::ensure_artwork(&images, &game, &log);
             let _ = tx.send(Msg::Art { id: game.id, path });
             wake();
         }
@@ -595,38 +878,76 @@ fn cached_art(id: &str) -> slint::Image {
     ART.with(|art| art.borrow().get(id).cloned().unwrap_or_default())
 }
 
+/// Bring the console model up to date with the live history. Only new lines are added, so an
+/// idle console costs nothing per tick and a busy one does not rebuild a thousand rows.
 fn render_logs(log: &Log) {
-    let rows = log
-        .history()
-        .into_iter()
-        .map(|entry| {
-            let tone = match entry.level {
-                LogLevel::Info => Tone::Accent,
-                LogLevel::Success => Tone::Success,
-                LogLevel::Warn => Tone::Warning,
-                LogLevel::Error => Tone::Danger,
-            };
-            LogRow {
-                time: entry.time.into(),
-                level: entry.level.label().into(),
-                message: entry.message.into(),
-                tone: tone.into(),
-            }
-        })
-        .collect();
     MODELS.with(|models| {
-        if let Some(models) = models.borrow().as_ref() {
-            sync_model(&models.logs, rows);
+        let models = models.borrow();
+        let Some(models) = models.as_ref() else {
+            return;
+        };
+        let mut cursor = models.log_cursor.get();
+        match log.changes_since(&mut cursor) {
+            LogChanges::None => {}
+            LogChanges::Reset(entries) => {
+                models
+                    .logs
+                    .set_vec(entries.into_iter().map(log_row).collect::<Vec<_>>());
+            }
+            LogChanges::Append(entries) => {
+                for entry in entries {
+                    models.logs.push(log_row(entry));
+                }
+                let excess = models.logs.row_count().saturating_sub(MAX_HISTORY);
+                for _ in 0..excess {
+                    models.logs.remove(0);
+                }
+            }
         }
+        models.log_cursor.set(cursor);
     });
 }
 
+fn log_row(entry: LogEntry) -> LogRow {
+    let tone = match entry.level {
+        LogLevel::Debug => Tone::Debug,
+        LogLevel::Info => Tone::Accent,
+        LogLevel::Success => Tone::Success,
+        LogLevel::Warn => Tone::Warning,
+        LogLevel::Error => Tone::Danger,
+    };
+    LogRow {
+        time: entry.time.into(),
+        level: entry.level.label().into(),
+        area: entry.area.label().into(),
+        message: entry.message.into(),
+        tone: tone.into(),
+        quiet: entry.level == LogLevel::Debug,
+    }
+}
+
 fn show_log_window(window: &LogWindow, log: &Log) {
+    let reopening = window.window().is_visible();
     render_logs(log);
-    if window.show().is_ok()
-        && let Some(hwnd) = platform::hwnd_of(window.window())
-    {
-        platform::style_frame(hwnd);
+    match window.show() {
+        Ok(()) => {
+            if !reopening {
+                log.debug(Area::App, "Log console opened");
+            }
+            if let Some(hwnd) = platform::hwnd_of(window.window()) {
+                platform::style_frame(hwnd);
+            }
+        }
+        Err(error) => log.error(Area::App, format!("Log console failed to open: {error}")),
+    }
+}
+
+fn hide_log_window(window: &LogWindow, log: &Log) {
+    if window.window().is_visible() {
+        log.debug(Area::App, "Log console closed");
+    }
+    if let Err(error) = window.hide() {
+        log.error(Area::App, format!("Log console failed to close: {error}"));
     }
 }
 
@@ -720,7 +1041,7 @@ fn reselect_paused(session: &mut Session, log: &Log) {
     session.selected = Some(active.clone());
     session.config.last_selected_discord_application_id = Some(active);
     if let Err(error) = ConfigStore::new(session.paths.config()).save(&session.config) {
-        log.info(format!("Config save failed: {error}"));
+        log.error(Area::Settings, format!("Config save failed: {error}"));
     }
 }
 
@@ -929,6 +1250,17 @@ fn database_detail(session: &Session) -> String {
     }
 }
 
+/// "updated 3 h ago" style age of the cached database, for the log.
+fn catalog_age(updated: Option<SystemTime>) -> String {
+    match updated.and_then(|time| SystemTime::now().duration_since(time).ok()) {
+        Some(age) => format!(
+            "updated {} ago",
+            format_minutes(Duration::from_secs(age.as_secs() / 60 * 60))
+        ),
+        None => "age unknown".into(),
+    }
+}
+
 fn group_digits(value: usize) -> String {
     let digits = value.to_string();
     let mut grouped = String::with_capacity(digits.len() + digits.len() / 3);
@@ -986,6 +1318,7 @@ fn show_main(ui: &MainWindow) {
 
 #[derive(Clone, Copy)]
 enum Tone {
+    Debug,
     Accent,
     Success,
     Warning,
@@ -996,6 +1329,7 @@ enum Tone {
 impl From<Tone> for slint::Color {
     fn from(value: Tone) -> Self {
         match value {
+            Tone::Debug => slint::Color::from_rgb_u8(0x7E, 0x7A, 0x96),
             Tone::Accent => slint::Color::from_rgb_u8(0xA4, 0x9E, 0xF8),
             Tone::Success => slint::Color::from_rgb_u8(0x69, 0xDA, 0xA5),
             Tone::Warning => slint::Color::from_rgb_u8(0xF5, 0xBE, 0x66),

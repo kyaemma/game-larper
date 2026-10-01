@@ -1,4 +1,8 @@
 // Detached live log console. It intentionally behaves like a normal utility window.
+//
+// Sizing flows one way only: the window gives the list its size, and each row derives its
+// height from that width. Rows never set their own width and the list never reports its
+// content size back to the window, so no layout constraint depends on its own result.
 
 import { Theme, Icons } from "theme.slint";
 import { Button, CaptionButton, Hairline } from "controls.slint";
@@ -35,40 +39,49 @@ component LogTitleBar inherits Rectangle {
 
 component LogLine inherits Rectangle {
     in property <LogRow> entry;
-
-    min-height: 28px;
-    background: transparent;
+    // Shared column widths, measured once by the window from the widest labels.
+    in property <length> level-width;
+    in property <length> area-width;
 
     HorizontalLayout {
         padding-left: 12px;
         padding-right: 12px;
-        padding-top: 5px;
-        padding-bottom: 5px;
-        spacing: 12px;
+        padding-top: 3px;
+        padding-bottom: 3px;
+        spacing: 10px;
 
         Text {
             text: root.entry.time;
             color: Theme.text-3;
             font-size: Theme.text-s;
-            font-family: "Consolas";
-            min-width: 66px;
+            font-family: Theme.mono;
             vertical-alignment: top;
         }
         Text {
             text: root.entry.level;
             color: root.entry.tone;
             font-size: Theme.text-s;
-            font-family: "Consolas";
+            font-family: Theme.mono;
             font-weight: 700;
-            min-width: 64px;
+            min-width: root.level-width;
+            vertical-alignment: top;
+        }
+        Text {
+            text: root.entry.area;
+            color: Theme.text-3;
+            font-size: Theme.text-s;
+            font-family: Theme.mono;
+            min-width: root.area-width;
             vertical-alignment: top;
         }
         Text {
             text: root.entry.message;
-            color: Theme.text-2;
+            color: root.entry.quiet ? Theme.text-3 : Theme.text-2;
             font-size: Theme.text-s;
-            font-family: "Consolas";
+            font-family: Theme.mono;
             wrap: word-wrap;
+            // Long paths wrap anywhere instead of widening the window to their longest word.
+            min-width: 0px;
             horizontal-stretch: 1;
             vertical-alignment: top;
         }
@@ -94,7 +107,25 @@ export component LogWindow inherits Window {
     callback clear();
     callback open-folder();
 
+    // Keep the newest line in view until the user scrolls away from the bottom.
+    property <bool> follow: true;
+
     forward-focus: keys;
+
+    // Measure the level and area columns; never shown. "settings" is the widest area label.
+    level-probe := Text {
+        text: "SUCCESS";
+        font-size: Theme.text-s;
+        font-family: Theme.mono;
+        font-weight: 700;
+        visible: false;
+    }
+    area-probe := Text {
+        text: "settings";
+        font-size: Theme.text-s;
+        font-family: Theme.mono;
+        visible: false;
+    }
 
     keys := FocusScope {
         capture-key-pressed(event) => {
@@ -111,28 +142,76 @@ export component LogWindow inherits Window {
             }
             Hairline { }
 
-            if root.rows.length == 0: Rectangle {
+            Rectangle {
                 vertical-stretch: 1;
-                Text {
+
+                // Explicit placement keeps the list's content size out of the window's
+                // constraints; otherwise a short log would cap how tall the window can grow.
+                flick := Flickable {
+                    x: 0;
+                    y: 0;
+                    width: parent.width;
+                    height: parent.height;
+                    content-width: self.width;
+                    content-height: lines.preferred-height;
+                    flicked => {
+                        root.follow = self.content-y <= self.height - self.content-height + 2px;
+                    }
+                    changed content-height => {
+                        if (root.follow) {
+                            self.content-y = min(0px, self.height - self.content-height);
+                        }
+                    }
+                    changed height => {
+                        if (root.follow) {
+                            self.content-y = min(0px, self.height - self.content-height);
+                        }
+                    }
+
+                    lines := VerticalLayout {
+                        padding-top: 4px;
+                        padding-bottom: 4px;
+                        for entry in root.rows: LogLine {
+                            entry: entry;
+                            level-width: level-probe.preferred-width;
+                            area-width: area-probe.preferred-width;
+                        }
+                    }
+                }
+
+                if flick.content-height > flick.height: Rectangle {
+                    property <length> track: flick.height;
+                    property <float> ratio: flick.height / flick.content-height;
+                    x: parent.width - self.width - 1px;
+                    width: thumb-touch.has-hover || thumb-touch.pressed ? 6px : 4px;
+                    height: max(28px, self.track * self.ratio);
+                    y: (-flick.content-y) / (flick.content-height - flick.height) * (self.track - self.height);
+                    border-radius: self.width / 2;
+                    background: thumb-touch.pressed ? #FFFFFF40 : thumb-touch.has-hover ? #FFFFFF2E : #FFFFFF1C;
+                    animate width, background { duration: Theme.quick; }
+                    thumb-touch := TouchArea {
+                        property <length> start;
+                        pointer-event(event) => {
+                            if (event.kind == PointerEventKind.down) {
+                                self.start = flick.content-y;
+                            }
+                        }
+                        moved => {
+                            if (self.pressed) {
+                                flick.content-y = max(flick.height - flick.content-height, min(0px,
+                                    self.start - (self.mouse-y - self.pressed-y) * flick.content-height / flick.height));
+                                root.follow = flick.content-y <= flick.height - flick.content-height + 2px;
+                            }
+                        }
+                    }
+                }
+
+                if root.rows.length == 0: Text {
                     text: "No live logs yet.";
                     color: Theme.text-3;
                     font-size: Theme.text-m;
                     horizontal-alignment: center;
                     vertical-alignment: center;
-                }
-            }
-
-            if root.rows.length > 0: Flickable {
-                vertical-stretch: 1;
-                content-height: lines.preferred-height;
-
-                lines := VerticalLayout {
-                    width: parent.width;
-                    spacing: 0px;
-                    for entry in root.rows: LogLine {
-                        entry: entry;
-                        width: parent.width;
-                    }
                 }
             }
 
@@ -166,7 +245,10 @@ export component LogWindow inherits Window {
                         kind: "ghost";
                         height: 30px;
                         enabled: root.rows.length > 0;
-                        clicked => { root.clear(); }
+                        clicked => {
+                            root.follow = true;
+                            root.clear();
+                        }
                     }
                 }
                 VerticalLayout {

@@ -28,7 +28,7 @@ Sometimes. Discord's detector is undocumented and it moves. The useful manual te
 
 Pause should make the activity go away. Resume should bring it back. Quit should leave no extra process behind.
 
-If nothing shows up, the log in `%LOCALAPPDATA%\GameLarper\logs` has the process id, the fake path, and the window handle. The checklist lives in [docs/DETECTION.md](docs/DETECTION.md).
+If nothing shows up, the log has the process id, the fake path, and the window handle. Settings → Logs → View shows it live (Copy grabs it for a bug report); the daily files are in `%LOCALAPPDATA%\GameLarper\logs`, with your profile folder written as `%LOCALAPPDATA%` / `%USERPROFILE%`. The checklist lives in [docs/DETECTION.md](docs/DETECTION.md).
 
 ## a queue, because of course
 
