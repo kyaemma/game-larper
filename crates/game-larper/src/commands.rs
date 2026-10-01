@@ -601,7 +601,6 @@ fn render_logs(log: &Log) {
         .into_iter()
         .map(|entry| {
             let tone = match entry.level {
-                LogLevel::Debug => Tone::Muted,
                 LogLevel::Info => Tone::Accent,
                 LogLevel::Success => Tone::Success,
                 LogLevel::Warn => Tone::Warning,
