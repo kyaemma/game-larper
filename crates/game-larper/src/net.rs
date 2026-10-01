@@ -1,18 +1,37 @@
-use std::fs;
-use std::io::Read;
+use std::fs::{self, File};
+use std::io::{BufReader, Cursor, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
+use std::sync::LazyLock;
+use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{Duration, Instant};
 
 use game_larper_core::{
     CatalogCache, DETECTABLE_ENDPOINTS, Error as CoreError, GameDefinition, MAX_CATALOG_BYTES,
     USER_AGENT,
 };
-use image::ImageReader;
+use image::{ImageFormat, ImageReader};
 
 use crate::log::{Area, Log, redact};
 
 const MAX_IMAGE_BYTES: usize = 1_000_000;
 const MAX_IMAGE_EDGE: u32 = 1024;
+/// A complete PNG ends with an IEND chunk. Looking for it in the last bytes catches a file cut
+/// short without decoding any pixels.
+const PNG_END_WINDOW: u64 = 64;
+/// One reveal fetches its first rows in parallel plus a background worker, all to the same
+/// two CDNs. Keeping that many idle connections per host lets the next search reuse them
+/// instead of repeating TLS handshakes (ureq keeps only one per host by default).
+const ARTWORK_IDLE_PER_HOST: usize = 12;
+
+/// The agent for every artwork download. An `Agent` is a cheap handle onto a shared connection
+/// pool and TLS configuration and is safe to use from any thread, so the parallel workers
+/// share it instead of each building their own.
+static ARTWORK_AGENT: LazyLock<ureq::Agent> = LazyLock::new(|| {
+    ureq::AgentBuilder::new()
+        .timeout(Duration::from_secs(12))
+        .max_idle_connections_per_host(ARTWORK_IDLE_PER_HOST)
+        .build()
+});
 
 pub fn refresh_catalog(cache: &CatalogCache, log: &Log) -> Result<Vec<GameDefinition>, String> {
     let agent = ureq::AgentBuilder::new()
@@ -167,9 +186,6 @@ impl ArtRequest {
 ///
 /// Disk cache hits stay silent; downloads and failures are logged once per game.
 pub fn ensure_artwork(directory: &Path, game: &ArtRequest, log: &Log) -> Option<PathBuf> {
-    let agent = ureq::AgentBuilder::new()
-        .timeout(Duration::from_secs(12))
-        .build();
     let candidates = game.candidates();
     for (file_name, url) in &candidates {
         let path = directory.join(file_name);
@@ -177,7 +193,7 @@ pub fn ensure_artwork(directory: &Path, game: &ArtRequest, log: &Log) -> Option<
             return Some(path);
         }
         let source = file_name.split('-').next().unwrap_or("artwork");
-        let bytes = match download_limited(&agent, url) {
+        let bytes = match download_limited(&ARTWORK_AGENT, url) {
             Ok(bytes) => bytes,
             Err(error) => {
                 log.debug(
@@ -205,8 +221,9 @@ pub fn ensure_artwork(directory: &Path, game: &ArtRequest, log: &Log) -> Option<
             );
             return None;
         }
-        match fs::write(&path, &bytes) {
-            Ok(()) if cached_image_ok(&path) => {
+        // The bytes were just validated, so a clean write is all the cache needs.
+        match write_cache_file(&path, &bytes) {
+            Ok(()) => {
                 log.debug(
                     Area::Art,
                     format!(
@@ -217,10 +234,6 @@ pub fn ensure_artwork(directory: &Path, game: &ArtRequest, log: &Log) -> Option<
                 );
                 return Some(path);
             }
-            Ok(()) => log.warn(
-                Area::Files,
-                format!("{} did not read back as an image", redact(&path)),
-            ),
             Err(error) => log.warn(
                 Area::Files,
                 format!("Writing {} failed: {error}", redact(&path)),
@@ -258,30 +271,67 @@ fn download_limited(agent: &ureq::Agent, url: &str) -> Result<Vec<u8>, String> {
     Ok(buffer)
 }
 
+/// A cached file is usable when it is a complete, bounded PNG or JPEG. Only the header and the
+/// end of the file are read; the pixels are decoded once, when the UI loads the picture.
 fn cached_image_ok(path: &Path) -> bool {
-    let Ok(metadata) = fs::metadata(path) else {
+    let Ok(file) = File::open(path) else {
         return false;
     };
-    if !metadata.is_file() || metadata.len() == 0 || metadata.len() > MAX_IMAGE_BYTES as u64 {
-        return false;
-    }
-    let Ok(bytes) = fs::read(path) else {
+    let Ok(metadata) = file.metadata() else {
         return false;
     };
-    image_bytes_ok(&bytes)
+    metadata.is_file() && image_ok(file, metadata.len())
 }
 
 fn image_bytes_ok(bytes: &[u8]) -> bool {
-    let Ok(reader) = ImageReader::new(std::io::Cursor::new(bytes)).with_guessed_format() else {
+    image_ok(Cursor::new(bytes), bytes.len() as u64)
+}
+
+/// Format, dimensions and completeness checks that never decode pixel data.
+fn image_ok<R: Read + Seek>(mut source: R, len: u64) -> bool {
+    if len == 0 || len > MAX_IMAGE_BYTES as u64 {
+        return false;
+    }
+    let Ok(reader) = ImageReader::new(BufReader::new(&mut source)).with_guessed_format() else {
         return false;
     };
-    let Ok(decoded) = reader.decode() else {
+    let format = reader.format();
+    if !matches!(format, Some(ImageFormat::Png | ImageFormat::Jpeg)) {
+        return false;
+    }
+    let Ok((width, height)) = reader.into_dimensions() else {
         return false;
     };
-    decoded.width() > 0
-        && decoded.height() > 0
-        && decoded.width() <= MAX_IMAGE_EDGE
-        && decoded.height() <= MAX_IMAGE_EDGE
+    if width == 0 || height == 0 || width > MAX_IMAGE_EDGE || height > MAX_IMAGE_EDGE {
+        return false;
+    }
+    format != Some(ImageFormat::Png) || png_is_complete(&mut source, len)
+}
+
+fn png_is_complete<R: Read + Seek>(source: &mut R, len: u64) -> bool {
+    let window = len.min(PNG_END_WINDOW);
+    let mut tail = vec![0; window as usize];
+    source.seek(SeekFrom::Start(len - window)).is_ok()
+        && source.read_exact(&mut tail).is_ok()
+        && tail.windows(4).any(|chunk| chunk == b"IEND")
+}
+
+/// Write through a temporary file so a crash, or a reader on another thread, never sees a
+/// partly written image under its final name.
+fn write_cache_file(path: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    static SEQUENCE: AtomicU32 = AtomicU32::new(0);
+    let mut name = path.file_name().unwrap_or_default().to_os_string();
+    name.push(format!(
+        ".{}.{}.tmp",
+        std::process::id(),
+        SEQUENCE.fetch_add(1, Ordering::Relaxed)
+    ));
+    let temporary = path.with_file_name(name);
+    let result = fs::write(&temporary, bytes).and_then(|()| fs::rename(&temporary, path));
+    if result.is_err() {
+        let _ = fs::remove_file(&temporary);
+    }
+    result
 }
 
 pub fn clear_artwork(directory: &Path) -> Result<usize, String> {
@@ -325,6 +375,84 @@ mod tests {
         game.icon_hash = icon_hash.map(str::to_string);
         game.steam_app_id = steam_app_id.map(str::to_string);
         game
+    }
+
+    fn encoded(width: u32, height: u32, format: ImageFormat) -> Vec<u8> {
+        let mut bytes = Cursor::new(Vec::new());
+        image::DynamicImage::ImageRgb8(image::RgbImage::new(width, height))
+            .write_to(&mut bytes, format)
+            .unwrap();
+        bytes.into_inner()
+    }
+
+    #[test]
+    fn complete_bounded_pngs_and_jpegs_are_accepted() {
+        assert!(image_bytes_ok(&encoded(8, 8, ImageFormat::Png)));
+        assert!(image_bytes_ok(&encoded(128, 128, ImageFormat::Png)));
+        assert!(image_bytes_ok(&encoded(231, 87, ImageFormat::Jpeg)));
+        assert!(image_bytes_ok(&encoded(
+            MAX_IMAGE_EDGE,
+            1,
+            ImageFormat::Png
+        )));
+    }
+
+    #[test]
+    fn oversized_empty_corrupt_and_foreign_images_are_rejected() {
+        let png = encoded(8, 8, ImageFormat::Png);
+        assert!(!image_bytes_ok(&[]));
+        assert!(!image_bytes_ok(b"not an image at all"));
+        assert!(!image_bytes_ok(&encoded(
+            MAX_IMAGE_EDGE + 1,
+            1,
+            ImageFormat::Png
+        )));
+        assert!(!image_bytes_ok(&encoded(
+            1,
+            MAX_IMAGE_EDGE + 1,
+            ImageFormat::Jpeg
+        )));
+        assert!(!image_bytes_ok(b"GIF89a     ;"));
+        assert!(!image_ok(Cursor::new(&png), MAX_IMAGE_BYTES as u64 + 1));
+        // A PNG cut short loses its IEND chunk even though its header still reads.
+        assert!(!image_bytes_ok(&png[..png.len() - 16]));
+        assert!(!image_bytes_ok(&png[..png.len() / 2]));
+        // Only the header is read, so a damaged JPEG body is the UI loader's to reject.
+        assert!(!image_bytes_ok(&encoded(8, 8, ImageFormat::Jpeg)[..4]));
+    }
+
+    #[test]
+    fn cached_files_are_validated_in_place() {
+        let directory =
+            std::env::temp_dir().join(format!("game-larper-net-{}", std::process::id()));
+        fs::create_dir_all(&directory).unwrap();
+        let good = directory.join("good.png");
+        let cut = directory.join("cut.png");
+        let png = encoded(16, 16, ImageFormat::Png);
+        fs::write(&good, &png).unwrap();
+        fs::write(&cut, &png[..png.len() - 20]).unwrap();
+        assert!(cached_image_ok(&good));
+        assert!(!cached_image_ok(&cut));
+        assert!(!cached_image_ok(&directory.join("missing.png")));
+        assert!(!cached_image_ok(&directory));
+        fs::remove_dir_all(&directory).unwrap();
+    }
+
+    #[test]
+    fn cache_writes_replace_atomically_and_leave_no_temporary_files() {
+        let directory =
+            std::env::temp_dir().join(format!("game-larper-write-{}", std::process::id()));
+        fs::create_dir_all(&directory).unwrap();
+        let target = directory.join("art.png");
+        write_cache_file(&target, b"first").unwrap();
+        write_cache_file(&target, b"second").unwrap();
+        assert_eq!(fs::read(&target).unwrap(), b"second");
+        let names: Vec<_> = fs::read_dir(&directory)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect();
+        assert_eq!(names, ["art.png"]);
+        fs::remove_dir_all(&directory).unwrap();
     }
 
     #[test]
