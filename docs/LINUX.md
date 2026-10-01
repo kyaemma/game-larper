@@ -1,22 +1,25 @@
-# Linux (experimental)
+# Linux
 
-Linux support is experimental until Discord detection has been verified by hand. The code builds,
-passes lint, and its process and X11 mechanics are tested automatically on Linux CI. Whether Discord
-on Linux shows the game has **not** been checked yet, in any environment.
+Linux support is now merged into `main`. The code builds, passes lint, and its process and X11
+mechanics are tested automatically on Linux CI. A Linux contributor has also completed a successful
+end-to-end manual test with Discord detection. The exact behavior of every Linux display/session and
+Discord packaging combination is still not fully characterized.
 
 ## Status
 
 | Environment | Status | Why |
 | --- | --- | --- |
 | Windows, native Discord | **Verified** by hand (ELDEN RING) | See [DETECTION.md](DETECTION.md). |
-| Native Discord + X11 | Unverified; mechanics validated automatically | Process identity and the X11 window are tested in CI under Xvfb. Discord's reaction is unknown. First manual target. |
-| Native Discord + XWayland (Wayland session) | Unverified | Same runner path as X11 through XWayland. Not separately tested: XWayland is a different X server, and how Discord itself runs there decides what it can see. |
-| Native Discord + pure Wayland (no `DISPLAY`) | Unverified | No window is created (Wayland clients cannot enumerate other clients' windows). Only process identity is left, which may or may not be enough. |
-| Discord Flatpak | Unverified; expected not to work | The Flatpak sandbox runs Discord in its own PID namespace, so host processes are not visible in its `/proc`. Not tested. No workaround is attempted. |
+| Native Discord on Linux (contributor test setup) | **Verified end-to-end** | Manual testing reported that the current implementation works and Discord detects the spoofed game. |
+| Native Discord + X11 | Mechanics validated automatically; backend-specific manual status not recorded here | Process identity and the X11 window are tested in CI under Xvfb. |
+| Native Discord + XWayland (Wayland session) | Not separately characterized | Same runner path as X11 through XWayland. XWayland is a different X server, and how Discord itself runs there decides what it can see. |
+| Native Discord + pure Wayland (no `DISPLAY`) | Not separately characterized | No window is created. Only process identity is left, which may or may not be enough on every Discord build. |
+| Discord Flatpak | Unverified; expected not to work | The Flatpak sandbox runs Discord in its own PID namespace, so host processes are not visible in its `/proc`. No workaround is attempted. |
 
 What the automated Linux CI job proves: the workspace compiles, passes `clippy -D warnings`, and the
 tests pass. The tests cover the runner's `/proc` identity, its lifeline and `SIGTERM` exits, its X11
-window under Xvfb, and the host's launch, stop and cleanup. It does not prove anything about Discord.
+window under Xvfb, and the host's launch, stop and cleanup. Discord detection itself is established by
+manual testing, not by CI.
 
 ## How it works
 
@@ -138,9 +141,9 @@ panic, say) shows up as a warning.
 - **Fonts:** the UI asks for Segoe UI Variable and Consolas, which Linux usually lacks; fontconfig
   falls back to other fonts. Cosmetic.
 - **No window icon** is applied to the Linux runner (no known detection role).
-- **No Linux release artifact.** Build from source. A future artifact should contain
-  `GameLarper` and `GameLarper.Runner` (the host also finds `game-larper-runner`) side by side, and
-  should only ship after the manual test below passes.
+- **No Linux release artifact.** Build from source for now. A future artifact should contain the
+  host and runner side by side; the current source build produces `game-larper` and
+  `game-larper-runner`.
 
 ## Manual test (Ubuntu VM, native Discord)
 
@@ -148,13 +151,14 @@ Prepare:
 
 1. Ubuntu Desktop 24.04 VM. Log in once with "Ubuntu on Xorg" (X11) and once with the default
    Wayland session (XWayland).
-2. Build the integration branch:
+2. Build the current `main` branch:
 
    ```bash
    sudo apt-get install --yes build-essential pkg-config libfontconfig1-dev
    git clone https://github.com/kyaemma/game-larper.git
    cd game-larper
-   git checkout integrate/linux-support
+   git checkout main
+   git pull --ff-only
    cargo build --release
    ```
 
