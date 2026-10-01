@@ -34,6 +34,10 @@ const STARTUP_BUDGET: Duration = Duration::from_secs(5);
 const AFTER_LIFELINE: Duration = Duration::from_secs(2);
 const AFTER_SIGTERM: Duration = Duration::from_secs(2);
 const AFTER_SIGKILL: Duration = Duration::from_secs(5);
+/// A freshly staged executable can transiently return ETXTBSY on some Linux filesystems.
+/// Retry only that kernel error for a short bounded window.
+const EXEC_RETRY_BUDGET: Duration = Duration::from_millis(250);
+const EXEC_RETRY_DELAY: Duration = Duration::from_millis(10);
 /// Runner lines forwarded to the log per launch; the rest are drained and dropped.
 const MAX_FORWARDED: usize = 200;
 
@@ -57,6 +61,37 @@ pub fn watch_exit(watch: ExitWatch, on_exit: impl FnOnce() + Send + 'static) {
         let _ = watch.0.recv();
         on_exit();
     });
+}
+
+fn spawn_staged_process(command: &mut Command, log: &Log) -> std::io::Result<Child> {
+    let deadline = Instant::now() + EXEC_RETRY_BUDGET;
+    let mut retries = 0_u32;
+    loop {
+        match command.spawn() {
+            Ok(child) => {
+                if retries > 0 {
+                    log.debug(
+                        Area::Runner,
+                        format!("Executable became available after {retries} ETXTBSY retr{}", if retries == 1 { "y" } else { "ies" }),
+                    );
+                }
+                return Ok(child);
+            }
+            Err(error)
+                if error.raw_os_error() == Some(libc::ETXTBSY) && Instant::now() < deadline =>
+            {
+                retries += 1;
+                if retries == 1 {
+                    log.debug(
+                        Area::Runner,
+                        "Executable is temporarily busy (ETXTBSY); retrying launch",
+                    );
+                }
+                std::thread::sleep(EXEC_RETRY_DELAY);
+            }
+            Err(error) => return Err(error),
+        }
+    }
 }
 
 impl RunnerHost {
@@ -90,13 +125,13 @@ impl RunnerHost {
             );
         }
         let started = Instant::now();
-        let spawned = Command::new(&staged.path)
+        let mut command = Command::new(&staged.path);
+        command
             .current_dir(&directory)
             .stdin(Stdio::piped())
             .stdout(Stdio::null())
-            .stderr(Stdio::piped())
-            .spawn();
-        let mut child = match spawned {
+            .stderr(Stdio::piped());
+        let mut child = match spawn_staged_process(&mut command, &self.log) {
             Ok(child) => child,
             Err(error) => {
                 self.cleanup(&staged);
