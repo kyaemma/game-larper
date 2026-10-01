@@ -1,28 +1,72 @@
 use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use game_larper_core::{
-    CatalogCache, DETECTABLE_ENDPOINTS, GameDefinition, MAX_CATALOG_BYTES, USER_AGENT,
+    CatalogCache, DETECTABLE_ENDPOINTS, Error as CoreError, GameDefinition, MAX_CATALOG_BYTES,
+    USER_AGENT,
 };
 use image::ImageReader;
+
+use crate::log::{Area, Log, redact};
 
 const MAX_IMAGE_BYTES: usize = 1_000_000;
 const MAX_IMAGE_EDGE: u32 = 1024;
 
-pub fn refresh_catalog(cache: &CatalogCache) -> Result<Vec<GameDefinition>, String> {
+pub fn refresh_catalog(cache: &CatalogCache, log: &Log) -> Result<Vec<GameDefinition>, String> {
     let agent = ureq::AgentBuilder::new()
         .timeout(Duration::from_secs(20))
         .build();
     let mut last_error = String::from("No detectable catalog endpoint responded.");
     for endpoint in DETECTABLE_ENDPOINTS {
-        match fetch_text(&agent, endpoint) {
-            Ok(body) => match cache.store_response(&body) {
-                Ok(games) => return Ok(games),
-                Err(error) => last_error = error.to_string(),
-            },
-            Err(error) => last_error = error,
+        log.debug(Area::Network, format!("GET {endpoint}"));
+        let started = Instant::now();
+        let body = match fetch_text(&agent, endpoint) {
+            Ok(body) => body,
+            Err(error) => {
+                log.warn(
+                    Area::Network,
+                    format!("{error} (after {} ms)", started.elapsed().as_millis()),
+                );
+                last_error = error;
+                continue;
+            }
+        };
+        log.debug(
+            Area::Network,
+            format!(
+                "{endpoint}: {} KiB in {} ms",
+                body.len() / 1024,
+                started.elapsed().as_millis()
+            ),
+        );
+        match cache.store_response(&body) {
+            Ok(games) => {
+                log.debug(
+                    Area::Catalog,
+                    format!(
+                        "Parsed {} entries; saved {}",
+                        games.len(),
+                        redact(cache.path())
+                    ),
+                );
+                return Ok(games);
+            }
+            Err(CoreError::Io(error)) => {
+                log.error(
+                    Area::Files,
+                    format!("Saving {} failed: {error}", redact(cache.path())),
+                );
+                last_error = error.to_string();
+            }
+            Err(error) => {
+                log.warn(
+                    Area::Network,
+                    format!("{endpoint}: response rejected: {error}"),
+                );
+                last_error = error.to_string();
+            }
         }
     }
     Err(last_error)
@@ -71,42 +115,96 @@ pub fn artwork_candidates(game: &GameDefinition) -> Vec<(String, String)> {
 }
 
 /// Return a cached image path. Network and decode failures try the next source.
-pub fn ensure_artwork(directory: &Path, game: &GameDefinition) -> Option<PathBuf> {
+///
+/// Disk cache hits stay silent; downloads and failures are logged once per game.
+pub fn ensure_artwork(directory: &Path, game: &GameDefinition, log: &Log) -> Option<PathBuf> {
     let agent = ureq::AgentBuilder::new()
         .timeout(Duration::from_secs(12))
         .build();
-    for (file_name, url) in artwork_candidates(game) {
-        let path = directory.join(&file_name);
+    let candidates = artwork_candidates(game);
+    for (file_name, url) in &candidates {
+        let path = directory.join(file_name);
         if cached_image_ok(&path) {
             return Some(path);
         }
-        let Ok(bytes) = download_limited(&agent, &url) else {
-            continue;
+        let source = file_name.split('-').next().unwrap_or("artwork");
+        let bytes = match download_limited(&agent, url) {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                log.debug(
+                    Area::Network,
+                    format!("{source} artwork for {} unavailable: {error}", game.name),
+                );
+                continue;
+            }
         };
         if !image_bytes_ok(&bytes) {
+            log.debug(
+                Area::Art,
+                format!(
+                    "{source} artwork for {} is not a usable image ({} bytes)",
+                    game.name,
+                    bytes.len()
+                ),
+            );
             continue;
         }
-        if fs::create_dir_all(directory).is_err() {
+        if let Err(error) = fs::create_dir_all(directory) {
+            log.warn(
+                Area::Files,
+                format!("Artwork folder {} unavailable: {error}", redact(directory)),
+            );
             return None;
         }
-        if fs::write(&path, &bytes).is_ok() && cached_image_ok(&path) {
-            return Some(path);
+        match fs::write(&path, &bytes) {
+            Ok(()) if cached_image_ok(&path) => {
+                log.debug(
+                    Area::Art,
+                    format!(
+                        "Cached {source} artwork for {} ({} KiB)",
+                        game.name,
+                        bytes.len().div_ceil(1024)
+                    ),
+                );
+                return Some(path);
+            }
+            Ok(()) => log.warn(
+                Area::Files,
+                format!("{} did not read back as an image", redact(&path)),
+            ),
+            Err(error) => log.warn(
+                Area::Files,
+                format!("Writing {} failed: {error}", redact(&path)),
+            ),
         }
+    }
+    if !candidates.is_empty() {
+        log.debug(
+            Area::Art,
+            format!(
+                "No artwork for {} ({}) after {} source(s)",
+                game.name,
+                game.id,
+                candidates.len()
+            ),
+        );
     }
     None
 }
 
-fn download_limited(agent: &ureq::Agent, url: &str) -> Result<Vec<u8>, ()> {
+fn download_limited(agent: &ureq::Agent, url: &str) -> Result<Vec<u8>, String> {
     let response = agent
         .get(url)
         .set("User-Agent", USER_AGENT)
         .call()
-        .map_err(|_| ())?;
+        .map_err(|error| error.to_string())?;
     let mut reader = response.into_reader().take((MAX_IMAGE_BYTES as u64) + 1);
     let mut buffer = Vec::new();
-    reader.read_to_end(&mut buffer).map_err(|_| ())?;
+    reader
+        .read_to_end(&mut buffer)
+        .map_err(|error| error.to_string())?;
     if buffer.len() > MAX_IMAGE_BYTES {
-        return Err(());
+        return Err(format!("larger than {MAX_IMAGE_BYTES} bytes"));
     }
     Ok(buffer)
 }

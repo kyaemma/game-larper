@@ -376,18 +376,47 @@ fn load_session(paths: &AppPaths, log: &Arc<Log>) -> Session {
 
 fn spawn_load(tx: mpsc::Sender<Msg>, paths: AppPaths, log: Arc<Log>, wake: Wake) {
     std::thread::spawn(move || {
+        let started = Instant::now();
         let current = CatalogCache::new(paths.catalog());
         let legacy = CatalogCache::new(paths.legacy_catalog());
+        if current.path().exists() {
+            log.debug(
+                Area::Catalog,
+                format!("Loading cached database {}", redact(current.path())),
+            );
+        } else if legacy.path().exists() {
+            log.info(
+                Area::Catalog,
+                format!(
+                    "No current cache; falling back to the legacy {}",
+                    redact(legacy.path())
+                ),
+            );
+        }
         let (games, warning) = load_catalog_with_legacy(&current, &legacy);
         if let Some(warning) = warning {
             log.warn(Area::Catalog, warning);
         }
-        let games = games
+        let parsed = games.as_ref().map(Vec::len);
+        let games: Vec<GameDefinition> = games
             .unwrap_or_default()
             .into_iter()
             .filter(|game| game.supported_path().is_some())
             .collect();
         let updated = current.last_updated().or_else(|| legacy.last_updated());
+        match parsed {
+            Some(parsed) => log.info(
+                Area::Catalog,
+                format!(
+                    "Loaded {} supported games from {} entries in {} ms ({})",
+                    group_digits(games.len()),
+                    group_digits(parsed),
+                    started.elapsed().as_millis(),
+                    catalog_age(updated)
+                ),
+            ),
+            None => log.info(Area::Catalog, "No cached game database yet"),
+        }
         let _ = tx.send(Msg::Loaded { games, updated });
         wake();
     });
@@ -651,7 +680,10 @@ fn wire(
                 Some(session.paths.clone())
             });
             if let Some(paths) = paths {
+                log.info(Area::Catalog, "Manual refresh requested");
                 spawn_refresh(tx.clone(), paths, log.clone(), wake.clone());
+            } else {
+                log.debug(Area::Catalog, "Refresh ignored: one is already running");
             }
             wake();
         }
@@ -1256,19 +1288,24 @@ fn apply_message(
     };
     match message {
         Msg::Loaded { games, updated } => {
-            log.info(
-                Area::Catalog,
-                format!("Catalog loaded: {} supported games", games.len()),
-            );
             session.games = games;
             session.loaded = true;
             session.catalog_updated = updated;
-            if session.config.restore_last_selected_game {
-                session.selected = session
-                    .config
-                    .last_selected_discord_application_id
-                    .clone()
-                    .filter(|id| session.games.iter().any(|game| game.id == *id));
+            if session.config.restore_last_selected_game
+                && let Some(id) = session.config.last_selected_discord_application_id.clone()
+            {
+                match session.games.iter().find(|game| game.id == id) {
+                    Some(game) => log.debug(
+                        Area::Session,
+                        format!("Restored selection {id} / {}", game.name),
+                    ),
+                    None => log.warn(
+                        Area::Session,
+                        format!("Last selection {id} is not a supported game; not restored"),
+                    ),
+                }
+                session.selected =
+                    Some(id).filter(|id| session.games.iter().any(|game| game.id == *id));
             }
             let plan = plan_results(&mut session);
             fetch_art(&mut session, &plan.first, tx, wake, true);
@@ -1277,6 +1314,14 @@ fn apply_message(
                 SystemTime::now().duration_since(time).unwrap_or_default() > CATALOG_STALE
             });
             if (stale || session.games.is_empty()) && !session.refreshing {
+                log.info(
+                    Area::Catalog,
+                    if session.games.is_empty() {
+                        "No usable database; downloading it".to_string()
+                    } else {
+                        format!("Database is stale ({}); refreshing", catalog_age(updated))
+                    },
+                );
                 session.refreshing = true;
                 spawn_refresh(tx.clone(), session.paths.clone(), log.clone(), wake.clone());
             }
@@ -1301,16 +1346,24 @@ fn apply_message(
                     session.catalog_updated = Some(SystemTime::now());
                     log.success(
                         Area::Catalog,
-                        format!("Catalog refreshed: {count} supported games"),
+                        format!("Refreshed: {} supported games", group_digits(count)),
                     );
-                    if session
+                    if let Some(id) = session
                         .selected
-                        .as_ref()
-                        .is_some_and(|id| !session.games.iter().any(|game| &game.id == id))
+                        .clone()
+                        .filter(|id| !session.games.iter().any(|game| &game.id == id))
                     {
+                        log.warn(
+                            Area::Session,
+                            format!("Selected game {id} is no longer supported; cleared"),
+                        );
                         session.selected = None;
                         session.config.last_selected_discord_application_id = None;
-                        let _ = ConfigStore::new(session.paths.config()).save(&session.config);
+                        if let Err(error) =
+                            ConfigStore::new(session.paths.config()).save(&session.config)
+                        {
+                            log.error(Area::Settings, format!("Config save failed: {error}"));
+                        }
                     }
                     session.art_failed.clear();
                     let plan = plan_results(&mut session);
@@ -1324,7 +1377,20 @@ fn apply_message(
                     }
                 }
                 Err(error) => {
-                    log.error(Area::Catalog, format!("Metadata refresh failed: {error}"));
+                    if session.games.is_empty() {
+                        log.error(
+                            Area::Catalog,
+                            format!("Refresh failed and no database is available: {error}"),
+                        );
+                    } else {
+                        log.warn(
+                            Area::Catalog,
+                            format!(
+                                "Refresh failed; offline with the cached {} games: {error}",
+                                group_digits(session.games.len())
+                            ),
+                        );
+                    }
                     session.offline = !session.games.is_empty();
                     toast_err(
                         &mut session,
@@ -1335,7 +1401,17 @@ fn apply_message(
         }
         Msg::Art { id, path } => {
             session.art_inflight.remove(&id);
-            match path.and_then(|path| slint::Image::load_from_path(&path).ok()) {
+            let image = path.and_then(|path| {
+                slint::Image::load_from_path(&path)
+                    .inspect_err(|error| {
+                        log.warn(
+                            Area::Art,
+                            format!("Could not load {}: {error}", redact(&path)),
+                        );
+                    })
+                    .ok()
+            });
+            match image {
                 Some(image) => ART.with(|art| {
                     art.borrow_mut().insert(id.clone(), image);
                 }),

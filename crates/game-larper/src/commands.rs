@@ -297,7 +297,7 @@ fn spawn_launch_blocking(
                     game.executables.len()
                 ),
             );
-            let icon = net::ensure_artwork(&images, &game);
+            let icon = net::ensure_artwork(&images, &game, &log);
             host.lock()
                 .unwrap_or_else(|poison| poison.into_inner())
                 .launch(&template, &game.id, &relative, icon.as_deref())
@@ -344,10 +344,17 @@ fn spawn_refresh(
 ) {
     std::thread::spawn(move || {
         let cache = CatalogCache::new(paths.catalog());
-        let result = net::refresh_catalog(&cache);
-        if let Err(error) = &result {
-            log.error(Area::Network, format!("Metadata refresh failed: {error}"));
-        }
+        let started = Instant::now();
+        log.info(Area::Catalog, "Refreshing the game database from Discord");
+        let result = net::refresh_catalog(&cache, &log);
+        log.debug(
+            Area::Catalog,
+            format!(
+                "Refresh {} after {} ms",
+                if result.is_ok() { "finished" } else { "failed" },
+                started.elapsed().as_millis()
+            ),
+        );
         let _ = tx.send(Msg::Catalog(result));
         wake();
     });
@@ -377,10 +384,12 @@ fn select_index(
     }
     session.selected = Some(game.id.clone());
     session.config.last_selected_discord_application_id = Some(game.id.clone());
+    log.debug(
+        Area::Session,
+        format!("Selected {} / {}", game.id, game.name),
+    );
     if let Err(error) = ConfigStore::new(session.paths.config()).save(&session.config) {
         log.error(Area::Settings, format!("Config save failed: {error}"));
-    } else {
-        log.info(Area::Session, format!("Selected game: {} {}", game.id, game.name));
     }
     fetch_art(&mut session, std::slice::from_ref(&game), tx, wake, true);
 }
@@ -784,10 +793,19 @@ fn fetch_art(
     for game in &todo {
         session.art_inflight.insert(game.id.clone());
     }
+    session.log.debug(
+        Area::Art,
+        format!(
+            "Fetching artwork for {} game(s){}",
+            todo.len(),
+            if parallel { " in parallel" } else { "" }
+        ),
+    );
     let images = session.paths.images();
+    let log = session.log.clone();
     let run = move |games: Vec<GameDefinition>, tx: mpsc::Sender<Msg>, wake: Wake| {
         for game in games {
-            let path = net::ensure_artwork(&images, &game);
+            let path = net::ensure_artwork(&images, &game, &log);
             let _ = tx.send(Msg::Art { id: game.id, path });
             wake();
         }
@@ -1179,6 +1197,17 @@ fn database_detail(session: &Session) -> String {
         (Some(updated), false) => format!("{games} · {updated}"),
         (Some(updated), true) => format!("{games} · offline, {updated}"),
         (None, _) => games,
+    }
+}
+
+/// "updated 3 h ago" style age of the cached database, for the log.
+fn catalog_age(updated: Option<SystemTime>) -> String {
+    match updated.and_then(|time| SystemTime::now().duration_since(time).ok()) {
+        Some(age) => format!(
+            "updated {} ago",
+            format_minutes(Duration::from_secs(age.as_secs() / 60 * 60))
+        ),
+        None => "age unknown".into(),
     }
 }
 
