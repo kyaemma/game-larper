@@ -9,6 +9,7 @@ mod config;
 mod error;
 mod paths;
 mod queue;
+pub mod runner_protocol;
 mod safe_path;
 mod search;
 mod session;

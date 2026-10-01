@@ -1415,7 +1415,10 @@ dependencies = [
 name = "game-larper-runner"
 version = "0.1.0"
 dependencies = [
+ "game-larper-core",
+ "libc",
  "windows-sys 0.59.0",
+ "x11rb",
 ]
 
 [[package]]
