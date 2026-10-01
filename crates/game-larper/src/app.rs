@@ -922,18 +922,16 @@ fn render_main(ui: &MainWindow, session: &Session, now: Instant) {
     ui.set_db_color(color.into());
 
     let state = session.clock.state();
-    let (label, mode, tone) = if matches!(
-        session.queue.activity(),
-        QueueActivity::Transition { .. }
-    ) {
-        ("Switching…", "switching", Tone::Muted)
-    } else {
-        match state {
-            SessionState::Playing => ("Playing", "playing", Tone::Success),
-            SessionState::Paused => ("Paused", "paused", Tone::Warning),
-            SessionState::Stopped => ("Ready", "stopped", Tone::Muted),
-        }
-    };
+    let (label, mode, tone) =
+        if matches!(session.queue.activity(), QueueActivity::Transition { .. }) {
+            ("Switching…", "switching", Tone::Muted)
+        } else {
+            match state {
+                SessionState::Playing => ("Playing", "playing", Tone::Success),
+                SessionState::Paused => ("Paused", "paused", Tone::Warning),
+                SessionState::Stopped => ("Ready", "stopped", Tone::Muted),
+            }
+        };
     let current = session_game(session);
     ui.set_session_visible(current.is_some());
     ui.set_active_id(
