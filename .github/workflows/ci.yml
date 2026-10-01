@@ -81,7 +81,7 @@ jobs:
       - name: Test (X11 runner checks under Xvfb)
         env:
           GAME_LARPER_REQUIRE_X11: "1"
-        run: xvfb-run --auto-servernum cargo test --workspace
+        run: xvfb-run --auto-servernum cargo test --workspace --no-fail-fast
 
       - name: Build
         run: cargo build --workspace
