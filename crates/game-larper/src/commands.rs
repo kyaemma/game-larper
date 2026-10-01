@@ -111,6 +111,25 @@ fn begin_quit(
     );
 }
 
+fn should_stop_clock_for_dispatch(
+    activity: &QueueActivity,
+    state: SessionState,
+    action: &QueueAction,
+) -> bool {
+    if action.launch_index.is_some() {
+        return true;
+    }
+    if !action.stop_runner {
+        return false;
+    }
+
+    // A real pause intentionally keeps the clock and active identity around so Resume can
+    // continue the same session. Every other stop means there is no runner left to call
+    // "Playing": queue gaps, natural queue completion, failures, and explicit stops.
+    !matches!(activity, QueueActivity::Paused { .. })
+        && !(matches!(activity, QueueActivity::Idle) && state == SessionState::Paused)
+}
+
 fn dispatch_queue_action(
     session: &Arc<Mutex<Session>>,
     _log: &Log,
@@ -121,8 +140,12 @@ fn dispatch_queue_action(
     let Ok(mut guard) = session.lock() else {
         return;
     };
-    if action.launch_index.is_some() {
+    let activity = guard.queue.activity();
+    if should_stop_clock_for_dispatch(&activity, guard.clock.state(), &action) {
         guard.clock.stop();
+        if action.launch_index.is_none() {
+            guard.active = None;
+        }
     }
     let launch = action.launch_index.and_then(|index| {
         let item = guard.queue.items().get(index)?.clone();
