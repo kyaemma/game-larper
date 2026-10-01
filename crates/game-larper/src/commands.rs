@@ -297,7 +297,7 @@ fn spawn_launch_blocking(
                     game.executable_rules()
                 ),
             );
-            let icon = net::ensure_artwork(&images, &game, &log);
+            let icon = net::ensure_artwork(&images, &ArtRequest::from(&game), &log);
             host.lock()
                 .unwrap_or_else(|poison| poison.into_inner())
                 .launch(&template, &game.id, &relative, icon.as_deref())
@@ -363,27 +363,27 @@ fn select_index(
         return;
     };
     // Indexes refer to the rows on screen, which may still be the previous query's.
-    let Some(game) = session
+    let Some(request) = session
         .shown
         .get(index)
         .and_then(|&index| session.games.get(index))
-        .cloned()
+        .map(ArtRequest::from)
     else {
         return;
     };
-    if session.selected.as_deref() == Some(game.id.as_str()) {
+    if session.selected.as_deref() == Some(request.id.as_str()) {
         return;
     }
-    session.selected = Some(game.id.clone());
-    session.config.last_selected_discord_application_id = Some(game.id.clone());
+    session.selected = Some(request.id.clone());
+    session.config.last_selected_discord_application_id = Some(request.id.clone());
     log.debug(
         Area::Session,
-        format!("Selected {} / {}", game.id, game.name),
+        format!("Selected {} / {}", request.id, request.name),
     );
     if let Err(error) = ConfigStore::new(session.paths.config()).save(&session.config) {
         log.error(Area::Settings, format!("Config save failed: {error}"));
     }
-    fetch_art(&mut session, std::slice::from_ref(&game), tx, wake, true);
+    fetch_art(&mut session, &[request], tx, wake, true);
 }
 
 fn add_selected_to_queue(session: &Arc<Mutex<Session>>, panel: &Weak<SidePanel>) {
@@ -752,12 +752,12 @@ fn plan_results(session: &mut Session) -> ArtPlan {
         session.results = Results::Empty;
         return ArtPlan::default();
     }
-    let wanted = |range: &[usize]| -> Vec<GameDefinition> {
+    let wanted = |range: &[usize]| -> Vec<ArtRequest> {
         range
             .iter()
             .map(|&index| &session.games[index])
-            .filter(|game| needs_art(session, game))
-            .cloned()
+            .filter(|game| net::has_artwork_source(game) && needs_art(session, &game.id))
+            .map(ArtRequest::from)
             .collect()
     };
     let split = found.len().min(REVEAL_ROWS);
@@ -776,7 +776,7 @@ fn plan_results(session: &mut Session) -> ArtPlan {
     }
     session.reveal = Some(Reveal {
         shown: found,
-        waiting: plan.first.iter().map(|game| game.id.clone()).collect(),
+        waiting: plan.first.iter().map(|request| request.id.clone()).collect(),
         deadline: Instant::now() + ART_DEBOUNCE + REVEAL_WAIT,
     });
     plan
@@ -798,8 +798,8 @@ fn start_art(
     session: &Arc<Mutex<Session>>,
     tx: &mpsc::Sender<Msg>,
     wake: &Wake,
-    first: Vec<GameDefinition>,
-    rest: Vec<GameDefinition>,
+    first: Vec<ArtRequest>,
+    rest: Vec<ArtRequest>,
 ) {
     if let Ok(mut session) = session.lock() {
         fetch_art(&mut session, &first, tx, wake, true);
@@ -809,31 +809,34 @@ fn start_art(
     Timer::single_shot(REVEAL_WAIT + Duration::from_millis(20), move || wake());
 }
 
-fn needs_art(session: &Session, game: &GameDefinition) -> bool {
-    !ART.with(|art| art.borrow().contains(&game.id))
-        && !session.art_failed.contains(&game.id)
-        && !net::artwork_candidates(game).is_empty()
+/// Artwork that is neither decoded nor known to be unavailable. It may still be on its way.
+fn needs_art(session: &Session, id: &str) -> bool {
+    !ART.with(|art| art.borrow().contains(id)) && !session.art_failed.contains(id)
 }
 
 /// Start fetching artwork that is not cached, failed, or already on its way.
 /// `parallel` gives each game its own worker; otherwise one worker goes through the list.
 fn fetch_art(
     session: &mut Session,
-    games: &[GameDefinition],
+    requests: &[ArtRequest],
     tx: &mpsc::Sender<Msg>,
     wake: &Wake,
     parallel: bool,
 ) {
-    let todo: Vec<GameDefinition> = games
+    let todo: Vec<ArtRequest> = requests
         .iter()
-        .filter(|game| needs_art(session, game) && !session.art_inflight.contains(&game.id))
+        .filter(|request| {
+            request.has_source()
+                && needs_art(session, &request.id)
+                && !session.art_inflight.contains(&request.id)
+        })
         .cloned()
         .collect();
     if todo.is_empty() {
         return;
     }
-    for game in &todo {
-        session.art_inflight.insert(game.id.clone());
+    for request in &todo {
+        session.art_inflight.insert(request.id.clone());
     }
     session.log.debug(
         Area::Art,
@@ -845,12 +848,12 @@ fn fetch_art(
     );
     let images = session.paths.images();
     let log = session.log.clone();
-    let run = move |games: Vec<GameDefinition>, tx: mpsc::Sender<Msg>, wake: Wake| {
-        for game in games {
-            let identity = net::artwork_identity(&game);
-            let path = net::ensure_artwork(&images, &game, &log);
+    let run = move |requests: Vec<ArtRequest>, tx: mpsc::Sender<Msg>, wake: Wake| {
+        for request in requests {
+            let identity = request.identity();
+            let path = net::ensure_artwork(&images, &request, &log);
             let _ = tx.send(Msg::Art {
-                id: game.id,
+                id: request.id,
                 identity,
                 path,
             });
@@ -858,11 +861,11 @@ fn fetch_art(
         }
     };
     if parallel {
-        for game in todo {
+        for request in todo {
             let run = run.clone();
             let tx = tx.clone();
             let wake = wake.clone();
-            std::thread::spawn(move || run(vec![game], tx, wake));
+            std::thread::spawn(move || run(vec![request], tx, wake));
         }
     } else {
         let tx = tx.clone();
@@ -900,7 +903,7 @@ fn reconcile_art(session: &Session) {
                 .games
                 .iter()
                 .find(|game| game.id == id)
-                .map(net::artwork_identity)
+                .map(|game| ArtRequest::from(game).identity())
         });
     });
 }

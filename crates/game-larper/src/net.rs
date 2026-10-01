@@ -89,50 +89,88 @@ fn fetch_text(agent: &ureq::Agent, url: &str) -> Result<String, String> {
     String::from_utf8(buffer).map_err(|_| format!("{url}: catalog was not UTF-8"))
 }
 
-pub fn artwork_candidates(game: &GameDefinition) -> Vec<(String, String)> {
-    let mut sources = Vec::new();
-    if let Some(hash) = game.icon_hash.as_deref()
-        && !hash.is_empty()
-        && hash.chars().all(|character| character.is_ascii_hexdigit())
-    {
-        sources.push((
-            format!("discord-{}-{hash}.png", game.id),
-            format!(
-                "https://cdn.discordapp.com/app-icons/{}/{hash}.png?size=128",
-                game.id
-            ),
-        ));
-    }
-    if let Some(steam_id) = game.steam_app_id.as_deref() {
-        sources.push((
-            format!("steam-{steam_id}.jpg"),
-            format!(
-                "https://shared.fastly.steamstatic.com/store_item_assets/steam/apps/{steam_id}/capsule_231x87.jpg"
-            ),
-        ));
-    }
-    sources
+/// What fetching one game's artwork needs: a few short strings instead of a catalog record, so
+/// artwork workers and timers own their input and never share the catalog.
+#[derive(Debug, Clone)]
+pub struct ArtRequest {
+    pub id: String,
+    pub name: String,
+    /// Only a usable hash: non-empty and hexadecimal.
+    icon_hash: Option<String>,
+    steam_app_id: Option<String>,
 }
 
-/// What a game's artwork is fetched from. Two games sharing an id and an identity share a
-/// picture; when the catalog changes the icon hash or Steam id, the identity changes and any
-/// picture decoded for the old one is stale.
-pub fn artwork_identity(game: &GameDefinition) -> String {
-    artwork_candidates(game)
-        .iter()
-        .map(|(file_name, _)| file_name.as_str())
-        .collect::<Vec<_>>()
-        .join("|")
+fn usable_icon_hash(game: &GameDefinition) -> Option<&str> {
+    game.icon_hash.as_deref().filter(|hash| {
+        !hash.is_empty() && hash.chars().all(|character| character.is_ascii_hexdigit())
+    })
+}
+
+/// Whether the catalog names any place to fetch this game's artwork from.
+pub fn has_artwork_source(game: &GameDefinition) -> bool {
+    usable_icon_hash(game).is_some() || game.steam_app_id.is_some()
+}
+
+impl From<&GameDefinition> for ArtRequest {
+    fn from(game: &GameDefinition) -> Self {
+        Self {
+            id: game.id.clone(),
+            name: game.name.clone(),
+            icon_hash: usable_icon_hash(game).map(str::to_string),
+            steam_app_id: game.steam_app_id.clone(),
+        }
+    }
+}
+
+impl ArtRequest {
+    pub fn has_source(&self) -> bool {
+        self.icon_hash.is_some() || self.steam_app_id.is_some()
+    }
+
+    /// (cache file name, URL) of each source, best first.
+    pub fn candidates(&self) -> Vec<(String, String)> {
+        let mut sources = Vec::new();
+        if let Some(hash) = self.icon_hash.as_deref() {
+            sources.push((
+                format!("discord-{}-{hash}.png", self.id),
+                format!(
+                    "https://cdn.discordapp.com/app-icons/{}/{hash}.png?size=128",
+                    self.id
+                ),
+            ));
+        }
+        if let Some(steam_id) = self.steam_app_id.as_deref() {
+            sources.push((
+                format!("steam-{steam_id}.jpg"),
+                format!(
+                    "https://shared.fastly.steamstatic.com/store_item_assets/steam/apps/{steam_id}/capsule_231x87.jpg"
+                ),
+            ));
+        }
+        sources
+    }
+
+    /// What this artwork is fetched from. Two requests with the same id and identity yield the
+    /// same picture; when the catalog changes the icon hash or Steam id, the identity changes
+    /// and any picture decoded for the old one is stale. The candidate file names embed all of
+    /// application id, icon hash and Steam id.
+    pub fn identity(&self) -> String {
+        self.candidates()
+            .iter()
+            .map(|(file_name, _)| file_name.as_str())
+            .collect::<Vec<_>>()
+            .join("|")
+    }
 }
 
 /// Return a cached image path. Network and decode failures try the next source.
 ///
 /// Disk cache hits stay silent; downloads and failures are logged once per game.
-pub fn ensure_artwork(directory: &Path, game: &GameDefinition, log: &Log) -> Option<PathBuf> {
+pub fn ensure_artwork(directory: &Path, game: &ArtRequest, log: &Log) -> Option<PathBuf> {
     let agent = ureq::AgentBuilder::new()
         .timeout(Duration::from_secs(12))
         .build();
-    let candidates = artwork_candidates(game);
+    let candidates = game.candidates();
     for (file_name, url) in &candidates {
         let path = directory.join(file_name);
         if cached_image_ok(&path) {
@@ -276,4 +314,59 @@ fn is_reparse(metadata: &fs::Metadata) -> bool {
 #[cfg(target_os = "linux")]
 fn is_reparse(metadata: &fs::Metadata) -> bool {
     metadata.file_type().is_symlink()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn game(icon_hash: Option<&str>, steam_app_id: Option<&str>) -> GameDefinition {
+        let mut game = GameDefinition::new("123", "Game");
+        game.icon_hash = icon_hash.map(str::to_string);
+        game.steam_app_id = steam_app_id.map(str::to_string);
+        game
+    }
+
+    #[test]
+    fn requests_list_discord_then_steam_sources() {
+        let request = ArtRequest::from(&game(Some("abc123"), Some("55")));
+        let names: Vec<_> = request
+            .candidates()
+            .into_iter()
+            .map(|(name, _)| name)
+            .collect();
+        assert_eq!(names, ["discord-123-abc123.png", "steam-55.jpg"]);
+        assert_eq!(request.identity(), "discord-123-abc123.png|steam-55.jpg");
+        assert!(request.has_source());
+    }
+
+    #[test]
+    fn unusable_icon_hashes_are_not_sources() {
+        for hash in ["", "../x", "xyz", "ab cd"] {
+            let game = game(Some(hash), None);
+            assert!(!has_artwork_source(&game), "{hash:?}");
+            let request = ArtRequest::from(&game);
+            assert!(!request.has_source());
+            assert!(request.candidates().is_empty());
+            assert_eq!(request.identity(), "");
+        }
+        assert!(has_artwork_source(&game(Some("zz"), Some("5"))));
+    }
+
+    #[test]
+    fn identity_changes_with_the_artwork_source() {
+        let before = ArtRequest::from(&game(Some("aaaa"), Some("5"))).identity();
+        assert_ne!(
+            before,
+            ArtRequest::from(&game(Some("bbbb"), Some("5"))).identity()
+        );
+        assert_ne!(
+            before,
+            ArtRequest::from(&game(Some("aaaa"), None)).identity()
+        );
+        assert_eq!(
+            before,
+            ArtRequest::from(&game(Some("aaaa"), Some("5"))).identity()
+        );
+    }
 }

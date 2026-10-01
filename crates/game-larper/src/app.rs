@@ -16,7 +16,7 @@ use slint::{ComponentHandle, Model, ModelRc, SharedString, Timer, TimerMode, Vec
 use crate::art_cache::{self, ArtCache};
 use crate::host::{self, ExitWatch, LaunchReport, RunnerHost};
 use crate::log::{Area, Log, LogChanges, LogCursor, LogEntry, LogLevel, MAX_HISTORY, redact};
-use crate::net;
+use crate::net::{self, ArtRequest};
 use crate::panel::{Dock, Mode};
 use crate::platform;
 
@@ -56,7 +56,7 @@ enum Msg {
     Catalog(Result<Vec<GameDefinition>, String>),
     Art {
         id: String,
-        /// The artwork source the request was made for; see `net::artwork_identity`.
+        /// The artwork source the request was made for; see `ArtRequest::identity`.
         identity: String,
         path: Option<PathBuf>,
     },
@@ -85,8 +85,8 @@ struct Reveal {
 /// Artwork a query wants: the first rows gate the reveal, the rest load quietly.
 #[derive(Default)]
 struct ArtPlan {
-    first: Vec<GameDefinition>,
-    rest: Vec<GameDefinition>,
+    first: Vec<ArtRequest>,
+    rest: Vec<ArtRequest>,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -496,8 +496,12 @@ fn wire(
                     let session = session.clone();
                     let tx = tx.clone();
                     let wake = wake.clone();
+                    // The timer takes a repeatable closure, but fires its single shot once.
+                    let mut plan = Some(plan);
                     debounce.start(TimerMode::SingleShot, ART_DEBOUNCE, move || {
-                        start_art(&session, &tx, &wake, plan.first.clone(), plan.rest.clone());
+                        if let Some(plan) = plan.take() {
+                            start_art(&session, &tx, &wake, plan.first, plan.rest);
+                        }
                     });
                 }
                 _ => debounce.stop(),
@@ -1278,7 +1282,7 @@ fn tick(session: &Arc<Mutex<Session>>, log: &Arc<Log>, tx: &mpsc::Sender<Msg>, w
         }
     }
     // The dock and the queue panel show artwork too; fetch what they miss.
-    let wanted: Vec<GameDefinition> = {
+    let wanted: Vec<ArtRequest> = {
         let session = &*session_guard;
         let mut ids: Vec<&str> = session
             .selected
@@ -1294,14 +1298,11 @@ fn tick(session: &Arc<Mutex<Session>>, log: &Arc<Log>, tx: &mpsc::Sender<Msg>, w
                 .map(|item| item.application_id.as_str()),
         );
         // Most ticks have nothing to fetch; skip the catalog scan for those.
-        ids.retain(|id| {
-            !ART.with(|art| art.borrow().contains(id))
-                && !session.art_failed.contains(*id)
-                && !session.art_inflight.contains(*id)
-        });
+        ids.retain(|id| needs_art(session, id) && !session.art_inflight.contains(*id));
         ids.iter()
             .filter_map(|id| session.games.iter().find(|game| game.id == *id))
-            .cloned()
+            .filter(|game| net::has_artwork_source(game))
+            .map(ArtRequest::from)
             .collect()
     };
     fetch_art(&mut session_guard, &wanted, tx, wake, false);
@@ -1438,11 +1439,11 @@ fn apply_message(
                 .games
                 .iter()
                 .find(|game| game.id == id)
-                .map(net::artwork_identity);
-            if current.as_deref() != Some(identity.as_str()) {
+                .map(ArtRequest::from);
+            if current.as_ref().map(ArtRequest::identity).as_deref() != Some(identity.as_str()) {
                 // The catalog changed this game's artwork source while the fetch was running.
-                if let Some(game) = session.games.iter().find(|game| game.id == id).cloned() {
-                    fetch_art(&mut session, std::slice::from_ref(&game), tx, wake, true);
+                if let Some(request) = current {
+                    fetch_art(&mut session, &[request], tx, wake, true);
                 }
             } else {
                 let image = path.and_then(|path| {
