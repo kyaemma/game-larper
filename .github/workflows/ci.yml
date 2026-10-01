@@ -2,7 +2,7 @@ name: CI
 
 on:
   push:
-    branches: [main]
+    branches: [main, "integrate/**"]
   pull_request:
   workflow_dispatch:
 
@@ -40,3 +40,48 @@ jobs:
       - name: Format, lint, and test
         shell: pwsh
         run: .\scripts\check.ps1
+
+  # Automated Linux validation: build, lint, and the runner/host mechanics (X11 under Xvfb).
+  # It says nothing about whether Discord detects the runner; see docs/LINUX.md.
+  linux:
+    name: Linux x64
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Install system packages
+        run: |
+          sudo apt-get update
+          # fontconfig headers for Slint's font stack; Xvfb for the X11 runner test.
+          # X11, Wayland, GL and xkbcommon are dlopened at runtime and need no headers.
+          sudo apt-get install --yes --no-install-recommends pkg-config libfontconfig1-dev xvfb
+
+      - name: Install pinned Rust toolchain
+        run: |
+          rustup toolchain install 1.98.1 --profile minimal --component rustfmt,clippy
+          rustup override set 1.98.1
+          rustc --version
+          cargo --version
+
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: linux-x64
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
+      - name: Format
+        run: cargo fmt --all --check
+
+      - name: Lint
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: Test (X11 runner checks under Xvfb)
+        env:
+          GAME_LARPER_REQUIRE_X11: "1"
+        run: xvfb-run --auto-servernum cargo test --workspace
+
+      - name: Build
+        run: cargo build --workspace
