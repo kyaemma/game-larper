@@ -1200,7 +1200,7 @@ fn apply_message(
                     session.loaded = true;
                     session.offline = false;
                     session.catalog_updated = Some(SystemTime::now());
-                    log.info(format!("Catalog refreshed: {count} supported games"));
+                    log.success(format!("Catalog refreshed: {count} supported games"));
                     if session
                         .selected
                         .as_ref()
@@ -1222,7 +1222,7 @@ fn apply_message(
                     }
                 }
                 Err(error) => {
-                    log.info(format!("Metadata refresh failed: {error}"));
+                    log.error(format!("Metadata refresh failed: {error}"));
                     session.offline = !session.games.is_empty();
                     toast_err(
                         &mut session,
@@ -1250,7 +1250,7 @@ fn apply_message(
             match result {
                 Ok(report) => {
                     session.clock.play(Instant::now());
-                    log.info(format!(
+                    log.success(format!(
                         "Runner diagnostic: PID={}, path={}, basename={}, workingDirectory={}, alive=true, HWND=0x{:X}, title={}, integrity={}",
                         report.pid,
                         report.executable.display(),
@@ -1263,7 +1263,7 @@ fn apply_message(
                     watch_exit(report.generation, report.waiter, tx.clone());
                 }
                 Err(error) => {
-                    log.info(format!("Launch failed: {error}"));
+                    log.error(format!("Launch failed: {error}"));
                     session.clock.stop();
                     if matches!(
                         session.queue.activity(),
@@ -1287,7 +1287,7 @@ fn apply_message(
         Msg::Stopped(result) => {
             session.busy = false;
             if let Err(error) = result {
-                log.info(format!("Stop failed: {error}"));
+                log.error(format!("Stop failed: {error}"));
                 toast_err(&mut session, error);
             }
             if session.quitting {
@@ -1301,7 +1301,7 @@ fn apply_message(
                 .map(|mut host| host.take_unexpected_exit(generation))
                 .unwrap_or(false);
             if unexpected {
-                log.info(format!(
+                log.warn(format!(
                     "Runner exited unexpectedly (generation {generation})"
                 ));
                 session.clock.unexpected_exit();
