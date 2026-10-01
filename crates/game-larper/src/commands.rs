@@ -810,7 +810,7 @@ fn start_art(
 }
 
 fn needs_art(session: &Session, game: &GameDefinition) -> bool {
-    !ART.with(|art| art.borrow().contains_key(&game.id))
+    !ART.with(|art| art.borrow().contains(&game.id))
         && !session.art_failed.contains(&game.id)
         && !net::artwork_candidates(game).is_empty()
 }
@@ -847,8 +847,13 @@ fn fetch_art(
     let log = session.log.clone();
     let run = move |games: Vec<GameDefinition>, tx: mpsc::Sender<Msg>, wake: Wake| {
         for game in games {
+            let identity = net::artwork_identity(&game);
             let path = net::ensure_artwork(&images, &game, &log);
-            let _ = tx.send(Msg::Art { id: game.id, path });
+            let _ = tx.send(Msg::Art {
+                id: game.id,
+                identity,
+                path,
+            });
             wake();
         }
     };
@@ -867,7 +872,37 @@ fn fetch_art(
 }
 
 fn cached_art(id: &str) -> slint::Image {
-    ART.with(|art| art.borrow().get(id).cloned().unwrap_or_default())
+    ART.with(|art| art.borrow_mut().get(id).cloned().unwrap_or_default())
+}
+
+/// Artwork the UI is drawing or about to draw. It stays in memory however full the cache is.
+fn art_pinned(session: &Session, id: &str) -> bool {
+    let shows = |index: &usize| session.games.get(*index).is_some_and(|game| game.id == id);
+    session.selected.as_deref() == Some(id)
+        || session.active.as_deref() == Some(id)
+        || session
+            .queue
+            .items()
+            .iter()
+            .any(|item| item.application_id == id)
+        || session.shown.iter().any(shows)
+        || session
+            .reveal
+            .as_ref()
+            .is_some_and(|reveal| reveal.shown.iter().any(shows))
+}
+
+/// Forget decoded artwork whose game left the catalog or whose artwork source changed.
+fn reconcile_art(session: &Session) {
+    ART.with(|art| {
+        art.borrow_mut().reconcile(|id| {
+            session
+                .games
+                .iter()
+                .find(|game| game.id == id)
+                .map(net::artwork_identity)
+        });
+    });
 }
 
 /// Bring the console model up to date with the live history. Only new lines are added, so an

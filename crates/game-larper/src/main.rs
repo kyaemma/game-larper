@@ -2,6 +2,7 @@
 #![windows_subsystem = "windows"]
 
 mod app;
+mod art_cache;
 mod host;
 mod log;
 mod net;

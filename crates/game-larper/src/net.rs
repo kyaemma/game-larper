@@ -114,6 +114,17 @@ pub fn artwork_candidates(game: &GameDefinition) -> Vec<(String, String)> {
     sources
 }
 
+/// What a game's artwork is fetched from. Two games sharing an id and an identity share a
+/// picture; when the catalog changes the icon hash or Steam id, the identity changes and any
+/// picture decoded for the old one is stale.
+pub fn artwork_identity(game: &GameDefinition) -> String {
+    artwork_candidates(game)
+        .iter()
+        .map(|(file_name, _)| file_name.as_str())
+        .collect::<Vec<_>>()
+        .join("|")
+}
+
 /// Return a cached image path. Network and decode failures try the next source.
 ///
 /// Disk cache hits stay silent; downloads and failures are logged once per game.

@@ -1,5 +1,5 @@
 use std::cell::{Cell, RefCell};
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::{Arc, Mutex, mpsc};
@@ -13,6 +13,7 @@ use game_larper_core::{
 };
 use slint::{ComponentHandle, Model, ModelRc, SharedString, Timer, TimerMode, VecModel, Weak};
 
+use crate::art_cache::{self, ArtCache};
 use crate::host::{self, ExitWatch, LaunchReport, RunnerHost};
 use crate::log::{Area, Log, LogChanges, LogCursor, LogEntry, LogLevel, MAX_HISTORY, redact};
 use crate::net;
@@ -43,7 +44,8 @@ struct Models {
 
 thread_local! {
     static MODELS: RefCell<Option<Models>> = const { RefCell::new(None) };
-    static ART: RefCell<HashMap<String, slint::Image>> = RefCell::new(HashMap::new());
+    /// Decoded artwork, bounded; the files in the image cache folder remain the source of truth.
+    static ART: RefCell<ArtCache<slint::Image>> = RefCell::new(ArtCache::default());
 }
 
 enum Msg {
@@ -54,6 +56,8 @@ enum Msg {
     Catalog(Result<Vec<GameDefinition>, String>),
     Art {
         id: String,
+        /// The artwork source the request was made for; see `net::artwork_identity`.
+        identity: String,
         path: Option<PathBuf>,
     },
     Launch(Result<LaunchReport, String>),
@@ -1287,7 +1291,7 @@ fn tick(session: &Arc<Mutex<Session>>, log: &Arc<Log>, tx: &mpsc::Sender<Msg>, w
         );
         // Most ticks have nothing to fetch; skip the catalog scan for those.
         ids.retain(|id| {
-            !ART.with(|art| art.borrow().contains_key(*id))
+            !ART.with(|art| art.borrow().contains(id))
                 && !session.art_failed.contains(*id)
                 && !session.art_inflight.contains(*id)
         });
@@ -1393,6 +1397,7 @@ fn apply_message(
                         }
                     }
                     session.art_failed.clear();
+                    reconcile_art(&session);
                     let plan = plan_results(&mut session);
                     fetch_art(&mut session, &plan.first, tx, wake, true);
                     fetch_art(&mut session, &plan.rest, tx, wake, false);
@@ -1426,24 +1431,43 @@ fn apply_message(
                 }
             }
         }
-        Msg::Art { id, path } => {
+        Msg::Art { id, identity, path } => {
             session.art_inflight.remove(&id);
-            let image = path.and_then(|path| {
-                slint::Image::load_from_path(&path)
-                    .inspect_err(|error| {
-                        log.warn(
-                            Area::Art,
-                            format!("Could not load {}: {error}", redact(&path)),
-                        );
-                    })
-                    .ok()
-            });
-            match image {
-                Some(image) => ART.with(|art| {
-                    art.borrow_mut().insert(id.clone(), image);
-                }),
-                None => {
-                    session.art_failed.insert(id.clone());
+            let current = session
+                .games
+                .iter()
+                .find(|game| game.id == id)
+                .map(net::artwork_identity);
+            if current.as_deref() != Some(identity.as_str()) {
+                // The catalog changed this game's artwork source while the fetch was running.
+                if let Some(game) = session.games.iter().find(|game| game.id == id).cloned() {
+                    fetch_art(&mut session, std::slice::from_ref(&game), tx, wake, true);
+                }
+            } else {
+                let image = path.and_then(|path| {
+                    slint::Image::load_from_path(&path)
+                        .inspect_err(|error| {
+                            log.warn(
+                                Area::Art,
+                                format!("Could not load {}: {error}", redact(&path)),
+                            );
+                        })
+                        .ok()
+                });
+                match image {
+                    Some(image) => {
+                        let size = image.size();
+                        let cost = art_cache::decoded_cost(size.width, size.height);
+                        ART.with(|art| {
+                            art.borrow_mut()
+                                .insert(&id, identity, image, cost, |candidate| {
+                                    art_pinned(&session, candidate)
+                                });
+                        });
+                    }
+                    None => {
+                        session.art_failed.insert(id.clone());
+                    }
                 }
             }
             if let Some(reveal) = session.reveal.as_mut() {
