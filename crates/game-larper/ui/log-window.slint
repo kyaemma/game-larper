@@ -37,10 +37,7 @@ component LogLine inherits Rectangle {
     in property <LogRow> row;
 
     min-height: 28px;
-    background: touch.has-hover ? Theme.hover : transparent;
-    animate background { duration: Theme.quick; }
-
-    touch := TouchArea { }
+    background: transparent;
 
     HorizontalLayout {
         padding-left: 12px;
@@ -53,7 +50,7 @@ component LogLine inherits Rectangle {
             text: root.row.time;
             color: Theme.text-3;
             font-size: Theme.text-s;
-            font-family: "Cascadia Mono";
+            font-family: "Consolas";
             min-width: 66px;
             vertical-alignment: top;
         }
@@ -61,7 +58,7 @@ component LogLine inherits Rectangle {
             text: root.row.level;
             color: root.row.tone;
             font-size: Theme.text-s;
-            font-family: "Cascadia Mono";
+            font-family: "Consolas";
             font-weight: 700;
             min-width: 64px;
             vertical-alignment: top;
@@ -70,7 +67,7 @@ component LogLine inherits Rectangle {
             text: root.row.message;
             color: Theme.text-2;
             font-size: Theme.text-s;
-            font-family: "Cascadia Mono";
+            font-family: "Consolas";
             wrap: word-wrap;
             horizontal-stretch: 1;
             vertical-alignment: top;
