@@ -45,3 +45,6 @@ Desktop.ini
 
 # OS
 .DS_Store
+
+# Local UI review screenshots
+/assets/screenshots/
