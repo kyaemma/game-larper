@@ -188,6 +188,9 @@ mod tests {
         }
         assert_eq!(history.len(), MAX_HISTORY);
         assert_eq!(history.front().unwrap().message, "entry 1");
-        assert_eq!(history.back().unwrap().message, format!("entry {MAX_HISTORY}"));
+        assert_eq!(
+            history.back().unwrap().message,
+            format!("entry {MAX_HISTORY}")
+        );
     }
 }
