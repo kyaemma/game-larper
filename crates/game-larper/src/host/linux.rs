@@ -72,7 +72,10 @@ fn spawn_staged_process(command: &mut Command, log: &Log) -> std::io::Result<Chi
                 if retries > 0 {
                     log.debug(
                         Area::Runner,
-                        format!("Executable became available after {retries} ETXTBSY retr{}", if retries == 1 { "y" } else { "ies" }),
+                        format!(
+                            "Executable became available after {retries} ETXTBSY retr{}",
+                            if retries == 1 { "y" } else { "ies" }
+                        ),
                     );
                 }
                 return Ok(child);
