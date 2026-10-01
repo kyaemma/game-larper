@@ -86,7 +86,9 @@ fn replace_file(from: &Path, to: &Path) -> io::Result<()> {
 
 #[cfg(not(windows))]
 fn replace_file(from: &Path, to: &Path) -> io::Result<()> {
-    let _ = fs::remove_file(to);
+    // The temporary file is created beside the destination, so both paths are on the same
+    // filesystem. On Unix, rename replaces an existing regular file atomically: readers see
+    // either the old file or the new one, never a gap where the destination is missing.
     fs::rename(from, to)
 }
 
