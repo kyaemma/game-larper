@@ -261,7 +261,7 @@ fn spawn_refresh(
         let cache = CatalogCache::new(paths.catalog());
         let result = net::refresh_catalog(&cache);
         if let Err(error) = &result {
-            log.info(format!("Metadata refresh failed: {error}"));
+            log.error(format!("Metadata refresh failed: {error}"));
         }
         let _ = tx.send(Msg::Catalog(result));
         wake();
@@ -293,7 +293,7 @@ fn select_index(
     session.selected = Some(game.id.clone());
     session.config.last_selected_discord_application_id = Some(game.id.clone());
     if let Err(error) = ConfigStore::new(session.paths.config()).save(&session.config) {
-        log.info(format!("Config save failed: {error}"));
+        log.error(format!("Config save failed: {error}"));
     } else {
         log.info(format!("Selected game: {} {}", game.id, game.name));
     }
@@ -593,6 +593,41 @@ fn fetch_art(
 
 fn cached_art(id: &str) -> slint::Image {
     ART.with(|art| art.borrow().get(id).cloned().unwrap_or_default())
+}
+
+fn render_logs(log: &Log) {
+    let rows = log
+        .history()
+        .into_iter()
+        .map(|entry| {
+            let tone = match entry.level {
+                LogLevel::Info => Tone::Accent,
+                LogLevel::Success => Tone::Success,
+                LogLevel::Warn => Tone::Warning,
+                LogLevel::Error => Tone::Danger,
+            };
+            LogRow {
+                time: entry.time.into(),
+                level: entry.level.label().into(),
+                message: entry.message.into(),
+                tone: tone.into(),
+            }
+        })
+        .collect();
+    MODELS.with(|models| {
+        if let Some(models) = models.borrow().as_ref() {
+            sync_model(&models.logs, rows);
+        }
+    });
+}
+
+fn show_log_window(window: &LogWindow, log: &Log) {
+    render_logs(log);
+    if window.show().is_ok()
+        && let Some(hwnd) = platform::hwnd_of(window.window())
+    {
+        platform::style_frame(hwnd);
+    }
 }
 
 fn hit_rows(session: &Session) -> Vec<Hit> {

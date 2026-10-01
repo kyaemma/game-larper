@@ -14,7 +14,7 @@ use game_larper_core::{
 use slint::{ComponentHandle, Model, ModelRc, SharedString, Timer, TimerMode, VecModel, Weak};
 
 use crate::host::{LaunchReport, RunnerHost};
-use crate::log::Log;
+use crate::log::{Log, LogLevel};
 use crate::net;
 use crate::panel::{Dock, Mode};
 use crate::platform;
@@ -36,6 +36,7 @@ const CATALOG_STALE: Duration = Duration::from_secs(24 * 60 * 60);
 struct Models {
     hits: Rc<VecModel<Hit>>,
     rows: Rc<VecModel<QueueRow>>,
+    logs: Rc<VecModel<LogRow>>,
 }
 
 thread_local! {
@@ -127,6 +128,7 @@ pub fn run(
     let log = Arc::new(log);
     let ui = MainWindow::new()?;
     let panel = SidePanel::new()?;
+    let log_window = LogWindow::new()?;
     let tray = TrayIcon::new()?;
     let dock = Dock::new(&ui, &panel);
     let (tx, rx) = mpsc::channel();
@@ -134,9 +136,11 @@ pub fn run(
     let session = Arc::new(Mutex::new(load_session(&paths, &log)));
     let hits = Rc::new(VecModel::from(Vec::<Hit>::new()));
     let rows = Rc::new(VecModel::from(Vec::<QueueRow>::new()));
+    let logs = Rc::new(VecModel::from(Vec::<LogRow>::new()));
     ui.set_hits(ModelRc::from(hits.clone()));
     panel.set_queue_rows(ModelRc::from(rows.clone()));
-    MODELS.with(|slot| *slot.borrow_mut() = Some(Models { hits, rows }));
+    log_window.set_rows(ModelRc::from(logs.clone()));
+    MODELS.with(|slot| *slot.borrow_mut() = Some(Models { hits, rows, logs }));
     panel.set_version_label(env!("CARGO_PKG_VERSION").into());
     sync_settings_from_config(
         &panel,
@@ -175,6 +179,7 @@ pub fn run(
                 };
                 drain(&rx, &session, &log, &tx, &wake);
                 render(&ui, &panel, &tray, &session);
+                render_logs(&log);
             });
         })
     };
@@ -182,7 +187,17 @@ pub fn run(
         *slot = Some(wake.clone());
     }
 
-    wire(&ui, &panel, &tray, &dock, &session, &log, &tx, &wake);
+    wire(
+        &ui,
+        &panel,
+        &log_window,
+        &tray,
+        &dock,
+        &session,
+        &log,
+        &tx,
+        &wake,
+    );
     platform::watch_activation({
         let ui_weak = ui.as_weak();
         move || {
@@ -196,6 +211,7 @@ pub fn run(
     });
 
     render(&ui, &panel, &tray, &session);
+    render_logs(&log);
     let minimized = start_minimized_flag
         || session
             .lock()
@@ -227,6 +243,7 @@ pub fn run(
             drain(&rx, &session, &log, &tx, &wake);
             tick(&session, &log, &tx, &wake);
             render(&ui, &panel, &tray, &session);
+            render_logs(&log);
         });
     }
 
@@ -261,6 +278,15 @@ pub fn run(
             slint::CloseRequestResponse::KeepWindowShown
         }
     });
+    log_window.window().on_close_requested({
+        let log_window = log_window.as_weak();
+        move || {
+            if let Some(log_window) = log_window.upgrade() {
+                let _ = log_window.hide();
+            }
+            slint::CloseRequestResponse::KeepWindowShown
+        }
+    });
 
     slint::run_event_loop()?;
     if let Ok(mut host) = session
@@ -279,7 +305,7 @@ pub fn run(
 fn load_session(paths: &AppPaths, log: &Log) -> Session {
     let (config, warnings) = ConfigStore::new(paths.config()).load();
     for warning in warnings {
-        log.info(warning);
+        log.warn(warning);
     }
     let now_ms = unix_time_ms(SystemTime::now());
     let (queue, queue_warnings) = if config.preserve_queue {
@@ -331,7 +357,7 @@ fn spawn_load(tx: mpsc::Sender<Msg>, paths: AppPaths, log: Arc<Log>, wake: Wake)
         let legacy = CatalogCache::new(paths.legacy_catalog());
         let (games, warning) = load_catalog_with_legacy(&current, &legacy);
         if let Some(warning) = warning {
-            log.info(warning);
+            log.warn(warning);
         }
         let games = games
             .unwrap_or_default()
@@ -366,6 +392,7 @@ fn drain(
 fn wire(
     ui: &MainWindow,
     panel: &SidePanel,
+    log_window: &LogWindow,
     tray: &TrayIcon,
     dock: &Rc<Dock>,
     session: &Arc<Mutex<Session>>,
@@ -656,7 +683,7 @@ fn wire(
                         toast_ok(&mut session, format!("Cleared {count} cached images."));
                     }
                     Err(error) => {
-                        log.info(&error);
+                        log.error(&error);
                         toast_err(&mut session, error);
                     }
                 }
@@ -665,6 +692,48 @@ fn wire(
         }
     });
     panel.on_open_logs({
+        let log_window = log_window.as_weak();
+        let log = log.clone();
+        move || {
+            if let Some(log_window) = log_window.upgrade() {
+                show_log_window(&log_window, &log);
+            }
+        }
+    });
+    log_window.on_close_requested({
+        let log_window = log_window.as_weak();
+        move || {
+            if let Some(log_window) = log_window.upgrade() {
+                let _ = log_window.hide();
+            }
+        }
+    });
+    log_window.on_copy({
+        let session = session.clone();
+        let log = log.clone();
+        let wake = wake.clone();
+        move || {
+            let text = log.history_text();
+            if text.is_empty() {
+                return;
+            }
+            if let Ok(mut session) = session.lock() {
+                match platform::copy_text(&text) {
+                    Ok(()) => toast_ok(&mut session, "Logs copied"),
+                    Err(error) => toast_err(&mut session, error),
+                }
+            }
+            wake();
+        }
+    });
+    log_window.on_clear({
+        let log = log.clone();
+        move || {
+            log.clear_history();
+            render_logs(&log);
+        }
+    });
+    log_window.on_open_folder({
         let session = session.clone();
         move || {
             if let Ok(session) = session.lock() {
@@ -1131,7 +1200,7 @@ fn apply_message(
                     session.loaded = true;
                     session.offline = false;
                     session.catalog_updated = Some(SystemTime::now());
-                    log.info(format!("Catalog refreshed: {count} supported games"));
+                    log.success(format!("Catalog refreshed: {count} supported games"));
                     if session
                         .selected
                         .as_ref()
@@ -1153,7 +1222,7 @@ fn apply_message(
                     }
                 }
                 Err(error) => {
-                    log.info(format!("Metadata refresh failed: {error}"));
+                    log.error(format!("Metadata refresh failed: {error}"));
                     session.offline = !session.games.is_empty();
                     toast_err(
                         &mut session,
@@ -1181,7 +1250,7 @@ fn apply_message(
             match result {
                 Ok(report) => {
                     session.clock.play(Instant::now());
-                    log.info(format!(
+                    log.success(format!(
                         "Runner diagnostic: PID={}, path={}, basename={}, workingDirectory={}, alive=true, HWND=0x{:X}, title={}, integrity={}",
                         report.pid,
                         report.executable.display(),
@@ -1194,7 +1263,7 @@ fn apply_message(
                     watch_exit(report.generation, report.waiter, tx.clone());
                 }
                 Err(error) => {
-                    log.info(format!("Launch failed: {error}"));
+                    log.error(format!("Launch failed: {error}"));
                     session.clock.stop();
                     if matches!(
                         session.queue.activity(),
@@ -1218,7 +1287,7 @@ fn apply_message(
         Msg::Stopped(result) => {
             session.busy = false;
             if let Err(error) = result {
-                log.info(format!("Stop failed: {error}"));
+                log.error(format!("Stop failed: {error}"));
                 toast_err(&mut session, error);
             }
             if session.quitting {
@@ -1232,7 +1301,7 @@ fn apply_message(
                 .map(|mut host| host.take_unexpected_exit(generation))
                 .unwrap_or(false);
             if unexpected {
-                log.info(format!(
+                log.warn(format!(
                     "Runner exited unexpectedly (generation {generation})"
                 ));
                 session.clock.unexpected_exit();

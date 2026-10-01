@@ -1,0 +1,185 @@
+// Detached live log console. It intentionally behaves like a normal utility window.
+
+import { Theme, Icons } from "theme.slint";
+import { Button, CaptionButton, Hairline } from "controls.slint";
+import { LogRow } from "models.slint";
+
+component LogTitleBar inherits Rectangle {
+    callback close();
+
+    height: 40px;
+    background: Theme.bg-alt;
+    WindowMoveArea {
+        width: 100%;
+        height: 100%;
+    }
+    HorizontalLayout {
+        padding-left: 14px;
+        spacing: 9px;
+        Text {
+            text: "Logs";
+            color: Theme.text;
+            font-size: Theme.text-m;
+            font-weight: 600;
+            vertical-alignment: center;
+            horizontal-stretch: 1;
+        }
+        CaptionButton {
+            icon: Icons.window-close;
+            label: "Close";
+            danger: true;
+            clicked => { root.close(); }
+        }
+    }
+}
+
+component LogLine inherits Rectangle {
+    in property <LogRow> entry;
+
+    min-height: 28px;
+    background: transparent;
+
+    HorizontalLayout {
+        padding-left: 12px;
+        padding-right: 12px;
+        padding-top: 5px;
+        padding-bottom: 5px;
+        spacing: 12px;
+
+        Text {
+            text: root.entry.time;
+            color: Theme.text-3;
+            font-size: Theme.text-s;
+            font-family: "Consolas";
+            min-width: 66px;
+            vertical-alignment: top;
+        }
+        Text {
+            text: root.entry.level;
+            color: root.entry.tone;
+            font-size: Theme.text-s;
+            font-family: "Consolas";
+            font-weight: 700;
+            min-width: 64px;
+            vertical-alignment: top;
+        }
+        Text {
+            text: root.entry.message;
+            color: Theme.text-2;
+            font-size: Theme.text-s;
+            font-family: "Consolas";
+            wrap: word-wrap;
+            horizontal-stretch: 1;
+            vertical-alignment: top;
+        }
+    }
+}
+
+export component LogWindow inherits Window {
+    title: "Logs · Game Larper";
+    icon: @image-url("../../../assets/branding/game-larper-logo.png");
+    no-frame: true;
+    resize-border-width: 6px;
+    min-width: 520px;
+    min-height: 320px;
+    preferred-width: 760px;
+    preferred-height: 460px;
+    background: Theme.bg;
+    default-font-family: Theme.font;
+    default-font-size: Theme.text-m;
+
+    in-out property <[LogRow]> rows;
+    callback close-requested();
+    callback copy();
+    callback clear();
+    callback open-folder();
+
+    forward-focus: keys;
+
+    keys := FocusScope {
+        capture-key-pressed(event) => {
+            if (event.text == Key.Escape) {
+                root.close-requested();
+                return accept;
+            }
+            reject
+        }
+
+        VerticalLayout {
+            LogTitleBar {
+                close => { root.close-requested(); }
+            }
+            Hairline { }
+
+            if root.rows.length == 0: Rectangle {
+                vertical-stretch: 1;
+                Text {
+                    text: "No live logs yet.";
+                    color: Theme.text-3;
+                    font-size: Theme.text-m;
+                    horizontal-alignment: center;
+                    vertical-alignment: center;
+                }
+            }
+
+            if root.rows.length > 0: Flickable {
+                vertical-stretch: 1;
+                content-height: lines.preferred-height;
+
+                lines := VerticalLayout {
+                    width: parent.width;
+                    spacing: 0px;
+                    for entry in root.rows: LogLine {
+                        entry: entry;
+                        width: parent.width;
+                    }
+                }
+            }
+
+            Hairline { }
+            HorizontalLayout {
+                height: 52px;
+                padding-left: 12px;
+                padding-right: 12px;
+                spacing: 8px;
+
+                Text {
+                    text: root.rows.length + (root.rows.length == 1 ? " entry" : " entries");
+                    color: Theme.text-3;
+                    font-size: Theme.text-s;
+                    vertical-alignment: center;
+                    horizontal-stretch: 1;
+                }
+                VerticalLayout {
+                    alignment: center;
+                    Button {
+                        text: "Open folder";
+                        kind: "ghost";
+                        height: 30px;
+                        clicked => { root.open-folder(); }
+                    }
+                }
+                VerticalLayout {
+                    alignment: center;
+                    Button {
+                        text: "Clear";
+                        kind: "ghost";
+                        height: 30px;
+                        enabled: root.rows.length > 0;
+                        clicked => { root.clear(); }
+                    }
+                }
+                VerticalLayout {
+                    alignment: center;
+                    Button {
+                        text: "Copy";
+                        kind: "primary";
+                        height: 30px;
+                        enabled: root.rows.length > 0;
+                        clicked => { root.copy(); }
+                    }
+                }
+            }
+        }
+    }
+}

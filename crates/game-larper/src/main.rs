@@ -25,7 +25,7 @@ fn main() -> ExitCode {
         .renderer_name("femtovg".into())
         .select()
     {
-        log.info(format!("UI backend failed: {error}"));
+        log.error(format!("UI backend failed: {error}"));
         return ExitCode::from(1);
     }
     match app::run(paths, log, minimized) {
