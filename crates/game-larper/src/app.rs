@@ -14,7 +14,7 @@ use game_larper_core::{
 use slint::{ComponentHandle, Model, ModelRc, SharedString, Timer, TimerMode, VecModel, Weak};
 
 use crate::host::{LaunchReport, RunnerHost};
-use crate::log::{Area, Log, LogChanges, LogCursor, LogEntry, LogLevel, MAX_HISTORY};
+use crate::log::{Area, Log, LogChanges, LogCursor, LogEntry, LogLevel, MAX_HISTORY, redact};
 use crate::net;
 use crate::panel::{Dock, Mode};
 use crate::platform;
@@ -313,7 +313,7 @@ pub fn run(
 }
 
 /// Config and queue load at once. The catalog is large, so it loads on a worker.
-fn load_session(paths: &AppPaths, log: &Log) -> Session {
+fn load_session(paths: &AppPaths, log: &Arc<Log>) -> Session {
     let (config, warnings) = ConfigStore::new(paths.config()).load();
     for warning in warnings {
         log.warn(Area::Settings, warning);
@@ -350,7 +350,7 @@ fn load_session(paths: &AppPaths, log: &Log) -> Session {
         active: None,
         clock: SessionClock::new(),
         queue,
-        host: Arc::new(Mutex::new(RunnerHost::new(paths.runtime()))),
+        host: Arc::new(Mutex::new(RunnerHost::new(paths.runtime(), log.clone()))),
         toast: String::new(),
         toast_kind: ToastKind::Info,
         toast_until: None,
@@ -1287,19 +1287,21 @@ fn apply_message(
                     log.success(
                         Area::Runner,
                         format!(
-                        "Runner diagnostic: PID={}, path={}, basename={}, workingDirectory={}, alive=true, HWND=0x{:X}, title={}, integrity={}",
-                        report.pid,
-                        report.executable.display(),
-                        report.basename,
-                        report.working_directory.display(),
-                        report.hwnd,
-                        report.title,
-                        report.integrity
-                    ));
+                            "Running PID={} HWND=0x{:X} title=\"{}\" integrity={} basename={} path={} cwd={} (generation {})",
+                            report.pid,
+                            report.hwnd,
+                            report.title,
+                            report.integrity,
+                            report.basename,
+                            redact(&report.executable),
+                            redact(&report.working_directory),
+                            report.generation
+                        ),
+                    );
                     watch_exit(report.generation, report.waiter, tx.clone());
                 }
                 Err(error) => {
-                    log.error(Area::Runner, format!("Launch failed: {error}"));
+                    // The cause is logged where the launch failed; this is what it means here.
                     session.clock.stop();
                     if matches!(
                         session.queue.activity(),
@@ -1314,6 +1316,10 @@ fn apply_message(
                             QueueActivity::Transition { next_index } => next_index,
                             _ => 0,
                         };
+                        log.error(
+                            Area::Queue,
+                            format!("Item {} failed to launch; queue stopped", index + 1),
+                        );
                         session.queue.fail(index, error.clone());
                     }
                     toast_err(&mut session, error);
@@ -1323,10 +1329,10 @@ fn apply_message(
         Msg::Stopped(result) => {
             session.busy = false;
             if let Err(error) = result {
-                log.error(Area::Runner, format!("Stop failed: {error}"));
                 toast_err(&mut session, error);
             }
             if session.quitting {
+                log.info(Area::App, "Runner released; leaving the event loop");
                 let _ = slint::quit_event_loop();
             }
         }
@@ -1337,14 +1343,17 @@ fn apply_message(
                 .map(|mut host| host.take_unexpected_exit(generation))
                 .unwrap_or(false);
             if unexpected {
-                log.warn(
-                    Area::Runner,
-                    format!("Runner exited unexpectedly (generation {generation})"),
-                );
                 session.clock.unexpected_exit();
                 if let QueueActivity::Running { index } | QueueActivity::Paused { index } =
                     session.queue.activity()
                 {
+                    log.error(
+                        Area::Queue,
+                        format!(
+                            "Item {} failed: the runner exited; queue stopped",
+                            index + 1
+                        ),
+                    );
                     session.queue.fail(index, "The runner exited.");
                 }
                 session.busy = false;

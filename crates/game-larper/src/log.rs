@@ -94,6 +94,34 @@ fn line_body(level: LogLevel, area: Area, message: &str) -> String {
     )
 }
 
+/// A path for a log line, with the user's profile folders replaced by their variables so a
+/// pasted log shows where files are without naming the Windows account.
+pub fn redact(path: &Path) -> String {
+    let roots = [
+        ("%LOCALAPPDATA%", std::env::var_os("LOCALAPPDATA")),
+        ("%USERPROFILE%", std::env::var_os("USERPROFILE")),
+    ];
+    redact_with(path, &roots)
+}
+
+fn redact_with(path: &Path, roots: &[(&str, Option<std::ffi::OsString>)]) -> String {
+    let text = path.display().to_string();
+    for (name, root) in roots {
+        let Some(root) = root.as_ref().and_then(|root| root.to_str()) else {
+            continue;
+        };
+        let root = root.trim_end_matches(['\\', '/']);
+        if root.is_empty() || text.len() < root.len() || !text.is_char_boundary(root.len()) {
+            continue;
+        }
+        let (head, tail) = text.split_at(root.len());
+        if head.eq_ignore_ascii_case(root) && (tail.is_empty() || tail.starts_with(['\\', '/'])) {
+            return format!("{name}{tail}");
+        }
+    }
+    text
+}
+
 /// Where a reader of the live history left off.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct LogCursor {
@@ -288,7 +316,10 @@ fn rotate(path: &Path) -> std::io::Result<()> {
 
 #[cfg(test)]
 mod tests {
-    use super::{Area, History, LogChanges, LogCursor, LogEntry, LogLevel, MAX_HISTORY};
+    use super::{
+        Area, History, LogChanges, LogCursor, LogEntry, LogLevel, MAX_HISTORY, redact_with,
+    };
+    use std::path::Path;
 
     fn push(history: &mut History, index: usize) {
         history.push(
@@ -320,6 +351,25 @@ mod tests {
             entry(LogLevel::Success).formatted(),
             "[12:34:56.789] [SUCCESS] [network] catalog refresh failed"
         );
+    }
+
+    #[test]
+    fn redaction_hides_the_account_folder_only_at_a_path_boundary() {
+        let roots = [
+            ("%LOCALAPPDATA%", Some(r"C:\Users\Kya\AppData\Local".into())),
+            ("%USERPROFILE%", Some(r"C:\Users\Kya".into())),
+        ];
+        let redact = |path: &str| redact_with(Path::new(path), &roots);
+        assert_eq!(
+            redact(r"c:\users\kya\AppData\Local\GameLarper\runtime\10\game.exe"),
+            r"%LOCALAPPDATA%\GameLarper\runtime\10\game.exe"
+        );
+        assert_eq!(
+            redact(r"C:\Users\Kya\Downloads\GameLarper.exe"),
+            r"%USERPROFILE%\Downloads\GameLarper.exe"
+        );
+        assert_eq!(redact(r"C:\Users\Kyara\file"), r"C:\Users\Kyara\file");
+        assert_eq!(redact(r"D:\Games\runner.exe"), r"D:\Games\runner.exe");
     }
 
     #[test]

@@ -1,6 +1,6 @@
 fn begin_play(
     session: &Arc<Mutex<Session>>,
-    _log: &Log,
+    log: &Arc<Log>,
     tx: &mpsc::Sender<Msg>,
     wake: &Arc<dyn Fn() + Send + Sync>,
 ) {
@@ -8,6 +8,7 @@ fn begin_play(
         return;
     };
     if guard.busy {
+        log.debug(Area::Session, "Play ignored: a launch or stop is in progress");
         return;
     }
     if matches!(
@@ -16,28 +17,38 @@ fn begin_play(
             | QueueActivity::Paused { .. }
             | QueueActivity::Transition { .. }
     ) {
+        log.debug(Area::Session, "Play ignored: the queue owns the runner");
         toast(&mut guard, "Stop the queue before playing one game.");
         return;
     }
     let Some(id) = guard.selected.clone() else {
+        log.debug(Area::Session, "Play ignored: no game selected");
         toast(&mut guard, "Select a game first.");
         return;
     };
     let Some(game) = guard.games.iter().find(|game| game.id == id).cloned() else {
+        log.warn(
+            Area::Session,
+            format!("Play refused: application {id} is not a supported game in the catalog"),
+        );
         toast_err(&mut guard, "That game is no longer supported.");
         return;
     };
+    log.info(
+        Area::Session,
+        format!("Play requested: {} ({})", game.name, game.id),
+    );
     guard.busy = true;
     guard.active = Some(game.id.clone());
     let host = guard.host.clone();
     let images = guard.paths.images();
     drop(guard);
-    spawn_launch(host, images, game, tx.clone(), wake.clone());
+    spawn_launch(host, images, game, log.clone(), tx.clone(), wake.clone());
 }
 
 fn begin_pause(
     session: &Arc<Mutex<Session>>,
-    log: &Log,
+    log: &Arc<Log>,
     tx: &mpsc::Sender<Msg>,
     wake: &Arc<dyn Fn() + Send + Sync>,
 ) {
@@ -50,10 +61,12 @@ fn begin_pause(
             QueueActivity::Running { .. } | QueueActivity::Transition { .. }
         );
         if queued {
+            log.info(Area::Queue, "Pause requested from the transport controls");
             let action = guard.queue.pause(Instant::now());
             guard.clock.pause(Instant::now());
             Some(action)
         } else if guard.clock.state() == SessionState::Playing {
+            log.info(Area::Session, "Pause requested");
             guard.clock.pause(Instant::now());
             Some(QueueAction {
                 stop_runner: true,
@@ -70,12 +83,19 @@ fn begin_pause(
 
 fn begin_stop(
     session: &Arc<Mutex<Session>>,
-    log: &Log,
+    log: &Arc<Log>,
     tx: &mpsc::Sender<Msg>,
     wake: &Arc<dyn Fn() + Send + Sync>,
     clear_manual: bool,
 ) {
     let action = session.lock().ok().map(|mut guard| {
+        let queue_active = guard.queue.active_index().is_some();
+        if clear_manual {
+            log.info(Area::Session, "Stop requested");
+        }
+        if queue_active {
+            log.info(Area::Queue, "Queue stopped");
+        }
         let mut action = guard.queue.stop();
         guard.clock.stop();
         // The queue only reports its own runner. A manual session owns one too.
@@ -89,7 +109,7 @@ fn begin_stop(
 
 fn begin_quit(
     session: &Arc<Mutex<Session>>,
-    log: &Log,
+    log: &Arc<Log>,
     tx: &mpsc::Sender<Msg>,
     wake: &Arc<dyn Fn() + Send + Sync>,
 ) {
@@ -132,7 +152,7 @@ fn should_stop_clock_for_dispatch(
 
 fn dispatch_queue_action(
     session: &Arc<Mutex<Session>>,
-    _log: &Log,
+    log: &Arc<Log>,
     tx: &mpsc::Sender<Msg>,
     wake: &Arc<dyn Fn() + Send + Sync>,
     action: QueueAction,
@@ -140,6 +160,18 @@ fn dispatch_queue_action(
     let Ok(mut guard) = session.lock() else {
         return;
     };
+    if action.stop_runner || action.launch_index.is_some() {
+        log.debug(
+            Area::Session,
+            format!(
+                "Runner action: stop={} launch={}",
+                action.stop_runner,
+                action
+                    .launch_index
+                    .map_or("none".to_string(), |index| format!("item {}", index + 1))
+            ),
+        );
+    }
     let activity = guard.queue.activity();
     if should_stop_clock_for_dispatch(&activity, guard.clock.state(), &action) {
         guard.clock.stop();
@@ -156,9 +188,20 @@ fn dispatch_queue_action(
             .cloned();
         guard.selected = Some(item.application_id.clone());
         guard.active = Some(item.application_id.clone());
-        guard.config.last_selected_discord_application_id = Some(item.application_id);
-        let _ = ConfigStore::new(guard.paths.config()).save(&guard.config);
+        guard.config.last_selected_discord_application_id = Some(item.application_id.clone());
+        if let Err(error) = ConfigStore::new(guard.paths.config()).save(&guard.config) {
+            log.error(Area::Settings, format!("Config save failed: {error}"));
+        }
         game.or_else(|| {
+            log.warn(
+                Area::Queue,
+                format!(
+                    "Item {} ({}, {}) is not a supported game in the current catalog",
+                    index + 1,
+                    item.name,
+                    item.application_id
+                ),
+            );
             toast_err(
                 &mut guard,
                 format!("{} is not in the current catalog.", item.name),
@@ -181,6 +224,7 @@ fn dispatch_queue_action(
     }
     let tx = tx.clone();
     let wake = wake.clone();
+    let log = log.clone();
     std::thread::spawn(move || {
         let stop_result = if action.stop_runner {
             host.lock().unwrap_or_else(|p| p.into_inner()).stop()
@@ -193,7 +237,7 @@ fn dispatch_queue_action(
             return;
         }
         if let Some(game) = launch {
-            spawn_launch_blocking(host, images, game, tx, wake);
+            spawn_launch_blocking(host, images, game, log, tx, wake);
         } else {
             let _ = tx.send(Msg::Stopped(Ok(())));
             wake();
@@ -205,16 +249,18 @@ fn spawn_launch(
     host: Arc<Mutex<RunnerHost>>,
     images: PathBuf,
     game: GameDefinition,
+    log: Arc<Log>,
     tx: mpsc::Sender<Msg>,
     wake: Arc<dyn Fn() + Send + Sync>,
 ) {
-    std::thread::spawn(move || spawn_launch_blocking(host, images, game, tx, wake));
+    std::thread::spawn(move || spawn_launch_blocking(host, images, game, log, tx, wake));
 }
 
 fn spawn_launch_blocking(
     host: Arc<Mutex<RunnerHost>>,
     images: PathBuf,
     game: GameDefinition,
+    log: Arc<Log>,
     tx: mpsc::Sender<Msg>,
     wake: Arc<dyn Fn() + Send + Sync>,
 ) {
@@ -224,13 +270,40 @@ fn spawn_launch_blocking(
         .map(|path| path.to_string_lossy().replace('\\', "/"));
     let result = match (template, relative) {
         (Ok(template), Some(relative)) => {
+            log.info(
+                Area::Runner,
+                format!(
+                    "Launching {} for application {} as {relative}",
+                    game.name, game.id
+                ),
+            );
+            log.debug(
+                Area::Runner,
+                format!(
+                    "Template {}; {} Windows executable rule(s) in the catalog",
+                    redact(&template),
+                    game.executables.len()
+                ),
+            );
             let icon = net::ensure_artwork(&images, &game);
             host.lock()
                 .unwrap_or_else(|poison| poison.into_inner())
                 .launch(&template, &game.id, &relative, icon.as_deref())
         }
-        (Err(error), _) => Err(error),
-        (_, None) => Err("This game has no safe Windows executable.".into()),
+        (Err(error), _) => {
+            log.error(Area::Runner, format!("Cannot launch {}: {error}", game.name));
+            Err(error)
+        }
+        (_, None) => {
+            log.error(
+                Area::Runner,
+                format!(
+                    "Cannot launch {} ({}): no safe Windows executable rule",
+                    game.name, game.id
+                ),
+            );
+            Err("This game has no safe Windows executable.".into())
+        }
     };
     let _ = tx.send(Msg::Launch(result));
     wake();
@@ -270,7 +343,7 @@ fn spawn_refresh(
 
 fn select_index(
     session: &Arc<Mutex<Session>>,
-    log: &Log,
+    log: &Arc<Log>,
     tx: &mpsc::Sender<Msg>,
     wake: &Wake,
     index: usize,
@@ -431,7 +504,7 @@ fn persist_queue(session: &mut Session) {
 
 fn queue_command(
     session: &Arc<Mutex<Session>>,
-    log: &Log,
+    log: &Arc<Log>,
     tx: &mpsc::Sender<Msg>,
     wake: &Arc<dyn Fn() + Send + Sync>,
     command: impl FnOnce(&mut QueueMachine) -> Result<QueueAction, game_larper_core::Error>,
