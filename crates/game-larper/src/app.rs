@@ -14,7 +14,7 @@ use game_larper_core::{
 use slint::{ComponentHandle, Model, ModelRc, SharedString, Timer, TimerMode, VecModel, Weak};
 
 use crate::host::{LaunchReport, RunnerHost};
-use crate::log::Log;
+use crate::log::{Log, LogLevel};
 use crate::net;
 use crate::panel::{Dock, Mode};
 use crate::platform;
@@ -36,6 +36,7 @@ const CATALOG_STALE: Duration = Duration::from_secs(24 * 60 * 60);
 struct Models {
     hits: Rc<VecModel<Hit>>,
     rows: Rc<VecModel<QueueRow>>,
+    logs: Rc<VecModel<LogRow>>,
 }
 
 thread_local! {
@@ -127,6 +128,7 @@ pub fn run(
     let log = Arc::new(log);
     let ui = MainWindow::new()?;
     let panel = SidePanel::new()?;
+    let log_window = LogWindow::new()?;
     let tray = TrayIcon::new()?;
     let dock = Dock::new(&ui, &panel);
     let (tx, rx) = mpsc::channel();
@@ -134,9 +136,11 @@ pub fn run(
     let session = Arc::new(Mutex::new(load_session(&paths, &log)));
     let hits = Rc::new(VecModel::from(Vec::<Hit>::new()));
     let rows = Rc::new(VecModel::from(Vec::<QueueRow>::new()));
+    let logs = Rc::new(VecModel::from(Vec::<LogRow>::new()));
     ui.set_hits(ModelRc::from(hits.clone()));
     panel.set_queue_rows(ModelRc::from(rows.clone()));
-    MODELS.with(|slot| *slot.borrow_mut() = Some(Models { hits, rows }));
+    log_window.set_rows(ModelRc::from(logs.clone()));
+    MODELS.with(|slot| *slot.borrow_mut() = Some(Models { hits, rows, logs }));
     panel.set_version_label(env!("CARGO_PKG_VERSION").into());
     sync_settings_from_config(
         &panel,
@@ -175,6 +179,8 @@ pub fn run(
                 };
                 drain(&rx, &session, &log, &tx, &wake);
                 render(&ui, &panel, &tray, &session);
+    render_logs(&log);
+                render_logs(&log);
             });
         })
     };
@@ -182,7 +188,17 @@ pub fn run(
         *slot = Some(wake.clone());
     }
 
-    wire(&ui, &panel, &tray, &dock, &session, &log, &tx, &wake);
+    wire(
+        &ui,
+        &panel,
+        &log_window,
+        &tray,
+        &dock,
+        &session,
+        &log,
+        &tx,
+        &wake,
+    );
     platform::watch_activation({
         let ui_weak = ui.as_weak();
         move || {
@@ -227,6 +243,7 @@ pub fn run(
             drain(&rx, &session, &log, &tx, &wake);
             tick(&session, &log, &tx, &wake);
             render(&ui, &panel, &tray, &session);
+            render_logs(&log);
         });
     }
 
@@ -261,6 +278,15 @@ pub fn run(
             slint::CloseRequestResponse::KeepWindowShown
         }
     });
+    log_window.window().on_close_requested({
+        let log_window = log_window.as_weak();
+        move || {
+            if let Some(log_window) = log_window.upgrade() {
+                let _ = log_window.hide();
+            }
+            slint::CloseRequestResponse::KeepWindowShown
+        }
+    });
 
     slint::run_event_loop()?;
     if let Ok(mut host) = session
@@ -279,7 +305,7 @@ pub fn run(
 fn load_session(paths: &AppPaths, log: &Log) -> Session {
     let (config, warnings) = ConfigStore::new(paths.config()).load();
     for warning in warnings {
-        log.info(warning);
+        log.warn(warning);
     }
     let now_ms = unix_time_ms(SystemTime::now());
     let (queue, queue_warnings) = if config.preserve_queue {
