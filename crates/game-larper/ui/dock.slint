@@ -256,7 +256,7 @@ export component UtilityBar inherits Rectangle {
             IconButton {
                 icon: Icons.settings;
                 tip: "Settings";
-                tip-above: true;
+                show-tip: false;
                 checked: root.settings-open;
                 clicked => { root.settings(); }
             }
