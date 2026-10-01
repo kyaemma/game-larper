@@ -24,6 +24,10 @@ The parent copies that binary under `%LOCALAPPDATA%\GameLarper\runtime\<applicat
 
 If the destination file already exists and is not this runner, it is left alone and the launch uses `runtime\<id>\session-…\` in front of the same relative suffix, so Discord still sees `game\eldenring.exe`.
 
+## Linux
+
+The Linux runner and its open questions are described separately in [LINUX.md](LINUX.md). Nothing in this file has been verified on Linux.
+
 ## Manual checklist
 
 Do not treat a green test run as proof that Discord Desktop recognized the game.
