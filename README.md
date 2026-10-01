@@ -5,9 +5,9 @@
 <h1 align="center">LARPINNNGGG</h1>
 
 <p align="center">
-Pick a game.<br>
-Press play.<br>
-Discord gets lied to.
+Pick a game<br>
+Press play<br>
+Discord gets lied to
 </p>
 
 <p align="center">You are now gaming. Allegedly.</p>
