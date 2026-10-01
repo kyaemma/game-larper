@@ -179,7 +179,6 @@ pub fn run(
                 };
                 drain(&rx, &session, &log, &tx, &wake);
                 render(&ui, &panel, &tray, &session);
-    render_logs(&log);
                 render_logs(&log);
             });
         })
@@ -212,6 +211,7 @@ pub fn run(
     });
 
     render(&ui, &panel, &tray, &session);
+    render_logs(&log);
     let minimized = start_minimized_flag
         || session
             .lock()
@@ -357,7 +357,7 @@ fn spawn_load(tx: mpsc::Sender<Msg>, paths: AppPaths, log: Arc<Log>, wake: Wake)
         let legacy = CatalogCache::new(paths.legacy_catalog());
         let (games, warning) = load_catalog_with_legacy(&current, &legacy);
         if let Some(warning) = warning {
-            log.info(warning);
+            log.warn(warning);
         }
         let games = games
             .unwrap_or_default()
@@ -683,7 +683,7 @@ fn wire(
                         toast_ok(&mut session, format!("Cleared {count} cached images."));
                     }
                     Err(error) => {
-                        log.info(&error);
+                        log.error(&error);
                         toast_err(&mut session, error);
                     }
                 }
