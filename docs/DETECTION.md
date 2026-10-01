@@ -40,4 +40,4 @@ Do not treat a green test run as proof that Discord Desktop recognized the game.
 10. Stop and wait for it to disappear.
 11. Quit Game Larper from the tray and confirm the fake process is gone.
 
-Correct status before that human check: READY FOR MANUAL DISCORD VERIFICATION.
+The development build has been manually verified with ELDEN RING on Discord Desktop. That is evidence that the detection path works, not a guarantee that every game or future Discord client build will behave the same way.
