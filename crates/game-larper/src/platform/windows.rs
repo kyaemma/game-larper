@@ -5,8 +5,9 @@ use std::ffi::c_void;
 use std::path::Path;
 use std::process::Command;
 
+use crate::log::Log;
 use crate::platform::WorkArea;
-use game_larper_core::format_startup_command;
+use game_larper_core::{AppPaths, format_startup_command};
 use windows_sys::Win32::Foundation::{
     CloseHandle, ERROR_ALREADY_EXISTS, GetLastError, HANDLE, HWND, LPARAM, WPARAM,
 };
@@ -43,7 +44,9 @@ const CF_UNICODETEXT: u32 = 13;
 /// DWM draws this 1px outline around both windows on Windows 11 (COLORREF, 0x00BBGGRR).
 const BORDER_COLOR: u32 = 0x003A_2F26;
 
-pub fn claim_primary_instance() -> bool {
+/// Become the primary instance, or wake the one already running and return false. A named
+/// mutex per session; the paths and log are only used on Linux.
+pub fn claim_primary_instance(_paths: &AppPaths, _log: &Log) -> bool {
     let name = wide(MUTEX_NAME);
     let mutex = unsafe { CreateMutexW(std::ptr::null(), 1, name.as_ptr()) };
     if mutex.is_null() {
@@ -75,6 +78,11 @@ pub fn watch_activation(on_signal: impl Fn() + Send + 'static) {
             }
         }
     });
+}
+
+/// Nothing to add to the startup log on Windows.
+pub fn describe_session() -> Option<String> {
+    None
 }
 
 fn signal_activation() {

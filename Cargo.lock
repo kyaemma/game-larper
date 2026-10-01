@@ -1389,9 +1389,11 @@ dependencies = [
 name = "game-larper"
 version = "0.1.0"
 dependencies = [
+ "arboard",
  "chrono",
  "game-larper-core",
  "image",
+ "libc",
  "raw-window-handle",
  "serde",
  "serde_json",

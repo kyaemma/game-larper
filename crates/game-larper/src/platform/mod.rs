@@ -2,9 +2,13 @@
 //! into a target module directly; anything only one target has (the Win32 integrity level,
 //! window icons) is called from that target's code alone.
 
+#[cfg(target_os = "linux")]
+mod linux;
 #[cfg(windows)]
 mod windows;
 
+#[cfg(target_os = "linux")]
+pub use linux::*;
 #[cfg(windows)]
 pub use windows::*;
 
