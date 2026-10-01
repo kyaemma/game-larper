@@ -38,6 +38,11 @@ jobs:
           rustc --version
           cargo --version
 
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: windows-x64
+
       - name: Build release
         shell: pwsh
         run: .\scripts\build-release.ps1
