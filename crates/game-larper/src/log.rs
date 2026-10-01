@@ -95,27 +95,69 @@ fn line_body(level: LogLevel, area: Area, message: &str) -> String {
 }
 
 /// A path for a log line, with the user's profile folders replaced by their variables so a
-/// pasted log shows where files are without naming the Windows account.
+/// pasted log shows where files are without naming the account.
 pub fn redact(path: &Path) -> String {
+    #[cfg(windows)]
     let roots = [
         ("%LOCALAPPDATA%", std::env::var_os("LOCALAPPDATA")),
         ("%USERPROFILE%", std::env::var_os("USERPROFILE")),
     ];
-    redact_with(path, &roots)
+    // Most specific first: both XDG directories usually sit inside the home directory.
+    #[cfg(target_os = "linux")]
+    let roots = [
+        ("$XDG_RUNTIME_DIR", std::env::var_os("XDG_RUNTIME_DIR")),
+        ("$XDG_DATA_HOME", std::env::var_os("XDG_DATA_HOME")),
+        ("~", std::env::var_os("HOME")),
+    ];
+    redact_with(path, &roots, PathRules::NATIVE)
 }
 
-fn redact_with(path: &Path, roots: &[(&str, Option<std::ffi::OsString>)]) -> String {
+/// How paths compare on a target: Windows ignores ASCII case and accepts both separators,
+/// Linux compares bytes exactly and only knows `/`.
+#[derive(Clone, Copy)]
+struct PathRules {
+    ignore_case: bool,
+    separators: &'static [char],
+}
+
+impl PathRules {
+    #[cfg_attr(not(windows), allow(dead_code))]
+    const WINDOWS: Self = Self {
+        ignore_case: true,
+        separators: &['\\', '/'],
+    };
+    #[cfg_attr(windows, allow(dead_code))]
+    const LINUX: Self = Self {
+        ignore_case: false,
+        separators: &['/'],
+    };
+    #[cfg(windows)]
+    const NATIVE: Self = Self::WINDOWS;
+    #[cfg(target_os = "linux")]
+    const NATIVE: Self = Self::LINUX;
+}
+
+fn redact_with(
+    path: &Path,
+    roots: &[(&str, Option<std::ffi::OsString>)],
+    rules: PathRules,
+) -> String {
     let text = path.display().to_string();
     for (name, root) in roots {
         let Some(root) = root.as_ref().and_then(|root| root.to_str()) else {
             continue;
         };
-        let root = root.trim_end_matches(['\\', '/']);
+        let root = root.trim_end_matches(rules.separators);
         if root.is_empty() || text.len() < root.len() || !text.is_char_boundary(root.len()) {
             continue;
         }
         let (head, tail) = text.split_at(root.len());
-        if head.eq_ignore_ascii_case(root) && (tail.is_empty() || tail.starts_with(['\\', '/'])) {
+        let same = if rules.ignore_case {
+            head.eq_ignore_ascii_case(root)
+        } else {
+            head == root
+        };
+        if same && (tail.is_empty() || tail.starts_with(rules.separators)) {
             return format!("{name}{tail}");
         }
     }
@@ -317,7 +359,8 @@ fn rotate(path: &Path) -> std::io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::{
-        Area, History, LogChanges, LogCursor, LogEntry, LogLevel, MAX_HISTORY, redact_with,
+        Area, History, LogChanges, LogCursor, LogEntry, LogLevel, MAX_HISTORY, PathRules,
+        redact_with,
     };
     use std::path::Path;
 
@@ -359,7 +402,7 @@ mod tests {
             ("%LOCALAPPDATA%", Some(r"C:\Users\Kya\AppData\Local".into())),
             ("%USERPROFILE%", Some(r"C:\Users\Kya".into())),
         ];
-        let redact = |path: &str| redact_with(Path::new(path), &roots);
+        let redact = |path: &str| redact_with(Path::new(path), &roots, PathRules::WINDOWS);
         assert_eq!(
             redact(r"c:\users\kya\AppData\Local\GameLarper\runtime\10\game.exe"),
             r"%LOCALAPPDATA%\GameLarper\runtime\10\game.exe"
@@ -370,6 +413,33 @@ mod tests {
         );
         assert_eq!(redact(r"C:\Users\Kyara\file"), r"C:\Users\Kyara\file");
         assert_eq!(redact(r"D:\Games\runner.exe"), r"D:\Games\runner.exe");
+    }
+
+    #[test]
+    fn linux_redaction_is_exact_and_prefers_the_most_specific_root() {
+        let roots = [
+            ("$XDG_RUNTIME_DIR", Some("/run/user/1000".into())),
+            ("$XDG_DATA_HOME", Some("/home/kya/.local/share/".into())),
+            ("~", Some("/home/kya".into())),
+        ];
+        let redact = |path: &str| redact_with(Path::new(path), &roots, PathRules::LINUX);
+        assert_eq!(
+            redact("/home/kya/.local/share/GameLarper/runtime/10/game/eldenring.exe"),
+            "$XDG_DATA_HOME/GameLarper/runtime/10/game/eldenring.exe"
+        );
+        assert_eq!(
+            redact("/home/kya/src/game-larper/target/debug/game-larper-runner"),
+            "~/src/game-larper/target/debug/game-larper-runner"
+        );
+        assert_eq!(
+            redact("/run/user/1000/game-larper.sock"),
+            "$XDG_RUNTIME_DIR/game-larper.sock"
+        );
+        // Linux paths are case-sensitive and only `/` separates components.
+        assert_eq!(redact("/home/Kya/file"), "/home/Kya/file");
+        assert_eq!(redact("/home/kyara/file"), "/home/kyara/file");
+        assert_eq!(redact(r"/home/kya\file"), r"/home/kya\file");
+        assert_eq!(redact("/opt/games/runner"), "/opt/games/runner");
     }
 
     #[test]

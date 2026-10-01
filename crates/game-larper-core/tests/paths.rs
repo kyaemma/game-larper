@@ -54,3 +54,22 @@ fn path_rejects_absolute_traversal_and_device_names() {
     let error = resolve_executable(Path::new(r"C:\temp"), "../1", "game.exe").unwrap_err();
     assert!(matches!(error, Error::InvalidApplicationId));
 }
+
+#[test]
+fn xdg_data_home_prefers_an_absolute_xdg_value_then_home() {
+    use game_larper_core::xdg_data_home;
+    let some = |value: &str| Some(std::ffi::OsString::from(value));
+    assert_eq!(
+        xdg_data_home(some("/data/kya"), some("/home/kya")),
+        Some(PathBuf::from("/data/kya"))
+    );
+    // The base-directory spec says relative and empty values are invalid and ignored.
+    for ignored in ["relative/data", ""] {
+        assert_eq!(
+            xdg_data_home(some(ignored), some("/home/kya")),
+            Some(Path::new("/home/kya").join(".local").join("share"))
+        );
+    }
+    assert_eq!(xdg_data_home(None, some("relative-home")), None);
+    assert_eq!(xdg_data_home(None, None), None);
+}
