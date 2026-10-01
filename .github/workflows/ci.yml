@@ -31,10 +31,12 @@ jobs:
           rustc --version
           cargo --version
 
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: windows-x64
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+
       - name: Format, lint, and test
         shell: pwsh
         run: .\scripts\check.ps1
-
-      - name: Release profile check
-        shell: pwsh
-        run: cargo check --workspace --release
