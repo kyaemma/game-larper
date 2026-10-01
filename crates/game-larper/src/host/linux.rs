@@ -9,7 +9,9 @@
 //!   forked, and launches happen on short-lived worker threads.)
 //! - **Diagnostics and exit.** The runner's stderr is drained by one thread per runner, which
 //!   forwards protocol lines (bounded) into the structured log, hands over the single `ready`
-//!   line, and fires the exit watch at EOF — the runner's stderr only closes when it exits.
+//!   line, and fires the exit watch at EOF. The runner is one process and starts no children,
+//!   so its stderr closes exactly when it exits; anything inheriting that pipe would delay the
+//!   signal, which is why the runner must stay childless.
 //! - **Stop.** Close the lifeline, wait; then `SIGTERM`, wait; then `SIGKILL`, wait. Signals go
 //!   to our own unreaped child, so its pid cannot have been reused. Then reap, then clean up.
 
@@ -520,16 +522,18 @@ mod tests {
     use std::sync::{Arc, Mutex};
     use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
-    /// Speaks the protocol, then holds the lifeline open with `cat`: exits exactly at EOF.
+    /// Speaks the protocol, then becomes `cat` holding the lifeline open: exits exactly at EOF.
+    /// `exec` keeps it a single process like the real runner; a child `cat` would inherit
+    /// stderr and keep the exit watch from firing until it died too.
     const STAND_IN: &str = r"printf 'GLR\tlog\tdebug\tstand-in up\n' >&2
 printf 'GLR\tready\tnone\t0x0\teldenring\n' >&2
-cat >/dev/null";
+exec cat >/dev/null";
 
     /// Two thousand diagnostics before `ready`, far more than the pipe buffer holds.
     const CHATTY: &str = r"i=0
 while [ $i -lt 2000 ]; do printf 'GLR\tlog\tdebug\tline %s\n' $i >&2; i=$((i+1)); done
 printf 'GLR\tready\tnone\t0x0\teldenring\n' >&2
-cat >/dev/null";
+exec cat >/dev/null";
 
     /// A scratch directory with its own log and stand-in runner templates.
     struct Scratch {
