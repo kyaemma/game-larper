@@ -21,6 +21,7 @@ if (Test-Path $out) { Remove-Item $out -Recurse -Force }
 New-Item -ItemType Directory -Path $out | Out-Null
 Copy-Item 'target\release\game-larper.exe' (Join-Path $out 'GameLarper.exe')
 Copy-Item 'target\release\game-larper-runner.exe' (Join-Path $out 'GameLarper.Runner.exe')
+Copy-Item 'LICENSE' (Join-Path $out 'LICENSE')
 if (-not (Test-Path (Join-Path $out 'GameLarper.Runner.exe'))) {
     throw 'Runner missing from the release folder.'
 }
