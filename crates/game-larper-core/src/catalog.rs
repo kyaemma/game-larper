@@ -3,9 +3,8 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
-use serde_json::Value;
-
 use crate::atomic;
+use crate::catalog_json::Catalog;
 use crate::error::Error;
 use crate::safe_path::{normalize_executable, separator_count};
 
@@ -96,98 +95,20 @@ fn is_excluded(path: &Path) -> bool {
 }
 
 pub fn parse_catalog(json: &str) -> Result<Vec<GameDefinition>, Error> {
-    let value: Value = serde_json::from_str(json)?;
-    let Some(items) = value.as_array() else {
-        return Err(Error::Format(
-            "The detectable catalog is not an array.".into(),
-        ));
+    let games = match serde_json::from_str(json)? {
+        Catalog::Games(games) => games,
+        Catalog::NotAnArray => {
+            return Err(Error::Format(
+                "The detectable catalog is not an array.".into(),
+            ));
+        }
     };
-    let mut games = Vec::new();
-    for item in items {
-        let Some(game) = parse_game(item) else {
-            continue;
-        };
-        games.push(game);
-    }
     if games.is_empty() {
         return Err(Error::Format(
             "The detectable catalog contains no valid games.".into(),
         ));
     }
     Ok(games)
-}
-
-fn parse_game(value: &Value) -> Option<GameDefinition> {
-    let object = value.as_object()?;
-    let id = text(object, "id")?;
-    if id.is_empty() || !id.bytes().all(|byte| byte.is_ascii_digit()) {
-        return None;
-    }
-    let name = text(object, "name")?.trim().to_string();
-    if name.is_empty() {
-        return None;
-    }
-    let mut aliases = Vec::new();
-    if let Some(items) = object.get("aliases").and_then(Value::as_array) {
-        for alias in items {
-            if let Some(alias) = alias.as_str()
-                && !alias.trim().is_empty()
-            {
-                aliases.push(alias.to_string());
-            }
-        }
-    }
-    let mut executables = Vec::new();
-    if let Some(items) = object.get("executables").and_then(Value::as_array) {
-        for executable in items {
-            let Some(executable) = executable.as_object() else {
-                continue;
-            };
-            if !text(executable, "os").is_some_and(|os| os.eq_ignore_ascii_case("win32")) {
-                continue;
-            }
-            let Some(path) = text(executable, "name") else {
-                continue;
-            };
-            let is_launcher = executable.get("is_launcher").and_then(Value::as_bool) == Some(true);
-            executables.push(ExecutableDefinition {
-                name: path,
-                is_launcher,
-            });
-        }
-    }
-    Some(GameDefinition {
-        id,
-        name,
-        aliases,
-        executables,
-        steam_app_id: steam_app_id(object),
-        icon_hash: text(object, "icon_hash").or_else(|| text(object, "icon")),
-        cover_image_hash: text(object, "cover_image_hash"),
-    })
-}
-
-fn steam_app_id(object: &serde_json::Map<String, Value>) -> Option<String> {
-    let skus = object.get("third_party_skus")?.as_array()?;
-    for sku in skus {
-        let Some(sku) = sku.as_object() else {
-            continue;
-        };
-        if !text(sku, "distributor").is_some_and(|name| name.eq_ignore_ascii_case("steam")) {
-            continue;
-        }
-        let Some(id) = text(sku, "id") else {
-            continue;
-        };
-        if !id.is_empty() && id.len() <= 12 && id.bytes().all(|byte| byte.is_ascii_digit()) {
-            return Some(id);
-        }
-    }
-    None
-}
-
-fn text(object: &serde_json::Map<String, Value>, name: &str) -> Option<String> {
-    object.get(name).and_then(Value::as_str).map(str::to_string)
 }
 
 /// Keep the first record for an id and fill gaps from later providers.

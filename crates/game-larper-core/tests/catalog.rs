@@ -91,6 +91,85 @@ fn catalog_rejects_empty_or_malformed_responses() {
 }
 
 #[test]
+fn invalid_entries_are_skipped_without_failing_the_catalog() {
+    let json = r#"[7, null, "text", [1, [2]], {}, true,
+        {"id":"1","name":"Kept"},
+        {"id":1,"name":"Numeric id"}, {"id":"x2","name":"Letters"}, {"id":"","name":"Empty id"},
+        {"id":"3","name":"   "}, {"id":"4"}, {"name":"No id"},
+        {"id":"5","name":" Also kept "}]"#;
+    let games = parse_catalog(json).unwrap();
+    let names: Vec<_> = games.iter().map(|game| game.name.as_str()).collect();
+    assert_eq!(names, ["Kept", "Also kept"]);
+}
+
+#[test]
+fn wrong_typed_fields_count_as_absent_and_unknown_fields_are_skipped() {
+    let json = r#"[{"id":"1","name":"A","aliases":"not a list","executables":{"name":"a.exe"},
+        "third_party_skus":"steam","icon_hash":5,"icon":"fallback","cover_image_hash":null,
+        "future":{"deep":[1,2,{"x":null}],"n":1e30}}]"#;
+    let game = parse_catalog(json).unwrap().pop().unwrap();
+    assert!(game.aliases.is_empty());
+    assert!(game.executables.is_empty());
+    assert_eq!(game.steam_app_id, None);
+    assert_eq!(game.icon_hash.as_deref(), Some("fallback"));
+
+    let json = r#"[{"id":"2","name":"B","aliases":[1,"keep"," ",null,["x"],{"y":1},"also"],
+        "executables":[3,null,"s",[1],{"os":"win32"},{"name":5,"os":"win32"},{"name":"a.exe","os":5},
+                       {"name":"b.exe","os":"WIN32","is_launcher":"yes"},
+                       {"name":"c.exe","os":"win32","is_launcher":true}],
+        "third_party_skus":[3,{"distributor":"steam","id":"12345678901234"},{"distributor":"Steam","id":"77"},
+                            {"distributor":"steam","id":"88"}]}]"#;
+    let game = parse_catalog(json).unwrap().pop().unwrap();
+    assert_eq!(game.aliases, ["keep", "also"]);
+    let executables: Vec<_> = game
+        .executables
+        .iter()
+        .map(|executable| (executable.name.as_str(), executable.is_launcher))
+        .collect();
+    assert_eq!(executables, [("b.exe", false), ("c.exe", true)]);
+    assert_eq!(game.steam_app_id.as_deref(), Some("77"));
+}
+
+#[test]
+fn repeated_and_escaped_keys_behave_like_a_json_object() {
+    // The last value of a repeated key wins, even when it has the wrong type.
+    let json = r#"[{"id":"1","name":"First","name":"Second"},
+                   {"id":"2","name":"Third","id":9},
+                   {"id":"3","name":"Café"}]"#;
+    let games = parse_catalog(json).unwrap();
+    let seen: Vec<_> = games
+        .iter()
+        .map(|game| (game.id.as_str(), game.name.as_str()))
+        .collect();
+    assert_eq!(seen, [("1", "Second"), ("3", "Café")]);
+}
+
+#[test]
+fn only_an_array_is_a_catalog_and_only_bad_syntax_is_a_json_error() {
+    for not_an_array in ["{}", r#"{"id":"1"}"#, "null", "5", "true", r#""text""#] {
+        assert!(
+            matches!(
+                parse_catalog(not_an_array),
+                Err(game_larper_core::Error::Format(_))
+            ),
+            "{not_an_array}"
+        );
+    }
+    for broken in [
+        "",
+        r#"[{"id":"1","name":"A"}"#,
+        r#"[{"id":"1","name":"A"}] trailing"#,
+        r#"[{"id":"1","name":"A"},]"#,
+        "{not json",
+    ] {
+        assert!(
+            matches!(parse_catalog(broken), Err(game_larper_core::Error::Json(_))),
+            "{broken}"
+        );
+    }
+}
+
+#[test]
 fn excluded_basename_is_not_a_supported_path() {
     let game = GameDefinition {
         id: "9".into(),

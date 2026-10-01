@@ -5,6 +5,7 @@
 
 mod atomic;
 mod catalog;
+mod catalog_json;
 mod config;
 mod error;
 mod paths;
