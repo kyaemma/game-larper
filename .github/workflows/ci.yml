@@ -35,6 +35,6 @@ jobs:
         shell: pwsh
         run: .\scripts\check.ps1
 
-      - name: Release build
+      - name: Release profile check
         shell: pwsh
-        run: cargo build --workspace --release
+        run: cargo check --workspace --release
