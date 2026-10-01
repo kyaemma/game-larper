@@ -73,3 +73,13 @@ fn xdg_data_home_prefers_an_absolute_xdg_value_then_home() {
     assert_eq!(xdg_data_home(None, some("relative-home")), None);
     assert_eq!(xdg_data_home(None, None), None);
 }
+
+#[test]
+fn only_the_temporary_root_counts_as_a_fallback() {
+    use game_larper_core::AppPaths;
+    let temp = std::env::temp_dir();
+    assert!(AppPaths::from_root(temp.join("GameLarper")).is_fallback());
+    // A real per-user root that merely lives under the temp folder is not the fallback.
+    assert!(!AppPaths::from_root(temp.join("claude").join("GameLarper")).is_fallback());
+    assert!(!AppPaths::from_root(PathBuf::from("/home/kya/.local/share/GameLarper")).is_fallback());
+}

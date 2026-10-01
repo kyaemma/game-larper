@@ -44,7 +44,7 @@ impl AppPaths {
 
     /// True when the root is the last-resort temporary directory instead of a per-user one.
     pub fn is_fallback(&self) -> bool {
-        self.root.starts_with(std::env::temp_dir())
+        self.root == std::env::temp_dir().join("GameLarper")
     }
 
     pub fn config(&self) -> PathBuf {
