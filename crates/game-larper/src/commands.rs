@@ -1284,7 +1284,12 @@ fn runner_template() -> Result<PathBuf, String> {
     let directory = executable
         .parent()
         .ok_or_else(|| "Cannot locate Game Larper.".to_string())?;
-    for name in ["GameLarper.Runner.exe", "game-larper-runner.exe"] {
+    // The release name first, then what `cargo build` produces.
+    #[cfg(windows)]
+    let names = ["GameLarper.Runner.exe", "game-larper-runner.exe"];
+    #[cfg(target_os = "linux")]
+    let names = ["GameLarper.Runner", "game-larper-runner"];
+    for name in names {
         let path = directory.join(name);
         if path.exists() {
             return Ok(path);
