@@ -4,6 +4,7 @@ members = [
     "crates/game-larper-core",
     "crates/game-larper-runner",
     "crates/game-larper",
+    "xtask",
 ]
 
 [workspace.package]
