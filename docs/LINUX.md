@@ -172,6 +172,11 @@ Run:
    ```bash
    ./target/release/game-larper
    ```
+1 (bis). Or install the binary on your system:
+
+   ```bash
+   sudo cp target/release/game-larper /usr/local/bin/game-larper
+   ```
 
 2. Open Settings → Logs → View.
 3. Search **ELDEN RING**, select it, press **Play**. In the console, expect:
