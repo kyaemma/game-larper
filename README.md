@@ -2,6 +2,19 @@
   <img src="assets/branding/game-larper-banner.png" width="540" alt="Game Larper">
 </p>
 
+<p align="center">
+  <a href="https://www.rust-lang.org/"><img alt="Rust 1.98.x" src="https://img.shields.io/badge/Rust-1.98.x-000000?style=flat-square&logo=rust&logoColor=white"></a>
+  <a href="https://slint.dev/"><img alt="Slint 1.18.1" src="https://img.shields.io/badge/Slint-1.18.1-2379F4?style=flat-square&logo=slint&logoColor=white"></a>
+  <img alt="Windows 10 / 11" src="https://img.shields.io/badge/Windows-10%20%2F%2011-0078D4?style=flat-square&logo=windows11&logoColor=white">
+  <img alt="Linux supported" src="https://img.shields.io/badge/Linux-supported-FCC624?style=flat-square&logo=linux&logoColor=black">
+  <a href="https://github.com/kyaemma/game-larper/actions/workflows/ci.yml"><img alt="CI" src="https://img.shields.io/github/actions/workflow/status/kyaemma/game-larper/ci.yml?branch=main&style=flat-square&label=CI"></a>
+  <a href="LICENSE"><img alt="MIT License" src="https://img.shields.io/github/license/kyaemma/game-larper?style=flat-square"></a>
+</p>
+
+<p align="center">
+  <a href="https://slint.dev/"><img alt="Made with Slint" src="https://raw.githubusercontent.com/slint-ui/slint/master/logo/MadeWithSlint-logo-whitebg.png" height="24"></a>
+</p>
+
 ## <p align="center">For my larpers 🤗</p>
 
 <p align="center">
