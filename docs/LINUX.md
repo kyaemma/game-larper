@@ -175,8 +175,10 @@ Run:
 1 (bis). Or install the binary on your system:
 
    ```bash
-   sudo cp target/release/game-larper /usr/local/bin/game-larper
+   cargo xtask install
    ```
+
+   It will create a `.desktop` file in `~/.local/share/applications` so the application can be launched from the desktop.
 
 2. Open Settings → Logs → View.
 3. Search **ELDEN RING**, select it, press **Play**. In the console, expect:
