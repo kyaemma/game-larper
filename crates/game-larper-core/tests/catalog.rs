@@ -1,24 +1,17 @@
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use game_larper_core::{
-    CATALOG_TTL, CatalogCache, ExecutableDefinition, GameDefinition, is_catalog_stale, merge_games,
-    parse_catalog,
+    CATALOG_TTL, CatalogCache, GameDefinition, is_catalog_stale, merge_games, parse_catalog,
 };
 
 fn game(id: &str, name: &str) -> GameDefinition {
-    GameDefinition {
-        id: id.into(),
-        name: name.into(),
-        aliases: Vec::new(),
-        executables: vec![ExecutableDefinition {
-            name: "game.exe".into(),
-            is_launcher: false,
-        }],
-        steam_app_id: None,
-        icon_hash: None,
-        cover_image_hash: None,
-    }
+    GameDefinition::new(id, name).with_executable("game.exe", false)
+}
+
+fn path(game: &GameDefinition) -> Option<String> {
+    game.supported_path()
+        .map(|path| path.to_string_lossy().replace('\\', "/"))
 }
 
 #[test]
@@ -30,12 +23,10 @@ fn catalog_parses_current_discord_fields_and_ignores_unknown_fields() {
     let game = parse_catalog(json).unwrap().pop().unwrap();
     assert_eq!(game.id, "1402418436809953330");
     assert_eq!(game.steam_app_id.as_deref(), Some("1245620"));
-    assert_eq!(
-        game.supported_path(),
-        Some(PathBuf::from("game").join("eldenring.exe"))
-    );
+    let expected = PathBuf::from("game").join("eldenring.exe");
+    assert_eq!(game.supported_path(), Some(expected.as_path()));
     assert_eq!(game.aliases, vec!["Elden".to_string()]);
-    assert_eq!(game.executables.len(), 2);
+    assert_eq!(game.executable_rules(), 2);
 
     let launcher_only = parse_catalog(
         r#"[{"id":"1","name":"Launcher","executables":[{"name":"setup.exe","os":"win32","is_launcher":true}]}]"#,
@@ -45,33 +36,32 @@ fn catalog_parses_current_discord_fields_and_ignores_unknown_fields() {
     .unwrap();
     assert!(launcher_only.supported_path().is_none());
 
-    let choices = GameDefinition {
-        id: "2".into(),
-        name: "Choices".into(),
-        aliases: Vec::new(),
-        executables: vec![
-            ExecutableDefinition {
-                name: "launcher.exe".into(),
-                is_launcher: true,
-            },
-            ExecutableDefinition {
-                name: "deep/game.exe".into(),
-                is_launcher: false,
-            },
-            ExecutableDefinition {
-                name: ">game.exe".into(),
-                is_launcher: false,
-            },
-            ExecutableDefinition {
-                name: "game.exe".into(),
-                is_launcher: false,
-            },
-        ],
-        steam_app_id: None,
-        icon_hash: None,
-        cover_image_hash: None,
-    };
-    assert_eq!(choices.supported_path(), Some(PathBuf::from("game.exe")));
+    let choices = GameDefinition::new("2", "Choices")
+        .with_executable("launcher.exe", true)
+        .with_executable("deep/game.exe", false)
+        .with_executable(">game.exe", false)
+        .with_executable("game.exe", false);
+    assert_eq!(choices.supported_path(), Some(Path::new("game.exe")));
+    assert_eq!(choices.executable_rules(), 4);
+}
+
+#[test]
+fn the_best_executable_is_chosen_while_parsing() {
+    let json = r#"[{"id":"1","name":"Pick","executables":[
+        {"name":"a/b/deep.exe","os":"win32"},
+        {"name":"launcher.exe","os":"win32"},
+        {"name":"setup.exe","os":"win32","is_launcher":true},
+        {"name":"../escape.exe","os":"win32"},
+        {"name":"mac.app","os":"darwin"},
+        {"name":"bin/longer-name.exe","os":"win32"},
+        {"name":"bin/game.exe","os":"win32"},
+        {"name":"bin/zzzz.exe","os":"win32"},
+        {"name":"vcredist_x64.exe","os":"win32"}]}]"#;
+    let game = parse_catalog(json).unwrap().pop().unwrap();
+    // Shallowest first, then shortest; the first of equal candidates stays.
+    assert_eq!(path(&game).as_deref(), Some("bin/game.exe"));
+    // Every Windows rule is counted, usable or not.
+    assert_eq!(game.executable_rules(), 8);
 }
 
 #[test]
@@ -91,29 +81,88 @@ fn catalog_rejects_empty_or_malformed_responses() {
 }
 
 #[test]
+fn invalid_entries_are_skipped_without_failing_the_catalog() {
+    let json = r#"[7, null, "text", [1, [2]], {}, true,
+        {"id":"1","name":"Kept"},
+        {"id":1,"name":"Numeric id"}, {"id":"x2","name":"Letters"}, {"id":"","name":"Empty id"},
+        {"id":"3","name":"   "}, {"id":"4"}, {"name":"No id"},
+        {"id":"5","name":" Also kept "}]"#;
+    let games = parse_catalog(json).unwrap();
+    let names: Vec<_> = games.iter().map(|game| game.name.as_str()).collect();
+    assert_eq!(names, ["Kept", "Also kept"]);
+}
+
+#[test]
+fn wrong_typed_fields_count_as_absent_and_unknown_fields_are_skipped() {
+    let json = r#"[{"id":"1","name":"A","aliases":"not a list","executables":{"name":"a.exe"},
+        "third_party_skus":"steam","icon_hash":5,"icon":"fallback","cover_image_hash":null,
+        "future":{"deep":[1,2,{"x":null}],"n":1e30}}]"#;
+    let game = parse_catalog(json).unwrap().pop().unwrap();
+    assert!(game.aliases.is_empty());
+    assert_eq!(game.executable_rules(), 0);
+    assert!(game.supported_path().is_none());
+    assert_eq!(game.steam_app_id, None);
+    assert_eq!(game.icon_hash.as_deref(), Some("fallback"));
+
+    let json = r#"[{"id":"2","name":"B","aliases":[1,"keep"," ",null,["x"],{"y":1},"also"],
+        "executables":[3,null,"s",[1],{"os":"win32"},{"name":5,"os":"win32"},{"name":"a.exe","os":5},
+                       {"name":"b.exe","os":"WIN32","is_launcher":"yes"},
+                       {"name":"c.exe","os":"win32","is_launcher":true}],
+        "third_party_skus":[3,{"distributor":"steam","id":"12345678901234"},{"distributor":"Steam","id":"77"},
+                            {"distributor":"steam","id":"88"}]}]"#;
+    let game = parse_catalog(json).unwrap().pop().unwrap();
+    assert_eq!(game.aliases, ["keep", "also"]);
+    // Only the two named Windows rules count: one launcher, one not.
+    assert_eq!(game.executable_rules(), 2);
+    assert_eq!(path(&game).as_deref(), Some("b.exe"));
+    assert_eq!(game.steam_app_id.as_deref(), Some("77"));
+}
+
+#[test]
+fn repeated_and_escaped_keys_behave_like_a_json_object() {
+    // The last value of a repeated key wins, even when it has the wrong type.
+    let json = r#"[{"id":"1","name":"First","name":"Second"},
+                   {"id":"2","name":"Third","id":9},
+                   {"id":"3","name":"Café"}]"#;
+    let games = parse_catalog(json).unwrap();
+    let seen: Vec<_> = games
+        .iter()
+        .map(|game| (game.id.as_str(), game.name.as_str()))
+        .collect();
+    assert_eq!(seen, [("1", "Second"), ("3", "Café")]);
+}
+
+#[test]
+fn only_an_array_is_a_catalog_and_only_bad_syntax_is_a_json_error() {
+    for not_an_array in ["{}", r#"{"id":"1"}"#, "null", "5", "true", r#""text""#] {
+        assert!(
+            matches!(
+                parse_catalog(not_an_array),
+                Err(game_larper_core::Error::Format(_))
+            ),
+            "{not_an_array}"
+        );
+    }
+    for broken in [
+        "",
+        r#"[{"id":"1","name":"A"}"#,
+        r#"[{"id":"1","name":"A"}] trailing"#,
+        r#"[{"id":"1","name":"A"},]"#,
+        "{not json",
+    ] {
+        assert!(
+            matches!(parse_catalog(broken), Err(game_larper_core::Error::Json(_))),
+            "{broken}"
+        );
+    }
+}
+
+#[test]
 fn excluded_basename_is_not_a_supported_path() {
-    let game = GameDefinition {
-        id: "9".into(),
-        name: "Installer".into(),
-        aliases: Vec::new(),
-        executables: vec![
-            ExecutableDefinition {
-                name: "launcher.exe".into(),
-                is_launcher: false,
-            },
-            ExecutableDefinition {
-                name: "bin/game.exe".into(),
-                is_launcher: false,
-            },
-        ],
-        steam_app_id: None,
-        icon_hash: None,
-        cover_image_hash: None,
-    };
-    assert_eq!(
-        game.supported_path(),
-        Some(PathBuf::from("bin").join("game.exe"))
-    );
+    let game = GameDefinition::new("9", "Installer")
+        .with_executable("launcher.exe", false)
+        .with_executable("bin/game.exe", false);
+    assert_eq!(path(&game).as_deref(), Some("bin/game.exe"));
 }
 
 #[test]
@@ -129,21 +178,38 @@ fn steam_id_is_the_first_short_numeric_steam_sku() {
 fn merge_fills_missing_metadata_and_keeps_the_first_name() {
     let mut first = game("7", "First");
     first.icon_hash = None;
-    let mut second = game("7", "Second");
+    let mut second = game("7", "Second").with_executable("other.exe", false);
     second.steam_app_id = Some("55".into());
     second.icon_hash = Some("abc".into());
     second.aliases = vec!["Alias".into()];
-    second.executables.push(ExecutableDefinition {
-        name: "other.exe".into(),
-        is_launcher: false,
-    });
     let merged = merge_games(vec![first], vec![second]);
     assert_eq!(merged.len(), 1);
     assert_eq!(merged[0].name, "First");
     assert_eq!(merged[0].steam_app_id.as_deref(), Some("55"));
     assert_eq!(merged[0].icon_hash.as_deref(), Some("abc"));
     assert_eq!(merged[0].aliases, vec!["Alias".to_string()]);
-    assert_eq!(merged[0].executables.len(), 2);
+    assert_eq!(path(&merged[0]).as_deref(), Some("game.exe"));
+}
+
+#[test]
+fn merge_keeps_the_best_executable_of_both_providers() {
+    let deep = GameDefinition::new("1", "A").with_executable("deep/dir/game.exe", false);
+    let shallow = GameDefinition::new("1", "A").with_executable("game.exe", false);
+    let merged = merge_games(vec![deep], vec![shallow]);
+    assert_eq!(path(&merged[0]).as_deref(), Some("game.exe"));
+
+    // An equal candidate from a later provider does not displace the first.
+    let first = GameDefinition::new("2", "B").with_executable("aaaa.exe", false);
+    let second = GameDefinition::new("2", "B").with_executable("bbbb.exe", false);
+    let merged = merge_games(vec![first], vec![second]);
+    assert_eq!(path(&merged[0]).as_deref(), Some("aaaa.exe"));
+
+    // A launcher-only first provider gets a usable path from the second.
+    let launcher = GameDefinition::new("3", "C").with_executable("setup.exe", true);
+    let usable = GameDefinition::new("3", "C").with_executable("c.exe", false);
+    let merged = merge_games(vec![launcher], vec![usable]);
+    assert_eq!(path(&merged[0]).as_deref(), Some("c.exe"));
+    assert_eq!(merged[0].executable_rules(), 2);
 }
 
 #[test]

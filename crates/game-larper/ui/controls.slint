@@ -10,13 +10,9 @@ export component Icon inherits Image {
     image-fit: contain;
 }
 
-// The official square logo, clipped to its tile so it fills small slots.
+// The official square logo, pre-cropped to its tile (see assets/branding) so it fills small slots.
 export component LogoMark inherits Image {
     source: Icons.logo;
-    source-clip-x: 259;
-    source-clip-y: 259;
-    source-clip-width: 737;
-    source-clip-height: 737;
     image-fit: contain;
     width: 18px;
     height: 18px;

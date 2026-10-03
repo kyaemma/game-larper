@@ -23,7 +23,7 @@ export component TrayIcon inherits SystemTrayIcon {
     callback open-settings();
     callback quit();
 
-    icon: @image-url("../../../assets/branding/game-larper-logo.png");
+    icon: @image-url("../../../assets/branding/game-larper-icon.png");
     tooltip: root.status-tip;
     clicked => { root.open-requested(); }
 

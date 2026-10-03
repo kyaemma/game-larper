@@ -3,9 +3,8 @@ use std::fs;
 use std::path::{Path, PathBuf};
 use std::time::{Duration, SystemTime};
 
-use serde_json::Value;
-
 use crate::atomic;
+use crate::catalog_json::Catalog;
 use crate::error::Error;
 use crate::safe_path::{normalize_executable, separator_count};
 
@@ -48,40 +47,97 @@ const EXCLUDED_BASENAMES: &[&str] = &[
     "wallpaper64.exe",
 ];
 
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ExecutableDefinition {
-    pub name: String,
-    pub is_launcher: bool,
-}
-
+/// A game Discord can detect, reduced to what Game Larper uses at runtime.
+///
+/// The catalog lists every executable rule of every platform for each game. Only one matters
+/// here, so the best safe Windows path is chosen once, when the record is built or merged,
+/// and the rest is dropped.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct GameDefinition {
     pub id: String,
     pub name: String,
     pub aliases: Vec<String>,
-    pub executables: Vec<ExecutableDefinition>,
     pub steam_app_id: Option<String>,
     pub icon_hash: Option<String>,
-    pub cover_image_hash: Option<String>,
+    pub(crate) executable: ExecutableChoice,
 }
 
 impl GameDefinition {
-    /// Shallowest, then shortest, safe non-launcher Windows path Discord can match.
-    pub fn supported_path(&self) -> Option<PathBuf> {
-        let mut paths: Vec<PathBuf> = self
-            .executables
-            .iter()
-            .filter(|executable| !executable.is_launcher)
-            .filter_map(|executable| normalize_executable(&executable.name))
-            .filter(|path| !is_excluded(path))
-            .collect();
-        paths.sort_by(|left, right| {
-            separator_count(left)
-                .cmp(&separator_count(right))
-                .then_with(|| left.as_os_str().len().cmp(&right.as_os_str().len()))
-        });
-        paths.into_iter().next()
+    /// A game with no executable rules yet; see [`GameDefinition::with_executable`].
+    pub fn new(id: impl Into<String>, name: impl Into<String>) -> Self {
+        Self {
+            id: id.into(),
+            name: name.into(),
+            aliases: Vec::new(),
+            steam_app_id: None,
+            icon_hash: None,
+            executable: ExecutableChoice::default(),
+        }
     }
+
+    /// Record a Windows executable rule as the catalog lists it (`is_launcher` as given).
+    pub fn with_executable(mut self, name: &str, is_launcher: bool) -> Self {
+        self.executable.offer(name, is_launcher);
+        self
+    }
+
+    /// Shallowest, then shortest, safe non-launcher Windows path Discord can match.
+    pub fn supported_path(&self) -> Option<&Path> {
+        self.executable.best.as_deref()
+    }
+
+    /// How many Windows executable rules the catalog listed. For diagnostics only: records
+    /// merged from several providers add their counts, so shared rules count twice.
+    pub fn executable_rules(&self) -> u32 {
+        self.executable.rules
+    }
+}
+
+/// The best executable among the Windows rules offered so far.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct ExecutableChoice {
+    pub(crate) best: Option<PathBuf>,
+    pub(crate) rules: u32,
+}
+
+impl ExecutableChoice {
+    /// Count a Windows rule and keep its path if it beats the current one. Launchers, unsafe
+    /// paths and excluded basenames never qualify; of two equal candidates the first stays.
+    pub(crate) fn offer(&mut self, name: &str, is_launcher: bool) {
+        self.rules = self.rules.saturating_add(1);
+        if is_launcher {
+            return;
+        }
+        let Some(path) = normalize_executable(name) else {
+            return;
+        };
+        if !is_excluded(&path) {
+            self.consider(path);
+        }
+    }
+
+    fn consider(&mut self, path: PathBuf) {
+        if self
+            .best
+            .as_deref()
+            .is_none_or(|best| preference(&path) < preference(best))
+        {
+            self.best = Some(path);
+        }
+    }
+
+    /// Take over a later provider's choice; this one keeps a tie.
+    fn merge(&mut self, other: Self) {
+        if let Some(path) = other.best {
+            self.consider(path);
+        }
+        self.rules = self.rules.saturating_add(other.rules);
+    }
+}
+
+/// Lower is better: fewer directories, then a shorter path.
+fn preference(path: &Path) -> (usize, usize) {
+    (separator_count(path), path.as_os_str().len())
 }
 
 fn is_excluded(path: &Path) -> bool {
@@ -96,98 +152,20 @@ fn is_excluded(path: &Path) -> bool {
 }
 
 pub fn parse_catalog(json: &str) -> Result<Vec<GameDefinition>, Error> {
-    let value: Value = serde_json::from_str(json)?;
-    let Some(items) = value.as_array() else {
-        return Err(Error::Format(
-            "The detectable catalog is not an array.".into(),
-        ));
+    let games = match serde_json::from_str(json)? {
+        Catalog::Games(games) => games,
+        Catalog::NotAnArray => {
+            return Err(Error::Format(
+                "The detectable catalog is not an array.".into(),
+            ));
+        }
     };
-    let mut games = Vec::new();
-    for item in items {
-        let Some(game) = parse_game(item) else {
-            continue;
-        };
-        games.push(game);
-    }
     if games.is_empty() {
         return Err(Error::Format(
             "The detectable catalog contains no valid games.".into(),
         ));
     }
     Ok(games)
-}
-
-fn parse_game(value: &Value) -> Option<GameDefinition> {
-    let object = value.as_object()?;
-    let id = text(object, "id")?;
-    if id.is_empty() || !id.bytes().all(|byte| byte.is_ascii_digit()) {
-        return None;
-    }
-    let name = text(object, "name")?.trim().to_string();
-    if name.is_empty() {
-        return None;
-    }
-    let mut aliases = Vec::new();
-    if let Some(items) = object.get("aliases").and_then(Value::as_array) {
-        for alias in items {
-            if let Some(alias) = alias.as_str()
-                && !alias.trim().is_empty()
-            {
-                aliases.push(alias.to_string());
-            }
-        }
-    }
-    let mut executables = Vec::new();
-    if let Some(items) = object.get("executables").and_then(Value::as_array) {
-        for executable in items {
-            let Some(executable) = executable.as_object() else {
-                continue;
-            };
-            if !text(executable, "os").is_some_and(|os| os.eq_ignore_ascii_case("win32")) {
-                continue;
-            }
-            let Some(path) = text(executable, "name") else {
-                continue;
-            };
-            let is_launcher = executable.get("is_launcher").and_then(Value::as_bool) == Some(true);
-            executables.push(ExecutableDefinition {
-                name: path,
-                is_launcher,
-            });
-        }
-    }
-    Some(GameDefinition {
-        id,
-        name,
-        aliases,
-        executables,
-        steam_app_id: steam_app_id(object),
-        icon_hash: text(object, "icon_hash").or_else(|| text(object, "icon")),
-        cover_image_hash: text(object, "cover_image_hash"),
-    })
-}
-
-fn steam_app_id(object: &serde_json::Map<String, Value>) -> Option<String> {
-    let skus = object.get("third_party_skus")?.as_array()?;
-    for sku in skus {
-        let Some(sku) = sku.as_object() else {
-            continue;
-        };
-        if !text(sku, "distributor").is_some_and(|name| name.eq_ignore_ascii_case("steam")) {
-            continue;
-        }
-        let Some(id) = text(sku, "id") else {
-            continue;
-        };
-        if !id.is_empty() && id.len() <= 12 && id.bytes().all(|byte| byte.is_ascii_digit()) {
-            return Some(id);
-        }
-    }
-    None
-}
-
-fn text(object: &serde_json::Map<String, Value>, name: &str) -> Option<String> {
-    object.get(name).and_then(Value::as_str).map(str::to_string)
 }
 
 /// Keep the first record for an id and fill gaps from later providers.
@@ -218,9 +196,6 @@ fn merge_into(left: &mut GameDefinition, right: GameDefinition) {
     if left.icon_hash.is_none() {
         left.icon_hash = right.icon_hash;
     }
-    if left.cover_image_hash.is_none() {
-        left.cover_image_hash = right.cover_image_hash;
-    }
     for alias in right.aliases {
         if !left
             .aliases
@@ -230,13 +205,7 @@ fn merge_into(left: &mut GameDefinition, right: GameDefinition) {
             left.aliases.push(alias);
         }
     }
-    for executable in right.executables {
-        if !left.executables.iter().any(|existing| {
-            existing.name == executable.name && existing.is_launcher == executable.is_launcher
-        }) {
-            left.executables.push(executable);
-        }
-    }
+    left.executable.merge(right.executable);
 }
 
 pub fn is_catalog_stale(modified: Option<SystemTime>, now: SystemTime) -> bool {

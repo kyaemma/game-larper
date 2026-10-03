@@ -294,10 +294,10 @@ fn spawn_launch_blocking(
                 format!(
                     "Template {}; {} Windows executable rule(s) in the catalog",
                     redact(&template),
-                    game.executables.len()
+                    game.executable_rules()
                 ),
             );
-            let icon = net::ensure_artwork(&images, &game, &log);
+            let icon = net::ensure_artwork(&images, &ArtRequest::from(&game), &log);
             host.lock()
                 .unwrap_or_else(|poison| poison.into_inner())
                 .launch(&template, &game.id, &relative, icon.as_deref())
@@ -363,27 +363,27 @@ fn select_index(
         return;
     };
     // Indexes refer to the rows on screen, which may still be the previous query's.
-    let Some(game) = session
+    let Some(request) = session
         .shown
         .get(index)
         .and_then(|&index| session.games.get(index))
-        .cloned()
+        .map(ArtRequest::from)
     else {
         return;
     };
-    if session.selected.as_deref() == Some(game.id.as_str()) {
+    if session.selected.as_deref() == Some(request.id.as_str()) {
         return;
     }
-    session.selected = Some(game.id.clone());
-    session.config.last_selected_discord_application_id = Some(game.id.clone());
+    session.selected = Some(request.id.clone());
+    session.config.last_selected_discord_application_id = Some(request.id.clone());
     log.debug(
         Area::Session,
-        format!("Selected {} / {}", game.id, game.name),
+        format!("Selected {} / {}", request.id, request.name),
     );
     if let Err(error) = ConfigStore::new(session.paths.config()).save(&session.config) {
         log.error(Area::Settings, format!("Config save failed: {error}"));
     }
-    fetch_art(&mut session, std::slice::from_ref(&game), tx, wake, true);
+    fetch_art(&mut session, &[request], tx, wake, true);
 }
 
 fn add_selected_to_queue(session: &Arc<Mutex<Session>>, panel: &Weak<SidePanel>) {
@@ -752,12 +752,12 @@ fn plan_results(session: &mut Session) -> ArtPlan {
         session.results = Results::Empty;
         return ArtPlan::default();
     }
-    let wanted = |range: &[usize]| -> Vec<GameDefinition> {
+    let wanted = |range: &[usize]| -> Vec<ArtRequest> {
         range
             .iter()
             .map(|&index| &session.games[index])
-            .filter(|game| needs_art(session, game))
-            .cloned()
+            .filter(|game| net::has_artwork_source(game) && needs_art(session, &game.id))
+            .map(ArtRequest::from)
             .collect()
     };
     let split = found.len().min(REVEAL_ROWS);
@@ -776,7 +776,7 @@ fn plan_results(session: &mut Session) -> ArtPlan {
     }
     session.reveal = Some(Reveal {
         shown: found,
-        waiting: plan.first.iter().map(|game| game.id.clone()).collect(),
+        waiting: plan.first.iter().map(|request| request.id.clone()).collect(),
         deadline: Instant::now() + ART_DEBOUNCE + REVEAL_WAIT,
     });
     plan
@@ -798,8 +798,8 @@ fn start_art(
     session: &Arc<Mutex<Session>>,
     tx: &mpsc::Sender<Msg>,
     wake: &Wake,
-    first: Vec<GameDefinition>,
-    rest: Vec<GameDefinition>,
+    first: Vec<ArtRequest>,
+    rest: Vec<ArtRequest>,
 ) {
     if let Ok(mut session) = session.lock() {
         fetch_art(&mut session, &first, tx, wake, true);
@@ -809,31 +809,34 @@ fn start_art(
     Timer::single_shot(REVEAL_WAIT + Duration::from_millis(20), move || wake());
 }
 
-fn needs_art(session: &Session, game: &GameDefinition) -> bool {
-    !ART.with(|art| art.borrow().contains_key(&game.id))
-        && !session.art_failed.contains(&game.id)
-        && !net::artwork_candidates(game).is_empty()
+/// Artwork that is neither decoded nor known to be unavailable. It may still be on its way.
+fn needs_art(session: &Session, id: &str) -> bool {
+    !ART.with(|art| art.borrow().contains(id)) && !session.art_failed.contains(id)
 }
 
 /// Start fetching artwork that is not cached, failed, or already on its way.
 /// `parallel` gives each game its own worker; otherwise one worker goes through the list.
 fn fetch_art(
     session: &mut Session,
-    games: &[GameDefinition],
+    requests: &[ArtRequest],
     tx: &mpsc::Sender<Msg>,
     wake: &Wake,
     parallel: bool,
 ) {
-    let todo: Vec<GameDefinition> = games
+    let todo: Vec<ArtRequest> = requests
         .iter()
-        .filter(|game| needs_art(session, game) && !session.art_inflight.contains(&game.id))
+        .filter(|request| {
+            request.has_source()
+                && needs_art(session, &request.id)
+                && !session.art_inflight.contains(&request.id)
+        })
         .cloned()
         .collect();
     if todo.is_empty() {
         return;
     }
-    for game in &todo {
-        session.art_inflight.insert(game.id.clone());
+    for request in &todo {
+        session.art_inflight.insert(request.id.clone());
     }
     session.log.debug(
         Area::Art,
@@ -845,19 +848,24 @@ fn fetch_art(
     );
     let images = session.paths.images();
     let log = session.log.clone();
-    let run = move |games: Vec<GameDefinition>, tx: mpsc::Sender<Msg>, wake: Wake| {
-        for game in games {
-            let path = net::ensure_artwork(&images, &game, &log);
-            let _ = tx.send(Msg::Art { id: game.id, path });
+    let run = move |requests: Vec<ArtRequest>, tx: mpsc::Sender<Msg>, wake: Wake| {
+        for request in requests {
+            let identity = request.identity();
+            let path = net::ensure_artwork(&images, &request, &log);
+            let _ = tx.send(Msg::Art {
+                id: request.id,
+                identity,
+                path,
+            });
             wake();
         }
     };
     if parallel {
-        for game in todo {
+        for request in todo {
             let run = run.clone();
             let tx = tx.clone();
             let wake = wake.clone();
-            std::thread::spawn(move || run(vec![game], tx, wake));
+            std::thread::spawn(move || run(vec![request], tx, wake));
         }
     } else {
         let tx = tx.clone();
@@ -867,7 +875,37 @@ fn fetch_art(
 }
 
 fn cached_art(id: &str) -> slint::Image {
-    ART.with(|art| art.borrow().get(id).cloned().unwrap_or_default())
+    ART.with(|art| art.borrow_mut().get(id).cloned().unwrap_or_default())
+}
+
+/// Artwork the UI is drawing or about to draw. It stays in memory however full the cache is.
+fn art_pinned(session: &Session, id: &str) -> bool {
+    let shows = |index: &usize| session.games.get(*index).is_some_and(|game| game.id == id);
+    session.selected.as_deref() == Some(id)
+        || session.active.as_deref() == Some(id)
+        || session
+            .queue
+            .items()
+            .iter()
+            .any(|item| item.application_id == id)
+        || session.shown.iter().any(shows)
+        || session
+            .reveal
+            .as_ref()
+            .is_some_and(|reveal| reveal.shown.iter().any(shows))
+}
+
+/// Forget decoded artwork whose game left the catalog or whose artwork source changed.
+fn reconcile_art(session: &Session) {
+    ART.with(|art| {
+        art.borrow_mut().reconcile(|id| {
+            session
+                .games
+                .iter()
+                .find(|game| game.id == id)
+                .map(|game| ArtRequest::from(game).identity())
+        });
+    });
 }
 
 /// Bring the console model up to date with the live history. Only new lines are added, so an
