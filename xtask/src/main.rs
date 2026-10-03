@@ -92,17 +92,18 @@ fn install() -> Result<(), Box<dyn Error>> {
         .ok_or("the installed application path is not valid UTF-8")?;
     let exec = desktop_exec(&[app_path]).ok_or("the application path cannot be written to Exec=")?;
     let desktop = format!(
-        "[Desktop Entry]\n\\
-         Type=Application\n\\
-         Version=1.0\n\\
-         Name=Game Larper\n\\
-         Comment=Simulate game activity on Discord\n\\
-         Exec={exec}\n\\
-         Icon=game-larper\n\\
-         Terminal=false\n\\
-         Categories=Utility;Game;\n\\
-         Keywords=Discord;Game;Activity;\n\\
-         StartupNotify=true\n"
+        "[Desktop Entry]
+Type=Application
+Version=1.0
+Name=Game Larper
+Comment=Simulate game activity on Discord
+Exec={exec}
+Icon=game-larper
+Terminal=false
+Categories=Utility;Game;
+Keywords=Discord;Game;Activity;
+StartupNotify=true
+"
     );
     write_atomic(&apps_dir.join(DESKTOP_FILE), desktop.as_bytes(), 0o644)?;
 
