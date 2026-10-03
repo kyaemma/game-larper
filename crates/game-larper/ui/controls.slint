@@ -41,7 +41,7 @@ export component Tip inherits Rectangle {
 }
 
 // Draws a keyboard focus ring around its parent.
-component FocusRing inherits Rectangle {
+export component FocusRing inherits Rectangle {
     in property <bool> active;
     in property <length> radius: Theme.radius;
     x: -3px;

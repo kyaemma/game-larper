@@ -57,6 +57,7 @@ export component SidePanel inherits Window {
     callback clear-images();
     callback open-logs();
     callback open-data();
+    callback notify(string);
     callback add-queue();
     callback queue-up(int);
     callback queue-down(int);
@@ -130,6 +131,7 @@ export component SidePanel inherits Window {
                         clear-images => { root.clear-images(); }
                         open-logs => { root.open-logs(); }
                         open-data => { root.open-data(); }
+                        notify(message) => { root.notify(message); }
                     }
                 }
                 if root.mode == "settings": Hairline { }
