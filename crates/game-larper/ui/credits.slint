@@ -1,0 +1,40 @@
+export struct Dev {
+    username: string,
+    role: string,
+}
+
+export global Actions {
+    callback open-url(string);
+}
+
+component GithubLink inherits Rectangle {
+    in property <string> username;
+    in property <string> role;
+
+    background: area.has-hover ? #ffffff18 : transparent;
+    border-radius: 6px;
+
+    HorizontalLayout {
+        padding: 6px;
+        spacing: 8px;
+        Text { text: "@" + root.username; color: #58a6ff; vertical-alignment: center; }
+        Text { text: root.role; color: #8b949e; vertical-alignment: center; }
+    }
+
+    area := TouchArea {
+        mouse-cursor: pointer;
+        clicked => { Actions.open-url("https://github.com/" + root.username); }
+    }
+}
+
+export component Credits inherits VerticalLayout {
+    property <[Dev]> devs: [
+        { username: "kyaemma", role: "Creator" },
+        { username: "DankDown10256", role: "Contributor" },
+    ];
+
+    for dev in devs : GithubLink {
+        username: dev.username;
+        role: dev.role;
+    }
+}

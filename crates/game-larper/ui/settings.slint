@@ -1,6 +1,7 @@
 // Settings content for the side panel. Values stay staged until Save.
 
 import { AboutSlint } from "std-widgets.slint";
+import { Credits } from "credits.slint";
 import { Theme } from "theme.slint";
 import { LogoMark, Button, Toggle, SectionLabel } from "controls.slint";
 
@@ -213,4 +214,6 @@ export component SettingsView inherits VerticalLayout {
         padding-bottom: 4px;
         AboutSlint { }
     }
+    Section { text: "CREDITS"; }
+    Credits { }
 }
