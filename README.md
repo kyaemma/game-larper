@@ -55,12 +55,27 @@ THANKS TO [DankDown10256](https://github.com/DankDown10256) for the help 🌹
 
 ## download
 
-Windows builds are available from [Releases](https://github.com/kyaemma/game-larper/releases). Grab the latest `GameLarper-win-x64.zip`, extract it, and keep both executables together:
+Windows and Linux x64 builds are available from [Releases](https://github.com/kyaemma/game-larper/releases).
+
+### Windows x64
+
+Grab `GameLarper-win-x64.zip`, extract it, and keep both executables together:
 
 ```text
 GameLarper.exe
 GameLarper.Runner.exe
 ```
+
+### Linux x64
+
+Grab `GameLarper-linux-x64.tar.gz`, extract it, and keep both binaries together:
+
+```text
+game-larper
+game-larper-runner
+```
+
+Then run `./game-larper`. The archive also includes the MIT `LICENSE`.
 
 ## build
 

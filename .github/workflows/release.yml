@@ -2,12 +2,13 @@ name: Release
 
 on:
   push:
-    tags:
-      - "v*"
+    branches: [main]
+    paths:
+      - "Cargo.toml"
   workflow_dispatch:
     inputs:
       tag:
-        description: "Release tag, for example v0.1.0"
+        description: "Release tag, for example v0.2.0"
         required: true
         type: string
 
@@ -19,16 +20,81 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  release:
-    name: Build and publish Windows release
-    runs-on: windows-latest
-    timeout-minutes: 40
+  resolve:
+    name: Resolve release
+    if: github.event_name == 'workflow_dispatch' || startsWith(github.event.head_commit.message, 'release: v')
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.release.outputs.tag }}
+      version: ${{ steps.release.outputs.version }}
+      sha: ${{ steps.release.outputs.sha }}
 
     steps:
       - name: Checkout
         uses: actions/checkout@v7
         with:
           fetch-depth: 0
+
+      - name: Resolve and validate release
+        id: release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          REQUESTED_TAG: ${{ inputs.tag }}
+        run: |
+          set -euo pipefail
+
+          version="$(awk '
+            /^\[workspace\.package\]$/ { in_workspace_package = 1; next }
+            /^\[/ && in_workspace_package { exit }
+            in_workspace_package && /^version = / {
+              gsub(/"/, "", $3)
+              print $3
+              exit
+            }
+          ' Cargo.toml)"
+
+          if [[ -z "$version" ]]; then
+            echo "Could not resolve workspace version from Cargo.toml." >&2
+            exit 1
+          fi
+
+          if [[ "${{ github.event_name }}" == "workflow_dispatch" ]]; then
+            tag="${REQUESTED_TAG//[[:space:]]/}"
+          else
+            tag="v${version}"
+          fi
+
+          if [[ ! "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+([-.][0-9A-Za-z.-]+)?$ ]]; then
+            echo "Release tag '$tag' is not valid." >&2
+            exit 1
+          fi
+
+          if [[ "${tag#v}" != "$version" ]]; then
+            echo "Release tag '$tag' does not match workspace version '$version'." >&2
+            exit 1
+          fi
+
+          if gh release view "$tag" --repo "${{ github.repository }}" >/dev/null 2>&1; then
+            echo "Release $tag already exists." >&2
+            exit 1
+          fi
+
+          echo "tag=$tag" >> "$GITHUB_OUTPUT"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "sha=$GITHUB_SHA" >> "$GITHUB_OUTPUT"
+
+  windows:
+    name: Build Windows x64
+    needs: resolve
+    runs-on: windows-latest
+    timeout-minutes: 40
+
+    steps:
+      - name: Checkout release commit
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.resolve.outputs.sha }}
 
       - name: Install pinned Rust toolchain
         shell: pwsh
@@ -47,61 +113,136 @@ jobs:
         shell: pwsh
         run: .\scripts\build-release.ps1
 
-      - name: Resolve release tag
-        id: release_tag
-        shell: pwsh
+      - name: Upload Windows package
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-windows-x64
+          path: artifacts/release/GameLarper-win-x64.zip
+          if-no-files-found: error
+          retention-days: 7
+
+  linux:
+    name: Build Linux x64
+    needs: resolve
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+
+    steps:
+      - name: Checkout release commit
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.resolve.outputs.sha }}
+
+      - name: Install system packages
         run: |
-          if ("${{ github.event_name }}" -eq "workflow_dispatch") {
-            $tag = "${{ inputs.tag }}".Trim()
-          } else {
-            $tag = "${{ github.ref_name }}".Trim()
-          }
+          sudo apt-get update
+          sudo apt-get install --yes --no-install-recommends pkg-config libfontconfig1-dev xvfb
 
-          if ($tag -notmatch '^v\d+\.\d+\.\d+([-.][0-9A-Za-z.-]+)?$') {
-            throw "Release tag '$tag' is not a valid version tag."
-          }
-
-          "tag=$tag" >> $env:GITHUB_OUTPUT
-
-      - name: Create tag for manual releases
-        if: github.event_name == 'workflow_dispatch'
-        shell: pwsh
+      - name: Install pinned Rust toolchain
         run: |
-          $tag = "${{ steps.release_tag.outputs.tag }}"
-          git ls-remote --exit-code --tags origin "refs/tags/$tag"
-          if ($LASTEXITCODE -eq 0) { throw "Tag $tag already exists." }
-          git config user.name "github-actions[bot]"
-          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git tag -a "$tag" "$env:GITHUB_SHA" -m "Game Larper $tag"
-          git push origin "$tag"
+          rustup toolchain install 1.98.1 --profile minimal --component rustfmt,clippy
+          rustup override set 1.98.1
+          rustc --version
+          cargo --version
+
+      - name: Cache Rust build
+        uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: linux-x64
+
+      - name: Build release
+        run: ./scripts/build-release.sh
+
+      - name: Upload Linux package
+        uses: actions/upload-artifact@v4
+        with:
+          name: release-linux-x64
+          path: artifacts/release/GameLarper-linux-x64.tar.gz
+          if-no-files-found: error
+          retention-days: 7
+
+  publish:
+    name: Publish GitHub release
+    needs: [resolve, windows, linux]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+
+    steps:
+      - name: Checkout release commit
+        uses: actions/checkout@v7
+        with:
+          ref: ${{ needs.resolve.outputs.sha }}
+          fetch-depth: 0
+
+      - name: Download release packages
+        uses: actions/download-artifact@v4
+        with:
+          pattern: release-*
+          path: artifacts/release
+          merge-multiple: true
 
       - name: Prepare release notes
-        shell: pwsh
+        shell: bash
         run: |
-          $zip = "artifacts\release\GameLarper-win-x64.zip"
-          $hash = (Get-FileHash $zip -Algorithm SHA256).Hash.ToLowerInvariant()
-          $notes = @(
-            "### LARPINNNGGG",
-            "",
-            "First public Windows build of Game Larper.",
-            "",
-            "Pick a game. Press play. Discord gets lied to.",
-            "",
-            "**Windows 10/11 x64**",
-            "",
-            "Extract the ZIP and keep GameLarper.exe and GameLarper.Runner.exe together.",
-            "",
-            "Discord's game detector is undocumented, so some titles may not work. The binaries are currently unsigned, so Windows may show an unknown-publisher / SmartScreen warning.",
-            "",
-            "**SHA-256**",
-            $hash
-          )
-          $notes | Set-Content -Encoding utf8 release-notes.md
+          set -euo pipefail
 
-      - name: Publish GitHub Release
-        shell: pwsh
+          version="${{ needs.resolve.outputs.version }}"
+          notes_source="docs/releases/${version}.md"
+
+          if [[ -f "$notes_source" ]]; then
+            cp "$notes_source" release-notes.md
+          else
+            printf '# Game Larper %s\n\nSee the assets below for Windows and Linux builds.\n' \
+              "${{ needs.resolve.outputs.tag }}" > release-notes.md
+          fi
+
+          win_hash="$(sha256sum artifacts/release/GameLarper-win-x64.zip | awk '{print $1}')"
+          linux_hash="$(sha256sum artifacts/release/GameLarper-linux-x64.tar.gz | awk '{print $1}')"
+
+          cat >> release-notes.md <<EOF
+
+          ## SHA-256
+
+          `GameLarper-win-x64.zip`  
+          `${win_hash}`
+
+          `GameLarper-linux-x64.tar.gz`  
+          `${linux_hash}`
+          EOF
+
+      - name: Create release tag
+        shell: bash
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          $tag = "${{ steps.release_tag.outputs.tag }}"
-          gh release create "$tag" "artifacts\release\GameLarper-win-x64.zip#GameLarper-win-x64.zip" --repo "${{ github.repository }}" --title "Game Larper $tag" --notes-file release-notes.md --verify-tag
+          set -euo pipefail
+
+          tag="${{ needs.resolve.outputs.tag }}"
+          sha="${{ needs.resolve.outputs.sha }}"
+
+          if git ls-remote --exit-code --tags origin "refs/tags/$tag" >/dev/null 2>&1; then
+            echo "Tag $tag already exists; reusing it."
+          else
+            gh api \
+              --method POST \
+              "repos/${{ github.repository }}/git/refs" \
+              -f ref="refs/tags/$tag" \
+              -f sha="$sha"
+          fi
+
+      - name: Publish GitHub Release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+
+          tag="${{ needs.resolve.outputs.tag }}"
+
+          gh release create "$tag" \
+            "artifacts/release/GameLarper-win-x64.zip#GameLarper-win-x64.zip" \
+            "artifacts/release/GameLarper-linux-x64.tar.gz#GameLarper-linux-x64.tar.gz" \
+            --repo "${{ github.repository }}" \
+            --title "Game Larper $tag" \
+            --notes-file release-notes.md \
+            --verify-tag
