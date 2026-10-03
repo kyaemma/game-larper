@@ -203,11 +203,11 @@ jobs:
 
           ## SHA-256
 
-          `GameLarper-win-x64.zip`  
-          `${win_hash}`
+          \`GameLarper-win-x64.zip\`  
+          \`${win_hash}\`
 
-          `GameLarper-linux-x64.tar.gz`  
-          `${linux_hash}`
+          \`GameLarper-linux-x64.tar.gz\`  
+          \`${linux_hash}\`
           EOF
 
       - name: Create release tag
