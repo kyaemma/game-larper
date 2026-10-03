@@ -182,6 +182,8 @@ impl Dock {
             )
         };
         panel.set_from_left(from_left);
+        // The Settings gear in the main window turns toward this same side.
+        main.set_panel_from_left(from_left);
         panel
             .window()
             .set_size(PhysicalSize::new(width as u32, h.max(1) as u32));

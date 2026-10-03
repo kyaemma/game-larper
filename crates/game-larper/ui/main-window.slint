@@ -185,6 +185,8 @@ export component MainWindow inherits Window {
     in-out property <string> queue-line;
     // "" | "queue" | "settings"
     in-out property <string> panel;
+    // True when the panel is docked left of the window. Set by Rust (panel.rs).
+    in-out property <bool> panel-from-left;
 
     in-out property <string> toast;
     in-out property <bool> toast-visible;
@@ -348,6 +350,7 @@ export component MainWindow inherits Window {
             queue-line: root.queue-line;
             queue-open: root.panel == "queue";
             settings-open: root.panel == "settings";
+            settings-from-left: root.panel-from-left;
             db-status: root.db-status;
             db-color: root.db-color;
             queue => { root.toggle-queue(); }
