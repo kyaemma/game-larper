@@ -1,7 +1,7 @@
 // The bottom of the main window: the current session, the utility row, and toasts.
 
 import { Theme, Icons } from "theme.slint";
-import { Icon, Button, IconButton, Art, Gutter } from "controls.slint";
+import { Icon, Button, Art, Gutter } from "controls.slint";
 
 export component SessionDock inherits Rectangle {
     in property <image> art;
@@ -199,11 +199,65 @@ component QueueButton inherits Rectangle {
     }
 }
 
+// The Settings gear. While Settings is open it brightens and turns toward the side the panel
+// is docked on, with no filled tile. Hover, press, focus ring and keys match IconButton.
+component SettingsGearButton inherits Rectangle {
+    in property <bool> open;
+    in property <bool> from-left;
+    callback clicked();
+
+    property <angle> swing: 70deg;
+
+    width: 32px;
+    height: 32px;
+    border-radius: Theme.radius;
+    background: touch.pressed ? Theme.press : touch.has-hover ? Theme.hover : transparent;
+    animate background { duration: Theme.quick; easing: ease-out; }
+
+    accessible-role: button;
+    accessible-label: "Settings";
+    accessible-checkable: true;
+    accessible-checked: root.open;
+    accessible-action-default => { root.clicked(); }
+
+    focus := FocusScope {
+        focus-on-click: false;
+        key-pressed(event) => {
+            if (event.text == Key.Return || event.text == Key.Space) {
+                root.clicked();
+                return accept;
+            }
+            reject
+        }
+    }
+    touch := TouchArea {
+        mouse-cursor: pointer;
+        clicked => { root.clicked(); }
+    }
+    Icon {
+        source: Icons.settings;
+        tint: root.open ? Theme.accent-soft : touch.has-hover ? Theme.text : Theme.text-2;
+        animate colorize { duration: Theme.quick; }
+        transform-rotation: root.open ? (root.from-left ? -root.swing : root.swing) : 0deg;
+        animate transform-rotation { duration: Theme.normal; easing: ease-out; }
+    }
+    Rectangle {
+        x: -3px;
+        y: -3px;
+        width: parent.width + 6px;
+        height: parent.height + 6px;
+        border-radius: Theme.radius + 3px;
+        border-width: 2px;
+        border-color: focus.has-focus ? Theme.accent-soft.with-alpha(0.7) : transparent;
+    }
+}
+
 export component UtilityBar inherits Rectangle {
     in property <int> queue-count;
     in property <string> queue-line;
     in property <bool> queue-open;
     in property <bool> settings-open;
+    in property <bool> settings-from-left;
     in property <string> db-status;
     in property <color> db-color;
     callback queue();
@@ -253,11 +307,9 @@ export component UtilityBar inherits Rectangle {
         }
         VerticalLayout {
             alignment: center;
-            IconButton {
-                icon: Icons.settings;
-                tip: "Settings";
-                show-tip: false;
-                checked: root.settings-open;
+            SettingsGearButton {
+                open: root.settings-open;
+                from-left: root.settings-from-left;
                 clicked => { root.settings(); }
             }
         }
