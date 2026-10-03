@@ -91,6 +91,14 @@ cargo build --release
 
 If you move the binaries elsewhere, keep `game-larper` and `game-larper-runner` together.
 
+To build and install Game Larper as a per-user desktop application instead:
+
+```bash
+cargo xtask install
+```
+
+This installs both binaries to `~/.local/bin`, adds a desktop entry under your XDG data directory, and installs the Game Larper icon. No `sudo` is required.
+
 ## license
 
 Game Larper is licensed under the [MIT License](LICENSE).
