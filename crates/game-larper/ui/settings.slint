@@ -1,9 +1,8 @@
 // Settings content for the side panel. Values stay staged until Save.
 
-import { AboutSlint } from "std-widgets.slint";
-import { Credits } from "credits.slint";
-import { Theme } from "theme.slint";
-import { LogoMark, Button, Toggle, SectionLabel } from "controls.slint";
+import { AboutSlint, Palette } from "std-widgets.slint";
+import { Theme, Icons } from "theme.slint";
+import { Icon, LogoMark, Button, Toggle, SectionLabel, FocusRing } from "controls.slint";
 
 component Section inherits HorizontalLayout {
     in property <string> text;
@@ -97,6 +96,91 @@ component DataRow inherits HorizontalLayout {
     }
 }
 
+// A row that opens something outside the app: icon tile, label, detail, and an external mark.
+component LinkRow inherits Rectangle {
+    in property <image> icon;
+    in property <string> label;
+    in property <string> detail;
+    callback clicked();
+
+    min-height: 48px;
+    border-radius: Theme.radius;
+    background: touch.pressed ? Theme.press : touch.has-hover ? Theme.hover : transparent;
+    animate background { duration: Theme.quick; }
+
+    accessible-role: button;
+    accessible-label: root.label;
+    accessible-description: root.detail;
+    accessible-action-default => { root.clicked(); }
+
+    focus := FocusScope {
+        focus-on-click: false;
+        key-pressed(event) => {
+            if (event.text == Key.Return || event.text == Key.Space) {
+                root.clicked();
+                return accept;
+            }
+            reject
+        }
+    }
+    touch := TouchArea {
+        mouse-cursor: pointer;
+        clicked => { root.clicked(); }
+    }
+    HorizontalLayout {
+        padding-left: 10px;
+        padding-right: 10px;
+        spacing: 12px;
+        VerticalLayout {
+            alignment: center;
+            Rectangle {
+                width: 32px;
+                height: 32px;
+                border-radius: Theme.radius-m;
+                background: Theme.fill;
+                Icon {
+                    source: root.icon;
+                    x: (parent.width - self.width) / 2;
+                    y: (parent.height - self.height) / 2;
+                    tint: touch.has-hover || focus.has-focus ? Theme.text : Theme.text-2;
+                    animate colorize { duration: Theme.quick; }
+                }
+            }
+        }
+        VerticalLayout {
+            alignment: center;
+            spacing: 2px;
+            horizontal-stretch: 1;
+            Text {
+                text: root.label;
+                color: Theme.text;
+                font-size: Theme.text-m;
+            }
+            Text {
+                text: root.detail;
+                color: Theme.text-3;
+                font-size: Theme.text-s;
+                overflow: elide;
+            }
+        }
+        VerticalLayout {
+            alignment: center;
+            Icon {
+                source: Icons.external;
+                width: 14px;
+                height: 14px;
+                tint: touch.has-hover || focus.has-focus ? Theme.text-2 : Theme.text-3;
+                animate colorize { duration: Theme.quick; }
+            }
+        }
+    }
+    FocusRing {
+        active: focus.has-focus;
+        width: root.width + 6px;
+        height: root.height + 6px;
+    }
+}
+
 export component SettingsView inherits VerticalLayout {
     in-out property <bool> launch-with-windows;
     in-out property <bool> start-minimized;
@@ -111,6 +195,19 @@ export component SettingsView inherits VerticalLayout {
     callback clear-images();
     callback open-logs();
     callback open-data();
+    callback notify(string);
+
+    // Fixed project metadata, never user input.
+    property <string> contributors-url: "https://github.com/kyaemma/game-larper/graphs/contributors";
+
+    function open-contributors() {
+        if (!Platform.open-url(root.contributors-url)) {
+            root.notify("Couldn't open the browser.");
+        }
+    }
+
+    // The panel is always dark, so the Slint badge must not follow a light OS theme.
+    init => { Palette.color-scheme = ColorScheme.dark; }
 
     padding-left: 10px;
     padding-right: 10px;
@@ -179,8 +276,8 @@ export component SettingsView inherits VerticalLayout {
 
     Section { text: "ABOUT"; }
     HorizontalLayout {
+        min-height: 48px;
         padding-left: 10px;
-        padding-top: 8px;
         spacing: 12px;
         VerticalLayout {
             alignment: center;
@@ -206,14 +303,17 @@ export component SettingsView inherits VerticalLayout {
             }
         }
     }
+    LinkRow {
+        icon: Icons.users;
+        label: "Contributors";
+        detail: "View project contributors";
+        clicked => { root.open-contributors(); }
+    }
 
     // Required attribution for Slint's royalty-free desktop license.
     HorizontalLayout {
-        padding-left: 10px;
-        padding-top: 12px;
-        padding-bottom: 4px;
-        AboutSlint { }
+        alignment: center;
+        padding-top: 10px;
+        AboutSlint { preferred-width: 184px; }
     }
-    Section { text: "CREDITS"; }
-    Credits { }
 }

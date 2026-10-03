@@ -688,16 +688,18 @@ fn wire(
             wake();
         }
     });
-    ui.on_notify({
+    let notify = {
         let session = session.clone();
         let wake = wake.clone();
-        move |message| {
+        move |message: slint::SharedString| {
             if let Ok(mut session) = session.lock() {
                 toast_err(&mut session, message);
             }
             wake();
         }
-    });
+    };
+    ui.on_notify(notify.clone());
+    panel.on_notify(notify);
     let refresh = {
         let session = session.clone();
         let tx = tx.clone();
