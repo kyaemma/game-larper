@@ -145,6 +145,23 @@ panic, say) shows up as a warning.
   host and runner side by side; the current source build produces `game-larper` and
   `game-larper-runner`.
 
+## Install from source
+
+After cloning the repository and installing the build dependencies, Linux users can install a
+per-user desktop entry with:
+
+```bash
+cargo xtask install
+```
+
+The installer builds the optimized release host **and** `game-larper-runner`, then installs them
+side by side in `~/.local/bin`. It also installs the 256×256 Game Larper icon and a
+`game-larper.desktop` entry under `$XDG_DATA_HOME` (falling back to `~/.local/share`).
+
+No root access is used. Launchers such as GNOME, KDE, COSMIC, rofi and wofi can discover the desktop
+entry. Running `game-larper` directly from a terminal also works when `~/.local/bin` is on
+`PATH`.
+
 ## Manual test (Ubuntu VM, native Discord)
 
 Prepare:
