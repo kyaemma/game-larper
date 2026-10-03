@@ -90,7 +90,7 @@ fn install() -> Result<(), Box<dyn Error>> {
     let app_path = app_dest
         .to_str()
         .ok_or("the installed application path is not valid UTF-8")?;
-    let exec = desktop_exec(&[app_path]).ok_or("the application path cannot be written to Exec=")?;
+    let exec =\n        desktop_exec(&[app_path]).ok_or("the application path cannot be written to Exec=")?;
     let desktop = format!(
         "[Desktop Entry]
 Type=Application
