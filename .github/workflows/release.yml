@@ -187,7 +187,7 @@ jobs:
           set -euo pipefail
 
           version="${{ needs.resolve.outputs.version }}"
-          notes_source="docs/releases/${version}.md"
+          notes_source="docs/releases/v${version}.md"
 
           if [[ -f "$notes_source" ]]; then
             cp "$notes_source" release-notes.md
