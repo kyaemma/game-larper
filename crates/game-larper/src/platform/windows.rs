@@ -36,6 +36,8 @@ use windows_sys::Win32::UI::WindowsAndMessaging::{
     SendMessageW, SetWindowLongPtrW, WM_SETICON,
 };
 
+/// The Settings label for `set_run_at_startup`.
+pub const STARTUP_LABEL: &str = "Launch with Windows";
 const RUN_KEY: &str = "Software\\Microsoft\\Windows\\CurrentVersion\\Run";
 const STARTUP_VALUE: &str = "GameLarper";
 const MUTEX_NAME: &str = "Local\\GameLarper.SingleInstance";
