@@ -28,6 +28,8 @@ use crate::log::{Area, Log, redact};
 use crate::platform::WorkArea;
 
 const AUTOSTART_FILE: &str = "game-larper.desktop";
+/// The Settings label for `set_run_at_startup`: an XDG autostart entry starts with the session.
+pub const STARTUP_LABEL: &str = "Launch at login";
 
 /// The primary instance's lock (held for the process lifetime) and its activation socket.
 struct Instance {

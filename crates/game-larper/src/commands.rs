@@ -189,9 +189,7 @@ fn dispatch_queue_action(
         guard.selected = Some(item.application_id.clone());
         guard.active = Some(item.application_id.clone());
         guard.config.last_selected_discord_application_id = Some(item.application_id.clone());
-        if let Err(error) = ConfigStore::new(guard.paths.config()).save(&guard.config) {
-            log.error(Area::Settings, format!("Config save failed: {error}"));
-        }
+        save_config(&mut guard, log);
         game.or_else(|| {
             log.warn(
                 Area::Queue,
@@ -375,14 +373,11 @@ fn select_index(
         return;
     }
     session.selected = Some(request.id.clone());
-    session.config.last_selected_discord_application_id = Some(request.id.clone());
+    remember_selection(&mut session, request.id.clone());
     log.debug(
         Area::Session,
         format!("Selected {} / {}", request.id, request.name),
     );
-    if let Err(error) = ConfigStore::new(session.paths.config()).save(&session.config) {
-        log.error(Area::Settings, format!("Config save failed: {error}"));
-    }
     fetch_art(&mut session, &[request], tx, wake, true);
 }
 
@@ -572,8 +567,7 @@ fn save_settings(session: &Arc<Mutex<Session>>, panel: &Weak<SidePanel>, log: &L
         }
     }
     session.config = next;
-    if let Err(error) = ConfigStore::new(session.paths.config()).save(&session.config) {
-        log.error(Area::Settings, format!("Config save failed: {error}"));
+    if !save_config(&mut session, log) {
         toast_err(&mut session, "Settings could not be saved.");
         return false;
     }
@@ -587,6 +581,26 @@ fn save_settings(session: &Arc<Mutex<Session>>, panel: &Weak<SidePanel>, log: &L
     panel.set_settings_dirty(false);
     toast_ok(&mut session, "Settings saved.");
     true
+}
+
+/// Write the config now. Any write carries the latest selection, so it also settles one that
+/// `remember_selection` left pending.
+fn save_config(session: &mut Session, log: &Log) -> bool {
+    session.selection_unsaved = None;
+    match ConfigStore::new(session.paths.config()).save(&session.config) {
+        Ok(()) => true,
+        Err(error) => {
+            log.error(Area::Settings, format!("Config save failed: {error}"));
+            false
+        }
+    }
+}
+
+/// Keep the selection for the next launch without a durable write per arrow key: `tick` writes
+/// it once the selection has been still for `SELECTION_SAVE_DELAY`, and quitting flushes it.
+fn remember_selection(session: &mut Session, id: String) {
+    session.config.last_selected_discord_application_id = Some(id);
+    session.selection_unsaved = Some(Instant::now());
 }
 
 fn persist_queue(session: &mut Session) {
@@ -1056,7 +1070,7 @@ fn session_game(session: &Session) -> Option<&GameDefinition> {
 }
 
 /// Resume means the paused game, even if another row got selected meanwhile.
-fn reselect_paused(session: &mut Session, log: &Log) {
+fn reselect_paused(session: &mut Session) {
     if session.clock.state() != SessionState::Paused {
         return;
     }
@@ -1067,10 +1081,7 @@ fn reselect_paused(session: &mut Session, log: &Log) {
         return;
     }
     session.selected = Some(active.clone());
-    session.config.last_selected_discord_application_id = Some(active);
-    if let Err(error) = ConfigStore::new(session.paths.config()).save(&session.config) {
-        log.error(Area::Settings, format!("Config save failed: {error}"));
-    }
+    remember_selection(session, active);
 }
 
 struct Controls {

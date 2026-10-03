@@ -1,7 +1,7 @@
 // Queue content for the side panel: controls, the list, adding, and the one-shot schedule.
 
 import { Theme, Icons } from "theme.slint";
-import { Icon, Button, IconButton, TextField, Chip, Art, SectionLabel, Hairline } from "controls.slint";
+import { Icon, Button, IconButton, TextField, Chip, Art, SectionLabel, Hairline, FocusRing } from "controls.slint";
 import { QueueRow } from "models.slint";
 
 component QueueItem inherits Rectangle {
@@ -365,6 +365,16 @@ export component QueueView inherits VerticalLayout {
             accessible-expandable: true;
             accessible-expanded: root.schedule-open;
             accessible-action-default => { root.schedule-open = !root.schedule-open; }
+            disclose-focus := FocusScope {
+                focus-on-click: false;
+                key-pressed(event) => {
+                    if (event.text == Key.Return || event.text == Key.Space) {
+                        root.schedule-open = !root.schedule-open;
+                        return accept;
+                    }
+                    reject
+                }
+            }
             disclose := TouchArea {
                 mouse-cursor: pointer;
                 clicked => { root.schedule-open = !root.schedule-open; }
@@ -398,6 +408,11 @@ export component QueueView inherits VerticalLayout {
                         tint: Theme.text-3;
                     }
                 }
+            }
+            FocusRing {
+                active: disclose-focus.has-focus;
+                width: parent.width + 6px;
+                height: parent.height + 6px;
             }
         }
         if root.schedule-open: VerticalLayout {

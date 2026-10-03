@@ -145,6 +145,8 @@ export component IconButton inherits Rectangle {
     in property <bool> show-tip: true;
     // Draw the tooltip above, right-aligned, for buttons along the bottom edge.
     in property <bool> tip-above;
+    // False for buttons that have a keyboard path elsewhere, such as the result rows.
+    in property <bool> tab-stop: true;
     out property <bool> has-focus: focus.has-focus;
     callback clicked();
 
@@ -166,6 +168,7 @@ export component IconButton inherits Rectangle {
     focus := FocusScope {
         enabled: root.enabled;
         focus-on-click: false;
+        focus-on-tab-navigation: root.tab-stop;
         key-pressed(event) => {
             if (event.text == Key.Return || event.text == Key.Space) {
                 root.clicked();

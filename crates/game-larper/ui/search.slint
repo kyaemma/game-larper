@@ -205,9 +205,12 @@ component ResultRow inherits Rectangle {
                 animate opacity { duration: Theme.quick; }
                 VerticalLayout {
                     alignment: center;
+                    // The search field drives the rows (arrows, Enter, the menu key), so the
+                    // row buttons stay out of the Tab order instead of adding a hidden stop each.
                     more := IconButton {
                         icon: Icons.more;
                         tip: "More";
+                        tab-stop: false;
                         clicked => {
                             root.select();
                             root.menu(self.absolute-position.x + self.width - 216px, self.absolute-position.y + self.height + 4px);

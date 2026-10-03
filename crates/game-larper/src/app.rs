@@ -2,6 +2,7 @@ use std::cell::{Cell, RefCell};
 use std::collections::HashSet;
 use std::path::PathBuf;
 use std::rc::Rc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, mpsc};
 use std::time::{Duration, Instant, SystemTime};
 
@@ -33,6 +34,8 @@ const REVEAL_WAIT: Duration = Duration::from_millis(260);
 /// Keeps the startup loader from flashing for a single frame.
 const LOADING_MIN: Duration = Duration::from_millis(280);
 const CATALOG_STALE: Duration = Duration::from_secs(24 * 60 * 60);
+/// How long a new selection must stay put before it is written to the config.
+const SELECTION_SAVE_DELAY: Duration = Duration::from_secs(1);
 
 struct Models {
     hits: Rc<VecModel<Hit>>,
@@ -112,6 +115,8 @@ struct Session {
     results: Results,
     reveal: Option<Reveal>,
     selected: Option<String>,
+    /// When the selection last changed without being written to the config yet.
+    selection_unsaved: Option<Instant>,
     /// The game the runner was last launched for.
     active: Option<String>,
     clock: SessionClock,
@@ -156,6 +161,7 @@ pub fn run(
         })
     });
     panel.set_version_label(env!("CARGO_PKG_VERSION").into());
+    panel.set_startup_label(platform::STARTUP_LABEL.into());
     sync_settings_from_config(
         &panel,
         &session.lock().unwrap_or_else(|p| p.into_inner()).config,
@@ -164,6 +170,9 @@ pub fn run(
     // Drains worker results on the UI thread, then renders. Wake itself is handed to the
     // drain through a slot, because some results start more work.
     let wake_slot: Arc<Mutex<Option<Wake>>> = Arc::new(Mutex::new(None));
+    // One drain and render covers every message sent before it starts, so a burst of
+    // artwork results queues a single pass instead of one full render per picture.
+    let wake_queued = Arc::new(AtomicBool::new(false));
     let wake: Wake = {
         let rx = rx.clone();
         let session = session.clone();
@@ -174,6 +183,9 @@ pub fn run(
         let tx = tx.clone();
         let wake_slot = wake_slot.clone();
         Arc::new(move || {
+            if wake_queued.swap(true, Ordering::AcqRel) {
+                return;
+            }
             let ui_weak = ui_weak.clone();
             let panel_weak = panel_weak.clone();
             let tray_weak = tray_weak.clone();
@@ -182,7 +194,10 @@ pub fn run(
             let log = log.clone();
             let tx = tx.clone();
             let wake_slot = wake_slot.clone();
-            let _ = slint::invoke_from_event_loop(move || {
+            let queued = wake_queued.clone();
+            let posted = slint::invoke_from_event_loop(move || {
+                // Cleared before draining: anything sent from here on queues the next pass.
+                queued.store(false, Ordering::Release);
                 let (Some(ui), Some(panel), Some(tray)) =
                     (ui_weak.upgrade(), panel_weak.upgrade(), tray_weak.upgrade())
                 else {
@@ -195,6 +210,9 @@ pub fn run(
                 render(&ui, &panel, &tray, &session);
                 render_logs(&log);
             });
+            if posted.is_err() {
+                wake_queued.store(false, Ordering::Release);
+            }
         })
     };
     if let Ok(mut slot) = wake_slot.lock() {
@@ -322,12 +340,11 @@ pub fn run(
     log.debug(Area::App, "Event loop running");
     slint::run_event_loop()?;
     log.info(Area::App, "Event loop ended; releasing the runner");
-    if let Ok(mut host) = session
-        .lock()
-        .unwrap_or_else(|p| p.into_inner())
-        .host
-        .lock()
-    {
+    let mut session = session.lock().unwrap_or_else(|p| p.into_inner());
+    if session.selection_unsaved.is_some() {
+        save_config(&mut session, &log);
+    }
+    if let Ok(mut host) = session.host.lock() {
         let _ = host.stop();
     }
     log.info(Area::App, "Game Larper stopped");
@@ -384,6 +401,7 @@ fn load_session(paths: &AppPaths, log: &Arc<Log>) -> Session {
         results: Results::Idle,
         reveal: None,
         selected: None,
+        selection_unsaved: None,
         active: None,
         clock: SessionClock::new(),
         queue,
@@ -563,7 +581,7 @@ fn wire(
         let wake = wake.clone();
         move || {
             if let Ok(mut session) = session.lock() {
-                reselect_paused(&mut session, &log);
+                reselect_paused(&mut session);
             }
             begin_play(&session, &log, &tx, &wake);
             wake();
@@ -1258,6 +1276,12 @@ fn tick(session: &Arc<Mutex<Session>>, log: &Arc<Log>, tx: &mpsc::Sender<Msg>, w
     {
         session_guard.toast_until = None;
     }
+    if session_guard
+        .selection_unsaved
+        .is_some_and(|since| since.elapsed() >= SELECTION_SAVE_DELAY)
+    {
+        save_config(&mut session_guard, log);
+    }
     if !session_guard.restored && session_guard.loaded {
         session_guard.restored = true;
         if session_guard.config.auto_resume && session_guard.selected.is_some() {
@@ -1394,11 +1418,7 @@ fn apply_message(
                         );
                         session.selected = None;
                         session.config.last_selected_discord_application_id = None;
-                        if let Err(error) =
-                            ConfigStore::new(session.paths.config()).save(&session.config)
-                        {
-                            log.error(Area::Settings, format!("Config save failed: {error}"));
-                        }
+                        save_config(&mut session, log);
                     }
                     session.art_failed.clear();
                     reconcile_art(&session);

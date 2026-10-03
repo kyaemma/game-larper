@@ -29,6 +29,8 @@ export component SidePanel inherits Window {
 
     // Settings, staged until Save.
     in-out property <bool> launch-with-windows;
+    // Platform wording for that switch. Set by Rust.
+    in-out property <string> startup-label: "Launch with Windows";
     in-out property <bool> start-minimized;
     in-out property <bool> close-to-tray: true;
     in-out property <bool> restore-last: true;
@@ -119,6 +121,7 @@ export component SidePanel inherits Window {
                     settings := SettingsView {
                         width: parent.width;
                         launch-with-windows <=> root.launch-with-windows;
+                        startup-label: root.startup-label;
                         start-minimized <=> root.start-minimized;
                         close-to-tray <=> root.close-to-tray;
                         restore-last <=> root.restore-last;
