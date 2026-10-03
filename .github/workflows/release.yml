@@ -22,7 +22,7 @@ concurrency:
 jobs:
   resolve:
     name: Resolve release
-    if: github.event_name == 'workflow_dispatch' || startsWith(github.event.head_commit.message, 'release: v')
+    if: "${{ github.event_name == 'workflow_dispatch' || startsWith(github.event.head_commit.message, 'release: v') }}"
     runs-on: ubuntu-latest
     outputs:
       tag: ${{ steps.release.outputs.tag }}
