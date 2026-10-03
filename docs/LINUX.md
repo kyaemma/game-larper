@@ -141,9 +141,24 @@ panic, say) shows up as a warning.
 - **Fonts:** the UI asks for Segoe UI Variable and Consolas, which Linux usually lacks; fontconfig
   falls back to other fonts. Cosmetic.
 - **No window icon** is applied to the Linux runner (no known detection role).
-- **No Linux release artifact.** Build from source for now. A future artifact should contain the
-  host and runner side by side; the current source build produces `game-larper` and
-  `game-larper-runner`.
+- **Portable release packaging:** the Linux release archive contains the host and runner side by
+  side. Desktop integration is still provided by `cargo xtask install` when installing from source.
+
+## Install from a release
+
+Download `GameLarper-linux-x64.tar.gz` from the GitHub Releases page, then:
+
+```bash
+tar -xzf GameLarper-linux-x64.tar.gz
+cd <extracted-directory>
+./game-larper
+```
+
+Keep `game-larper` and `game-larper-runner` in the same directory. The archive preserves the
+executable bits and also includes the MIT `LICENSE`.
+
+This is the portable build. If you want a per-user desktop entry and icon installed under the XDG
+directories, use the source installer below.
 
 ## Install from source
 
