@@ -19,8 +19,9 @@ what OS and Discord build, or say plainly that you could not run it.
 
 ## Setup
 
-Toolchain is pinned by `rust-toolchain.toml`: Rust **1.98.1**, edition 2024. rustup installs it
-for you. Linux build dependencies on Debian/Ubuntu:
+The Rust toolchain is pinned by `rust-toolchain.toml` to **1.98.1**; the workspace uses
+Rust edition 2024 from `Cargo.toml`. rustup installs the pinned toolchain for you. Linux build
+dependencies on Debian/Ubuntu:
 
 ```bash
 sudo apt-get install --yes build-essential pkg-config libfontconfig1-dev
@@ -114,8 +115,9 @@ Environment knobs:
 | Linux desktop installer | `xtask/src/main.rs` |
 | CI and release automation | `.github/workflows/{ci,release}.yml` |
 
-Slint files are compiled by `build.rs` into `**/generated/` and `**/*.slint.rs`, both gitignored.
-Never commit generated UI code. UI icons are monochrome white SVGs tinted at runtime; see
+Slint files are compiled by `crates/game-larper/build.rs`; the generated Rust goes through
+Cargo's build output (`OUT_DIR` under `target/`) and is not source-controlled. Never commit
+generated UI code. UI icons are monochrome white SVGs tinted at runtime; see
 `assets/ui/README.md`. Branding lives in `assets/branding/`.
 
 ## Rules the code depends on
@@ -137,8 +139,10 @@ Never commit generated UI code. UI icons are monochrome white SVGs tinted at run
   created, and remote executable strings never leave the runtime root. Logs redact paths.
 - Config stays camelCase JSON so a file written by the older C# build still loads. The catalog
   cache is `cache/catalog.json`, with a one-shot read of legacy `cache/discord-detectables.json`.
-- Data roots are `%LOCALAPPDATA%\GameLarper\` on Windows and `$XDG_DATA_HOME/GameLarper`
-  (else `~/.local/share/GameLarper`) on Linux. Do not write outside them.
+- Application data stays under `%LOCALAPPDATA%\GameLarper\` on Windows and
+  `$XDG_DATA_HOME/GameLarper` (else `~/.local/share/GameLarper`) on Linux. OS integration is
+  the deliberate exception: Windows startup uses the registry; Linux autostart / desktop install
+  uses the relevant XDG config/data locations and `~/.local/bin`.
 - Dependencies: Slint stays `~1.18.1` with `default-features = false`, `backend-winit` and
   `renderer-femtovg` (no Skia). Prefer crates already in the tree — x11rb comes via winit, arboard
   via Slint — and record the reason for a new one in the PR.
