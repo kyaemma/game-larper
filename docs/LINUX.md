@@ -191,7 +191,7 @@ Prepare:
    cd game-larper
    git checkout main
    git pull --ff-only
-   cargo build --release
+   cargo build --release // If you don t build it in release mode it can affect the app speed
    ```
 
 3. Install native Discord (the `.deb` from discord.com, not the Flatpak or Snap). Log in. Enable
