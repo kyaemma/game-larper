@@ -38,7 +38,8 @@ export component SidePanel inherits Window {
     in-out property <bool> preserve-queue: true;
     in-out property <bool> settings-dirty;
     in-out property <string> database-detail;
-    in-out property <string> version-label: "0.1.0";
+    // Package version. Set by Rust.
+    in-out property <string> version-label;
 
     // Queue.
     in-out property <[QueueRow]> queue-rows;

@@ -13,7 +13,7 @@ pub const DETECTABLE_ENDPOINTS: &[&str] = &[
     "https://discord.com/api/v9/applications/detectable",
 ];
 
-pub const USER_AGENT: &str = "GameLarper/0.1";
+pub const USER_AGENT: &str = concat!("GameLarper/", env!("CARGO_PKG_VERSION"));
 pub const MAX_CATALOG_BYTES: usize = 40_000_000;
 pub const CATALOG_TTL: Duration = Duration::from_secs(24 * 60 * 60);
 
