@@ -112,7 +112,7 @@ export component LogWindow inherits Window {
 
     forward-focus: keys;
 
-    // Measure the level and area columns; never shown. "settings" is the widest area label.
+    // Measure the level and area columns; never shown. "favorites" is the widest area label.
     level-probe := Text {
         text: "SUCCESS";
         font-size: Theme.text-s;
@@ -121,7 +121,7 @@ export component LogWindow inherits Window {
         visible: false;
     }
     area-probe := Text {
-        text: "settings";
+        text: "favorites";
         font-size: Theme.text-s;
         font-family: Theme.mono;
         visible: false;

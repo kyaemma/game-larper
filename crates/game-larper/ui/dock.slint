@@ -1,7 +1,7 @@
 // The bottom of the main window: the current session, the utility row, and toasts.
 
 import { Theme, Icons } from "theme.slint";
-import { Icon, Button, Art, Gutter } from "controls.slint";
+import { Icon, Button, Art, Gutter, IconButton } from "controls.slint";
 
 export component SessionDock inherits Rectangle {
     in property <image> art;
@@ -16,9 +16,11 @@ export component SessionDock inherits Rectangle {
     in property <bool> pause-enabled;
     in property <bool> stop-enabled;
     in property <string> play-label;
+    in property <bool> favorite;
     callback play();
     callback pause();
     callback stop();
+    callback toggle-favorite();
 
     background: Theme.bg-alt;
     vertical-stretch: 0;
@@ -52,6 +54,19 @@ export component SessionDock inherits Rectangle {
                         overflow: elide;
                         horizontal-stretch: 1;
                         vertical-alignment: center;
+                    }
+                    VerticalLayout {
+                        alignment: center;
+                        IconButton {
+                            width: 26px;
+                            height: 26px;
+                            icon: root.favorite ? Icons.star-filled : Icons.star;
+                            icon-size: 15px;
+                            tint: root.favorite ? Theme.accent-soft : Theme.text-2;
+                            tip: root.favorite ? "Remove from favorites" : "Add to favorites";
+                            tip-above: true;
+                            clicked => { root.toggle-favorite(); }
+                        }
                     }
                     if root.mode != "stopped": Text {
                         text: root.time;

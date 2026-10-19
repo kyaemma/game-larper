@@ -745,27 +745,53 @@ fn sync_settings_from_config(panel: &SidePanel, config: &AppConfig) {
 
 /// Recompute the rows for the current query.
 ///
-/// When the first rows have no artwork in memory yet, the new list waits (up to a short
-/// deadline) so rows appear with their pictures. Until then the previous rows stay, or a
-/// skeleton shows when there were none.
+/// An empty query shows the favorites, or the idle message when there are none. Otherwise the
+/// rows are search results.
 fn plan_results(session: &mut Session) -> ArtPlan {
     session.reveal = None;
     if session.query.trim().is_empty() {
-        session.shown.clear();
-        session.results = Results::Idle;
-        return ArtPlan::default();
+        return plan_favorites(session);
     }
     if !session.loaded {
         session.shown.clear();
+        session.shown_favorites = false;
         session.results = Results::Pending;
         return ArtPlan::default();
     }
     let found = game_larper_core::search(&session.games, &session.query, DEFAULT_SEARCH_LIMIT);
     if found.is_empty() {
         session.shown.clear();
+        session.shown_favorites = false;
         session.results = Results::Empty;
         return ArtPlan::default();
     }
+    plan_rows(session, found, false)
+}
+
+/// The empty-query view: the favorites, or the idle message when there are none.
+fn plan_favorites(session: &mut Session) -> ArtPlan {
+    let listed = !session.favorite_rows.is_empty();
+    if !session.loaded || (!listed && session.favorite_missing.is_empty()) {
+        session.shown.clear();
+        session.shown_favorites = false;
+        session.results = Results::Idle;
+        return ArtPlan::default();
+    }
+    if !listed {
+        // Only favorites the catalog no longer lists. Their rows have no artwork to wait for.
+        session.shown.clear();
+        session.shown_favorites = true;
+        session.results = Results::Ready;
+        return ArtPlan::default();
+    }
+    let found = session.favorite_rows.clone();
+    plan_rows(session, found, true)
+}
+
+/// Make `found` the list on screen. When the first rows have no artwork in memory yet, the new
+/// list waits (up to a short deadline) so rows appear with their pictures. Until then the
+/// previous rows stay, or a skeleton shows when there were none.
+fn plan_rows(session: &mut Session, found: Vec<usize>, favorites: bool) -> ArtPlan {
     let wanted = |range: &[usize]| -> Vec<ArtRequest> {
         range
             .iter()
@@ -777,19 +803,22 @@ fn plan_results(session: &mut Session) -> ArtPlan {
     let split = found.len().min(REVEAL_ROWS);
     let plan = ArtPlan {
         first: wanted(&found[..split]),
-        rest: wanted(&found[split..]),
+        rest: wanted(&found[split..found.len().min(ART_ROWS)]),
     };
     if plan.first.is_empty() {
         session.shown = found;
+        session.shown_favorites = favorites;
         session.results = Results::Ready;
         return plan;
     }
     if session.results != Results::Ready || session.shown.is_empty() {
         session.shown.clear();
+        session.shown_favorites = false;
         session.results = Results::Pending;
     }
     session.reveal = Some(Reveal {
         shown: found,
+        favorites,
         waiting: plan.first.iter().map(|request| request.id.clone()).collect(),
         deadline: Instant::now() + ART_DEBOUNCE + REVEAL_WAIT,
     });
@@ -803,7 +832,212 @@ fn settle_reveal(session: &mut Session, now: Instant) {
         .is_some_and(|reveal| reveal.waiting.is_empty() || now >= reveal.deadline);
     if ready && let Some(reveal) = session.reveal.take() {
         session.shown = reveal.shown;
+        session.shown_favorites = reveal.favorites;
         session.results = Results::Ready;
+    }
+}
+
+/// Sort the favorites against one pass over the catalog. Favorites are few, so they go in a
+/// small map instead of an id index over the whole catalog.
+///
+/// Returns the catalog indexes of the favorites that are listed, sorted by name, and the
+/// positions in `favorites` of the ones that are not.
+fn resolve_favorites(games: &[GameDefinition], favorites: &Favorites) -> (Vec<usize>, Vec<usize>) {
+    let positions: HashMap<&str, usize> = favorites
+        .items()
+        .iter()
+        .enumerate()
+        .map(|(position, favorite)| (favorite.id.as_str(), position))
+        .collect();
+    let mut found = vec![false; favorites.len()];
+    let mut rows = Vec::new();
+    for (index, game) in games.iter().enumerate() {
+        if let Some(&position) = positions.get(game.id.as_str())
+            && !found[position]
+        {
+            found[position] = true;
+            rows.push(index);
+        }
+    }
+    rows.sort_by(|&left, &right| {
+        name_order(&games[left].name, &games[right].name).then(left.cmp(&right))
+    });
+    let missing = (0..favorites.len())
+        .filter(|&position| !found[position])
+        .collect();
+    (rows, missing)
+}
+
+/// Case-insensitive, as the search results are ordered.
+fn name_order(left: &str, right: &str) -> std::cmp::Ordering {
+    left.chars()
+        .flat_map(char::to_uppercase)
+        .cmp(right.chars().flat_map(char::to_uppercase))
+}
+
+/// Re-resolve the favorites after the catalog or the favorites changed, and keep their names
+/// current with the catalog. The file is written only when a name changed.
+fn refresh_favorites(session: &mut Session) {
+    let (rows, missing) = resolve_favorites(&session.games, &session.favorites);
+    session.favorite_rows = rows;
+    session.favorite_missing = missing;
+    // The names come from the rows just resolved, so the catalog is not scanned again.
+    let names: HashMap<&str, &str> = session
+        .favorite_rows
+        .iter()
+        .map(|&index| {
+            (
+                session.games[index].id.as_str(),
+                session.games[index].name.as_str(),
+            )
+        })
+        .collect();
+    let changed = session
+        .favorites
+        .refresh_names(|id| names.get(id).copied());
+    if changed && !session.favorites_unreadable {
+        persist_favorites(session);
+    }
+}
+
+/// Read favorites.json again after an earlier read failed. True when the favorites in memory
+/// may be saved: the file read this time, or there was nothing to read.
+fn reload_unreadable_favorites(
+    path: &std::path::Path,
+    favorites: &mut Favorites,
+    unreadable: &mut bool,
+    log: &Log,
+) -> bool {
+    if !*unreadable {
+        return true;
+    }
+    match load_favorites(path) {
+        Ok((loaded, warnings)) => {
+            for warning in warnings {
+                log.warn(Area::Favorites, warning);
+            }
+            log.info(
+                Area::Favorites,
+                format!("Favorites file readable again; loaded {}", loaded.len()),
+            );
+            *favorites = loaded;
+            *unreadable = false;
+            true
+        }
+        Err(message) => {
+            log.warn(Area::Favorites, message);
+            false
+        }
+    }
+}
+
+/// Write the favorites file. False when the write failed; the list in memory is kept either way.
+fn persist_favorites(session: &Session) -> bool {
+    match save_favorites(&session.paths.favorites(), &session.favorites) {
+        Ok(()) => true,
+        Err(error) => {
+            session
+                .log
+                .error(Area::Files, format!("Favorites save failed: {error}"));
+            false
+        }
+    }
+}
+
+/// Star or unstar a game. An empty `id` means the selected game, which is what Ctrl+D means.
+fn toggle_favorite(session: &Arc<Mutex<Session>>, tx: &mpsc::Sender<Msg>, wake: &Wake, id: &str) {
+    let Ok(mut session) = session.lock() else {
+        return;
+    };
+    let id = if id.is_empty() {
+        session.selected.clone()
+    } else {
+        Some(id.to_string())
+    };
+    let Some(id) = id else {
+        toast(&mut session, "Select a game first.");
+        return;
+    };
+    // An unreadable file must not be overwritten with the in-memory list, so retry the read
+    // first and refuse the change if it still fails.
+    let readable = {
+        let session = &mut *session;
+        reload_unreadable_favorites(
+            &session.paths.favorites(),
+            &mut session.favorites,
+            &mut session.favorites_unreadable,
+            &session.log,
+        )
+    };
+    if !readable {
+        toast_err(&mut session, "Favorites couldn't be read, so nothing was changed.");
+        return;
+    }
+    let favorite = session
+        .favorites
+        .items()
+        .iter()
+        .find(|item| item.id == id)
+        .map(|item| item.name.clone());
+    let (name, added) = match favorite {
+        Some(name) => {
+            session.favorites.remove(&id);
+            (name, false)
+        }
+        None => {
+            let Some(name) = session
+                .games
+                .iter()
+                .find(|game| game.id == id)
+                .map(|game| game.name.clone())
+            else {
+                session.log.debug(
+                    Area::Favorites,
+                    format!("Favorite {id} is not in the catalog; not added"),
+                );
+                return;
+            };
+            match session.favorites.add(&id, &name) {
+                Ok(true) => (name, true),
+                Ok(false) => return,
+                Err(error) => {
+                    session.log.warn(
+                        Area::Favorites,
+                        format!("Adding {name} ({id}) refused: {error}"),
+                    );
+                    toast_err(&mut session, error.to_string());
+                    return;
+                }
+            }
+        }
+    };
+    let total = session.favorites.len();
+    let saved = persist_favorites(&session);
+    if added {
+        session.log.info(
+            Area::Favorites,
+            format!("Added {name} ({id}) to favorites; {total} total"),
+        );
+    } else {
+        session.log.info(
+            Area::Favorites,
+            format!("Removed {name} ({id}) from favorites; {total} total"),
+        );
+    }
+    if !saved {
+        toast_err(&mut session, "Favorites could not be saved.");
+    } else if added {
+        toast_ok(&mut session, format!("Added {name} to favorites."));
+    } else {
+        toast(&mut session, format!("Removed {name} from favorites."));
+    }
+    refresh_favorites(&mut session);
+    // Starring a search result leaves the search list unchanged, so only the favorites view
+    // is re-planned (and its artwork fetched).
+    if session.query.trim().is_empty() {
+        let plan = plan_results(&mut session);
+        fetch_art(&mut session, &plan.first, tx, wake, true);
+        fetch_art(&mut session, &plan.rest, tx, wake, false);
     }
 }
 
@@ -902,11 +1136,11 @@ fn art_pinned(session: &Session, id: &str) -> bool {
             .items()
             .iter()
             .any(|item| item.application_id == id)
-        || session.shown.iter().any(shows)
+        || session.shown.iter().take(PINNED_ROWS).any(shows)
         || session
             .reveal
             .as_ref()
-            .is_some_and(|reveal| reveal.shown.iter().any(shows))
+            .is_some_and(|reveal| reveal.shown.iter().take(PINNED_ROWS).any(shows))
 }
 
 /// Forget decoded artwork whose game left the catalog or whose artwork source changed.
@@ -994,7 +1228,7 @@ fn hide_log_window(window: &LogWindow, log: &Log) {
 }
 
 fn hit_rows(session: &Session) -> Vec<Hit> {
-    session
+    let mut hits: Vec<Hit> = session
         .shown
         .iter()
         .filter_map(|&index| session.games.get(index))
@@ -1004,8 +1238,30 @@ fn hit_rows(session: &Session) -> Vec<Hit> {
             name: game.name.clone().into(),
             art: cached_art(&game.id),
             selected: session.selected.as_deref() == Some(game.id.as_str()),
+            favorite: session.shown_favorites || session.favorites.contains(&game.id),
+            missing: false,
         })
-        .collect()
+        .collect();
+    // Favorites the catalog does not list follow the listed ones. They have no catalog index,
+    // so index-based callbacks never reach them.
+    if session.shown_favorites {
+        hits.extend(
+            session
+                .favorite_missing
+                .iter()
+                .filter_map(|&position| session.favorites.items().get(position))
+                .map(|favorite| Hit {
+                    id: favorite.id.clone().into(),
+                    steam_id: SharedString::default(),
+                    name: favorite.name.clone().into(),
+                    art: slint::Image::default(),
+                    selected: false,
+                    favorite: true,
+                    missing: true,
+                }),
+        );
+    }
+    hits
 }
 
 /// Update rows in place so delegates, hover state, and scroll position survive a render.

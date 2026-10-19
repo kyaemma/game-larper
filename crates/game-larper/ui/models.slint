@@ -8,6 +8,10 @@ export struct Hit {
     name: string,
     art: image,
     selected: bool,
+    // Starred by the user.
+    favorite: bool,
+    // A favorite the catalog does not list right now. Shown dimmed, and never playable.
+    missing: bool,
 }
 
 export struct QueueRow {

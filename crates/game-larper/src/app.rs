@@ -1,5 +1,5 @@
 use std::cell::{Cell, RefCell};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -9,8 +9,9 @@ use std::time::{Duration, Instant, SystemTime};
 use chrono::{Local, NaiveDate, NaiveTime, TimeZone};
 use game_larper_core::{
     AppConfig, AppPaths, CatalogCache, ConfigStore, DEFAULT_SEARCH_LIMIT, DEFAULT_TRANSITION_GAP,
-    GameDefinition, QueueAction, QueueActivity, QueueItem, QueueMachine, SessionClock,
-    SessionState, format_hms, load_catalog_with_legacy, load_queue, save_queue, unix_time_ms,
+    Favorites, GameDefinition, QueueAction, QueueActivity, QueueItem, QueueMachine, SessionClock,
+    SessionState, format_hms, load_catalog_with_legacy, load_favorites, load_queue, save_favorites,
+    save_queue, unix_time_ms,
 };
 use slint::{ComponentHandle, Model, ModelRc, SharedString, Timer, TimerMode, VecModel, Weak};
 
@@ -27,6 +28,12 @@ type Wake = Arc<dyn Fn() + Send + Sync>;
 
 /// Rows whose artwork may hold back a new result list.
 const REVEAL_ROWS: usize = 10;
+/// Rows of a list whose artwork is fetched. Only a long favorites list reaches this; rows below
+/// it show artwork already in memory, else the logo.
+const ART_ROWS: usize = art_cache::MAX_ENTRIES / 2;
+/// List rows whose artwork is never evicted. As many as a search shows, so a long favorites list
+/// pins no more than a search does.
+const PINNED_ROWS: usize = DEFAULT_SEARCH_LIMIT;
 /// Typing pause before artwork is fetched.
 const ART_DEBOUNCE: Duration = Duration::from_millis(110);
 /// Longest wait for artwork before rows show with the placeholder.
@@ -81,6 +88,8 @@ enum Results {
 /// A result list waiting for its first rows of artwork.
 struct Reveal {
     shown: Vec<usize>,
+    /// The list is the favorites view rather than a search.
+    favorites: bool,
     waiting: HashSet<String>,
     deadline: Instant,
 }
@@ -114,6 +123,16 @@ struct Session {
     shown: Vec<usize>,
     results: Results,
     reveal: Option<Reveal>,
+    /// The starred games, in the order they were added.
+    favorites: Favorites,
+    /// Indexes into `games` of the favorites the catalog lists, sorted by name.
+    favorite_rows: Vec<usize>,
+    /// Indexes into `favorites` of the favorites the catalog does not list right now.
+    favorite_missing: Vec<usize>,
+    /// True when `shown` holds the favorites view rather than a search.
+    shown_favorites: bool,
+    /// favorites.json exists but could not be read. Nothing is written until a later read succeeds.
+    favorites_unreadable: bool,
     selected: Option<String>,
     /// When the selection last changed without being written to the config yet.
     selection_unsaved: Option<Instant>,
@@ -385,6 +404,18 @@ fn load_session(paths: &AppPaths, log: &Arc<Log>) -> Session {
             ),
         );
     }
+    let (favorites, favorites_unreadable) = match load_favorites(&paths.favorites()) {
+        Ok((favorites, warnings)) => {
+            for warning in warnings {
+                log.warn(Area::Favorites, warning);
+            }
+            (favorites, false)
+        }
+        Err(message) => {
+            log.warn(Area::Favorites, message);
+            (Favorites::default(), true)
+        }
+    };
     Session {
         paths: paths.clone(),
         log: log.clone(),
@@ -400,6 +431,11 @@ fn load_session(paths: &AppPaths, log: &Arc<Log>) -> Session {
         shown: Vec::new(),
         results: Results::Idle,
         reveal: None,
+        favorites,
+        favorite_rows: Vec::new(),
+        favorite_missing: Vec::new(),
+        shown_favorites: false,
+        favorites_unreadable,
         selected: None,
         selection_unsaved: None,
         active: None,
@@ -690,6 +726,15 @@ fn wire(
         move |index| {
             select_index(&session, &log, &tx, &wake, index as usize);
             add_selected_to_queue(&session, &panel);
+            wake();
+        }
+    });
+    ui.on_toggle_favorite({
+        let session = session.clone();
+        let tx = tx.clone();
+        let wake = wake.clone();
+        move |id| {
+            toggle_favorite(&session, &tx, &wake, id.as_str());
             wake();
         }
     });
@@ -1178,6 +1223,13 @@ fn render_main(ui: &MainWindow, session: &Session, now: Instant) {
         };
     let current = session_game(session);
     ui.set_session_visible(current.is_some());
+    ui.set_session_id(
+        current
+            .map(|game| game.id.clone())
+            .unwrap_or_default()
+            .into(),
+    );
+    ui.set_session_favorite(current.is_some_and(|game| session.favorites.contains(&game.id)));
     ui.set_active_id(
         current
             .filter(|_| state != SessionState::Stopped)
@@ -1207,6 +1259,8 @@ fn render_main(ui: &MainWindow, session: &Session, now: Instant) {
 
     ui.set_queue_count(session.queue.items().len() as i32);
     ui.set_queue_line(queue_line(session).into());
+    ui.set_favorites_view(session.shown_favorites && session.results == Results::Ready);
+    ui.set_favorite_count(session.favorites.len() as i32);
     ui.set_toast_visible(session.toast_until.is_some_and(|until| now < until));
     if !session.toast.is_empty() {
         ui.set_toast(session.toast.clone().into());
@@ -1369,6 +1423,7 @@ fn apply_message(
                 session.selected =
                     Some(id).filter(|id| session.games.iter().any(|game| game.id == *id));
             }
+            refresh_favorites(&mut session);
             let plan = plan_results(&mut session);
             fetch_art(&mut session, &plan.first, tx, wake, true);
             fetch_art(&mut session, &plan.rest, tx, wake, false);
@@ -1399,6 +1454,7 @@ fn apply_message(
             match result {
                 Ok(games) => {
                     session.games = supported_only(games);
+                    refresh_favorites(&mut session);
                     let count = session.games.len();
                     session.loaded = true;
                     session.offline = false;
@@ -1691,6 +1747,79 @@ mod tests {
         assert_eq!(events.len(), 1);
         assert_eq!(events[0].0, LogLevel::Info);
         assert!(events[0].1.starts_with("Scheduled start ("));
+    }
+
+    #[test]
+    fn favorites_resolve_by_name_ignoring_case_and_report_missing_in_order() {
+        let games = vec![
+            GameDefinition::new("3", "Hades"),
+            GameDefinition::new("1", "elden ring"),
+            GameDefinition::new("2", "Celeste"),
+            GameDefinition::new("4", "bastion"),
+        ];
+        let mut favorites = Favorites::default();
+        favorites.add("1", "elden ring").unwrap();
+        favorites.add("9", "Gone").unwrap();
+        favorites.add("4", "bastion").unwrap();
+        favorites.add("3", "Hades").unwrap();
+        favorites.add("8", "Also gone").unwrap();
+
+        let (rows, missing) = resolve_favorites(&games, &favorites);
+        // Case-insensitive: "bastion" < "elden ring" < "Hades". A case-sensitive sort would
+        // put the lowercase names last.
+        assert_eq!(rows, vec![3, 1, 0]);
+        assert_eq!(missing, vec![1, 4]);
+    }
+
+    #[test]
+    fn unreadable_favorites_are_not_saved_until_read() {
+        let root = std::env::temp_dir().join(format!(
+            "game-larper-unreadable-{}-{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        let path = root.join("favorites.json");
+        // A directory cannot be read as the favorites file.
+        std::fs::create_dir_all(&path).unwrap();
+        let log = Log::new(root.join("logs"));
+        let mut favorites = Favorites::default();
+        favorites.add("9", "In memory").unwrap();
+        let mut unreadable = true;
+
+        assert!(!reload_unreadable_favorites(
+            &path,
+            &mut favorites,
+            &mut unreadable,
+            &log
+        ));
+        assert!(unreadable);
+        assert!(path.is_dir());
+
+        std::fs::remove_dir(&path).unwrap();
+        let mut stored = Favorites::default();
+        stored.add("1", "One").unwrap();
+        stored.add("2", "Two").unwrap();
+        save_favorites(&path, &stored).unwrap();
+
+        assert!(reload_unreadable_favorites(
+            &path,
+            &mut favorites,
+            &mut unreadable,
+            &log
+        ));
+        assert!(!unreadable);
+        assert_eq!(favorites, stored);
+    }
+
+    #[test]
+    fn empty_favorites_resolve_to_nothing() {
+        let games = vec![GameDefinition::new("1", "Elden Ring")];
+        let (rows, missing) = resolve_favorites(&games, &Favorites::default());
+        assert!(rows.is_empty());
+        assert!(missing.is_empty());
     }
 
     #[test]

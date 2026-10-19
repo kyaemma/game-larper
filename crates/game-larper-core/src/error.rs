@@ -8,6 +8,7 @@ pub enum Error {
     InvalidApplicationId,
     Io(std::io::Error),
     Queue(&'static str),
+    Favorites(&'static str),
 }
 
 impl fmt::Display for Error {
@@ -15,6 +16,7 @@ impl fmt::Display for Error {
         match self {
             Self::Format(message) => formatter.write_str(message),
             Self::Queue(message) => formatter.write_str(message),
+            Self::Favorites(message) => formatter.write_str(message),
             Self::Json(error) => write!(formatter, "The file is not valid JSON: {error}"),
             Self::UnsafePath(message) => formatter.write_str(message),
             Self::InvalidApplicationId => formatter.write_str("Invalid Discord application ID."),

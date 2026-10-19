@@ -55,6 +55,10 @@ impl AppPaths {
         self.root.join("queue.json")
     }
 
+    pub fn favorites(&self) -> PathBuf {
+        self.root.join("favorites.json")
+    }
+
     pub fn catalog(&self) -> PathBuf {
         self.root.join("cache").join("catalog.json")
     }

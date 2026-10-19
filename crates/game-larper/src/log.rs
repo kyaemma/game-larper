@@ -33,7 +33,7 @@ impl LogLevel {
 
 /// The part of Game Larper a line comes from.
 ///
-/// The console sizes its area column from the widest label ("settings" in log-window.slint),
+/// The console sizes its area column from the widest label ("favorites" in log-window.slint),
 /// so keep new labels at most that long.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Area {
@@ -46,6 +46,7 @@ pub enum Area {
     Settings,
     Network,
     Files,
+    Favorites,
 }
 
 impl Area {
@@ -60,6 +61,7 @@ impl Area {
             Self::Settings => "settings",
             Self::Network => "network",
             Self::Files => "files",
+            Self::Favorites => "favorites",
         }
     }
 }
@@ -454,11 +456,12 @@ mod tests {
             Area::Settings,
             Area::Network,
             Area::Files,
+            Area::Favorites,
         ];
         assert!(
             areas
                 .iter()
-                .all(|area| area.label().len() <= "settings".len())
+                .all(|area| area.label().len() <= "favorites".len())
         );
     }
 

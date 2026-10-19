@@ -1,7 +1,7 @@
 // Search: the field, result rows, and the quiet states around them.
 
 import { Theme, Icons } from "theme.slint";
-import { Icon, LogoMark, Tip, Button, IconButton, Art } from "controls.slint";
+import { Icon, LogoMark, Tip, Button, IconButton, Art, SectionLabel } from "controls.slint";
 import { Hit } from "models.slint";
 
 export component SearchField inherits Rectangle {
@@ -10,6 +10,7 @@ export component SearchField inherits Rectangle {
     callback accepted();
     callback step(int);
     callback menu();
+    callback favorite();
 
     public function clear() {
         input.text = "";
@@ -57,6 +58,10 @@ export component SearchField inherits Rectangle {
             }
             if (event.text == Key.Menu || (event.text == Key.F10 && event.modifiers.shift)) {
                 root.menu();
+                return accept;
+            }
+            if (event.modifiers.control && (event.text == "d" || event.text == "D")) {
+                root.favorite();
                 return accept;
             }
             reject
@@ -145,28 +150,44 @@ component SteamLink inherits Rectangle {
 component ResultRow inherits Rectangle {
     in property <Hit> hit;
     in property <bool> can-play: true;
+    // Resting stars stay hidden in the favorites view, where every row is a favorite.
+    in property <bool> quiet-favorite;
     callback select();
     callback play();
     callback menu(length, length);
     callback steam();
+    callback favorite();
 
     height: 56px;
     border-radius: Theme.radius-m;
-    background: root.hit.selected ? Theme.accent-tint : touch.has-hover ? Theme.hover : transparent;
+    background: root.hit.selected && !root.hit.missing ? Theme.accent-tint : touch.has-hover ? Theme.hover : transparent;
     animate background { duration: Theme.quick; }
     accessible-role: list-item;
-    accessible-label: root.hit.name;
-    accessible-item-selectable: true;
+    accessible-label: root.hit.missing ? root.hit.name + ", not in Discord’s list right now" : root.hit.name;
+    accessible-item-selectable: !root.hit.missing;
     accessible-item-selected: root.hit.selected;
-    accessible-action-default => { root.select(); }
+    accessible-action-default => {
+        if (!root.hit.missing) {
+            root.select();
+        }
+    }
 
     property <bool> active: touch.has-hover || root.hit.selected;
 
+    // Favorites the catalog does not list cannot be selected, played, or opened from the menu.
     touch := TouchArea {
-        clicked => { root.select(); }
-        double-clicked => { root.play(); }
+        clicked => {
+            if (!root.hit.missing) {
+                root.select();
+            }
+        }
+        double-clicked => {
+            if (!root.hit.missing) {
+                root.play();
+            }
+        }
         pointer-event(event) => {
-            if (event.button == PointerEventButton.right && event.kind == PointerEventKind.up) {
+            if (!root.hit.missing && event.button == PointerEventButton.right && event.kind == PointerEventKind.up) {
                 root.select();
                 root.menu(root.absolute-position.x + self.mouse-x, root.absolute-position.y + self.mouse-y);
             }
@@ -181,6 +202,7 @@ component ResultRow inherits Rectangle {
                     source: root.hit.art;
                     width: 40px;
                     height: 40px;
+                    opacity: root.hit.missing ? 0.5 : 1;
                 }
             }
             VerticalLayout {
@@ -189,9 +211,15 @@ component ResultRow inherits Rectangle {
                 horizontal-stretch: 1;
                 Text {
                     text: root.hit.name;
-                    color: Theme.text;
+                    color: root.hit.missing ? Theme.text-3 : Theme.text;
                     font-size: Theme.text-l;
                     font-weight: 600;
+                    overflow: elide;
+                }
+                if root.hit.missing: Text {
+                    text: "Not in Discord’s list right now";
+                    color: Theme.text-3;
+                    font-size: Theme.text-xs;
                     overflow: elide;
                 }
                 if root.hit.steam-id != "": HorizontalLayout {
@@ -201,48 +229,67 @@ component ResultRow inherits Rectangle {
             }
             HorizontalLayout {
                 spacing: 4px;
-                opacity: root.active ? 1 : 0;
-                animate opacity { duration: Theme.quick; }
                 VerticalLayout {
                     alignment: center;
-                    // The search field drives the rows (arrows, Enter, the menu key), so the
-                    // row buttons stay out of the Tab order instead of adding a hidden stop each.
-                    more := IconButton {
-                        icon: Icons.more;
-                        tip: "More";
-                        tab-stop: false;
-                        clicked => {
-                            root.select();
-                            root.menu(self.absolute-position.x + self.width - 216px, self.absolute-position.y + self.height + 4px);
-                        }
+                    // Filled stars on missing rows stay visible, since they are the only way to
+                    // remove those favorites. The star is a Tab stop only there: the search field
+                    // reaches every other row with the arrow keys.
+                    IconButton {
+                        icon: root.hit.favorite ? Icons.star-filled : Icons.star;
+                        icon-size: 15px;
+                        tint: root.hit.favorite ? Theme.accent-soft : Theme.text-2;
+                        tip: root.hit.favorite ? "Remove from favorites" : "Add to favorites";
+                        tab-stop: root.hit.missing;
+                        opacity: root.hit.missing || root.active || (root.hit.favorite && !root.quiet-favorite) ? 1 : 0;
+                        animate opacity { duration: Theme.quick; }
+                        clicked => { root.favorite(); }
                     }
                 }
-                VerticalLayout {
-                    alignment: center;
-                    Rectangle {
-                        width: 32px;
-                        height: 32px;
-                        border-radius: 16px;
-                        opacity: root.can-play ? 1 : 0.35;
-                        background: play-touch.pressed ? Theme.accent-press : play-touch.has-hover ? Theme.accent-hover : Theme.accent;
-                        animate background { duration: Theme.quick; }
-                        accessible-role: button;
-                        accessible-label: "Play " + root.hit.name;
-                        accessible-action-default => { root.play(); }
-                        play-touch := TouchArea {
-                            enabled: root.can-play;
-                            mouse-cursor: pointer;
-                            clicked => { root.play(); }
+                if !root.hit.missing: HorizontalLayout {
+                    spacing: 4px;
+                    opacity: root.active ? 1 : 0;
+                    animate opacity { duration: Theme.quick; }
+                    VerticalLayout {
+                        alignment: center;
+                        // The search field drives the rows (arrows, Enter, the menu key), so the
+                        // row buttons stay out of the Tab order instead of adding a hidden stop each.
+                        more := IconButton {
+                            icon: Icons.more;
+                            tip: "More";
+                            tab-stop: false;
+                            clicked => {
+                                root.select();
+                                root.menu(self.absolute-position.x + self.width - 240px, self.absolute-position.y + self.height + 4px);
+                            }
                         }
-                        Icon {
-                            source: Icons.play;
-                            width: 13px;
-                            height: 13px;
-                            x: (parent.width - self.width) / 2 + 1px;
-                            tint: #FFFFFF;
-                        }
-                        Tooltip {
-                            Tip { text: "Play"; }
+                    }
+                    VerticalLayout {
+                        alignment: center;
+                        Rectangle {
+                            width: 32px;
+                            height: 32px;
+                            border-radius: 16px;
+                            opacity: root.can-play ? 1 : 0.35;
+                            background: play-touch.pressed ? Theme.accent-press : play-touch.has-hover ? Theme.accent-hover : Theme.accent;
+                            animate background { duration: Theme.quick; }
+                            accessible-role: button;
+                            accessible-label: "Play " + root.hit.name;
+                            accessible-action-default => { root.play(); }
+                            play-touch := TouchArea {
+                                enabled: root.can-play;
+                                mouse-cursor: pointer;
+                                clicked => { root.play(); }
+                            }
+                            Icon {
+                                source: Icons.play;
+                                width: 13px;
+                                height: 13px;
+                                x: (parent.width - self.width) / 2 + 1px;
+                                tint: #FFFFFF;
+                            }
+                            Tooltip {
+                                Tip { text: "Play"; }
+                            }
                         }
                     }
                 }
@@ -297,12 +344,18 @@ export component ResultsList inherits Rectangle {
     // Id of the game playing right now, if any.
     in property <string> playing-id;
     in property <bool> blocked;
+    // Every row is a favorite in the favorites view, so resting stars stay hidden there.
+    in property <bool> quiet-favorites;
+    // Header above the rows, such as "FAVORITES · 3". Empty for search results.
+    in property <string> heading;
     callback select(int);
     callback play(int);
     callback menu(int, length, length);
     callback steam(string);
+    callback favorite(string);
 
     property <length> row-height: 58px;
+    property <length> header-height: root.heading != "" ? 30px : 0px;
 
     public function reveal(index: int) {
         if (index < 0) {
@@ -319,7 +372,20 @@ export component ResultsList inherits Rectangle {
         flick.content-y = 0;
     }
 
+    if root.heading != "": HorizontalLayout {
+        y: 0px;
+        width: parent.width;
+        height: root.header-height;
+        padding-left: 8px;
+        SectionLabel {
+            text: root.heading;
+            vertical-alignment: center;
+        }
+    }
+
     flick := Flickable {
+        y: root.header-height;
+        height: parent.height - root.header-height;
         content-height: root.hits.length * root.row-height;
         for hit[index] in root.hits: ResultRow {
             x: 0;
@@ -327,10 +393,12 @@ export component ResultsList inherits Rectangle {
             width: flick.width - 10px;
             hit: hit;
             can-play: !root.blocked && hit.id != root.playing-id;
+            quiet-favorite: root.quiet-favorites;
             select => { root.select(index); }
             play => { root.play(index); }
             menu(x, y) => { root.menu(index, x, y); }
             steam => { root.steam(hit.steam-id); }
+            favorite => { root.favorite(hit.id); }
         }
     }
     if flick.content-height > flick.height: Rectangle {
@@ -339,7 +407,7 @@ export component ResultsList inherits Rectangle {
         x: parent.width - self.width - 1px;
         width: thumb-touch.has-hover || thumb-touch.pressed ? 6px : 4px;
         height: max(28px, self.track * self.ratio);
-        y: (-flick.content-y) / (flick.content-height - flick.height) * (self.track - self.height);
+        y: root.header-height + (-flick.content-y) / (flick.content-height - flick.height) * (self.track - self.height);
         border-radius: self.width / 2;
         background: thumb-touch.pressed ? #FFFFFF40 : thumb-touch.has-hover ? #FFFFFF2E : #FFFFFF1C;
         animate width, background { duration: Theme.quick; }
