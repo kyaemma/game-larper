@@ -194,6 +194,9 @@ Prepare:
    cargo build --release
    ```
 
+   Build in release mode: the run step below uses `./target/release/game-larper`, which a plain
+   `cargo build` does not create. Use release builds for performance testing, since debug builds are not optimized.
+
 3. Install native Discord (the `.deb` from discord.com, not the Flatpak or Snap). Log in. Enable
    Settings → Activity Privacy → "Share your detected activities".
 
