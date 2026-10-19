@@ -31,14 +31,27 @@ Config is camelCase JSON so a file written by the older C# build still loads. Th
 
 ## Publishing a release
 
-The GitHub `Release` workflow builds and publishes the Windows ZIP. Run it manually from the Actions tab with a semantic version tag such as `v0.1.0`, or push an existing `v*` tag.
+The GitHub `Release` workflow (`.github/workflows/release.yml`) builds the Windows and Linux packages and publishes them as one GitHub Release. It starts in one of two ways:
 
-For a manual run, the workflow:
+- **Push to `main`** that changes `Cargo.toml`, when the head commit message starts with `release: v`. The tag is `v` plus the workspace version.
+- **Manual run** from the Actions tab, with a tag such as `v0.2.1`. The release is built from the commit the workflow is run on.
 
-1. runs the full release build,
-2. creates the requested annotated tag at the selected `main` commit,
-3. computes the ZIP SHA-256,
-4. creates the GitHub Release, and
-5. uploads `GameLarper-win-x64.zip`.
+Before building, the workflow reads the version from `[workspace.package]` in `Cargo.toml` and fails if the tag is not a semantic version tag (`vMAJOR.MINOR.PATCH`, optional suffix), if it does not match that version, or if a GitHub Release for it already exists.
 
-The release archive contains `GameLarper.exe`, `GameLarper.Runner.exe`, and the MIT `LICENSE`. The two executables must stay together.
+Both builds run on Rust 1.98.1 and use the release scripts, so they format, lint and test before building:
+
+| Artifact | Runner | Script |
+| --- | --- | --- |
+| `GameLarper-win-x64.zip` | `windows-latest` | `scripts/build-release.ps1` |
+| `GameLarper-linux-x64.tar.gz` | `ubuntu-latest` | `scripts/build-release.sh` |
+
+Each package holds the app, its runner and the MIT `LICENSE`. The Windows ZIP has `GameLarper.exe` and `GameLarper.Runner.exe`; the Linux archive has `game-larper` and `game-larper-runner`. The app and runner must stay together.
+
+When both builds pass, the publish job:
+
+1. uses `docs/releases/v<version>.md` as the release notes, or a short generic note if that file does not exist,
+2. appends a `SHA-256` section with the hash of each package,
+3. creates the release tag at the release commit, reusing the tag if it already exists, and
+4. creates the GitHub Release with both packages attached.
+
+Write `docs/releases/v<version>.md` and merge it before releasing.
