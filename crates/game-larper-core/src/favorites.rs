@@ -84,7 +84,7 @@ impl Favorites {
 }
 
 /// Discord application ids are decimal digits. Anything else cannot be launched or matched.
-fn valid_application_id(id: &str) -> bool {
+pub(crate) fn valid_application_id(id: &str) -> bool {
     !id.is_empty() && id.bytes().all(|byte| byte.is_ascii_digit())
 }
 

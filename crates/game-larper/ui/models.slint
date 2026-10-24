@@ -14,6 +14,20 @@ export struct Hit {
     missing: bool,
 }
 
+// A row of the tray panel's Favorites and Recent lists.
+export struct TrayGame {
+    // Discord application id.
+    id: string,
+    name: string,
+    // The second line: how long ago, or why the row cannot be launched.
+    meta: string,
+    art: image,
+    // False when the catalog does not list the game right now.
+    available: bool,
+    // The runner is on this game right now.
+    active: bool,
+}
+
 export struct QueueRow {
     name: string,
     meta: string,

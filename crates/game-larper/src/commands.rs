@@ -46,6 +46,154 @@ fn begin_play(
     spawn_launch(host, images, game, log.clone(), tx.clone(), wake.clone());
 }
 
+/// Tray entries remain disabled while a session is running or the queue owns the runner.
+/// Recheck on activation: a menu or panel can deliver an event from a stale snapshot.
+fn tray_quick_play_allowed(session: &Session) -> bool {
+    !session.busy
+        && !session.quitting
+        && session.loaded
+        && session.clock.state() != SessionState::Playing
+        && !matches!(
+            session.queue.activity(),
+            QueueActivity::Running { .. }
+                | QueueActivity::Paused { .. }
+                | QueueActivity::Transition { .. }
+        )
+}
+
+/// Start a game offered by the tray: a favorite or a recent game, from the native menu or the
+/// panel. Returns true when the shared launch pipeline was entered.
+fn begin_tray_launch(
+    session: &Arc<Mutex<Session>>,
+    log: &Arc<Log>,
+    tx: &mpsc::Sender<Msg>,
+    wake: &Wake,
+    id: &str,
+) -> bool {
+    let Ok(mut guard) = session.lock() else {
+        return false;
+    };
+    if !tray_quick_play_allowed(&guard) {
+        log.debug(Area::Favorites, "Tray launch refused: runner is busy or queue is active");
+        return false;
+    }
+    // The list may have changed while the menu or panel was open.
+    if !tray_offers(&guard, id) {
+        log.debug(Area::Favorites, format!("Tray launch refused: {id} is no longer offered"));
+        return false;
+    }
+    let Some(game) = guard.games.iter().find(|game| game.id == id).cloned() else {
+        log.warn(Area::Favorites, format!("Tray launch refused: {id} is absent from the catalog"));
+        toast_err(&mut guard, "This game is no longer available.");
+        return false;
+    };
+    // A different paused game is a new session, not a resume of the previous clock.
+    if guard.clock.state() == SessionState::Paused && guard.active.as_deref() != Some(id) {
+        guard.clock.stop();
+    }
+    if guard.selected.as_deref() != Some(id) {
+        guard.selected = Some(id.to_owned());
+        remember_selection(&mut guard, id.to_owned());
+        fetch_art(&mut guard, &[ArtRequest::from(&game)], tx, wake, true);
+    }
+    drop(guard);
+    // Share the exact launch pipeline and its queue/busy checks with the main window.
+    begin_play(session, log, tx, wake);
+    true
+}
+
+/// Whether the tray lists `id`: a favorite or a recent game.
+fn tray_offers(session: &Session, id: &str) -> bool {
+    session.favorites.contains(id) || session.recent.items().iter().any(|item| item.id == id)
+}
+
+/// Remember the game whose runner just started. Only a launch that succeeded gets here, so
+/// a failed start, a refused one, or a stop never reaches the list.
+fn record_recent(session: &mut Session) {
+    let Some(game) = session
+        .active
+        .as_deref()
+        .and_then(|id| session.games.iter().find(|game| game.id == id))
+    else {
+        return;
+    };
+    let (id, name) = (game.id.clone(), game.name.clone());
+    match session
+        .recent
+        .record(&id, &name, unix_time_ms(SystemTime::now()))
+    {
+        Ok(()) => persist_recent(session),
+        Err(error) => session.log.warn(
+            Area::Session,
+            format!("{name} ({id}) was not added to recent games: {error}"),
+        ),
+    }
+}
+
+/// Write recent.json. Skipped while the file on disk could not be read, so it is never
+/// overwritten with a list that does not include it.
+fn persist_recent(session: &Session) {
+    if session.recent_unreadable {
+        session.log.debug(
+            Area::Files,
+            "Recent games not saved: the saved list could not be read",
+        );
+        return;
+    }
+    if let Err(error) = save_recent(&session.paths.recent(), &session.recent) {
+        session
+            .log
+            .error(Area::Files, format!("Recent games save failed: {error}"));
+    }
+}
+
+/// Keep the names of recent games current with the catalog. The file is written only when a
+/// name changed.
+fn refresh_recent(session: &mut Session) {
+    if session.recent.is_empty() {
+        return;
+    }
+    let names: HashMap<&str, &str> = session
+        .games
+        .iter()
+        .filter(|game| session.recent.items().iter().any(|item| item.id == game.id))
+        .map(|game| (game.id.as_str(), game.name.as_str()))
+        .collect();
+    let changed = session.recent.refresh_names(|id| names.get(id).copied());
+    if changed {
+        persist_recent(session);
+    }
+}
+
+/// The ids the tray panel draws artwork for.
+fn tray_panel_ids(session: &Session) -> impl Iterator<Item = &str> {
+    session
+        .favorite_rows
+        .iter()
+        .take(TRAY_PANEL_FAVORITES)
+        .filter_map(|&index| session.games.get(index))
+        .map(|game| game.id.as_str())
+        .chain(
+            session
+                .recent
+                .items()
+                .iter()
+                .take(TRAY_PANEL_RECENT)
+                .map(|item| item.id.as_str()),
+        )
+}
+
+/// Artwork requests for the games among `ids` whose picture is neither decoded, failed, nor
+/// already on its way.
+fn missing_art_requests(session: &Session, mut ids: Vec<&str>) -> Vec<ArtRequest> {
+    ids.retain(|id| needs_art(session, id) && !session.art_inflight.contains(*id));
+    ids.iter()
+        .filter_map(|id| session.games.iter().find(|game| game.id == *id))
+        .filter(|game| net::has_artwork_source(game))
+        .map(ArtRequest::from)
+        .collect()
+}
+
 fn begin_pause(
     session: &Arc<Mutex<Session>>,
     log: &Arc<Log>,
@@ -1131,6 +1279,8 @@ fn art_pinned(session: &Session, id: &str) -> bool {
     let shows = |index: &usize| session.games.get(*index).is_some_and(|game| game.id == id);
     session.selected.as_deref() == Some(id)
         || session.active.as_deref() == Some(id)
+        || (session.tray_panel_open.load(Ordering::Acquire)
+            && tray_panel_ids(session).any(|shown| shown == id))
         || session
             .queue
             .items()
@@ -1607,10 +1757,30 @@ fn style_main(ui: &MainWindow) {
     platform::style_frame(ui.window());
 }
 
-/// Show the main window. The first show creates the native window, so style it each time.
+/// Show the main window and bring it forward. The first show creates the native window, so
+/// style it each time. A window that is already open may be minimized or behind others.
 fn show_main(ui: &MainWindow) {
+    if ui.window().is_minimized() {
+        ui.window().set_minimized(false);
+    }
     if ui.show().is_ok() {
         style_main(ui);
+        platform::focus_window(ui.window());
+    }
+}
+
+/// Double-click on the tray icon: hide the main window in the tray if it is shown, else show
+/// and restore it. Shown means on screen and not minimized, whether or not it has the focus.
+/// Hiding is what closing to the tray does, so the window and everything running stay as
+/// they are.
+fn toggle_main(ui: &MainWindow, dock: &Dock, log: &Log) {
+    let window = ui.window();
+    if window.is_visible() && !window.is_minimized() {
+        log.debug(Area::App, "Main window hidden to the tray (double-click)");
+        dock.dismiss();
+        let _ = ui.hide();
+    } else {
+        show_main(ui);
     }
 }
 

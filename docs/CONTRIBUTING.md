@@ -109,6 +109,7 @@ Environment knobs:
 | process mechanics, launch/stop, cleanup | `crates/game-larper/src/host/{mod,windows,linux}.rs` |
 | desktop glue (tray, autostart, clipboard, single instance) | `crates/game-larper/src/platform/{windows,linux}.rs` |
 | Slint shell, state push, event loop | `crates/game-larper/src/{app,commands,panel,main}.rs` |
+| tray panel (placement, focus, close) | `crates/game-larper/src/tray_panel.rs`, `ui/tray-panel.slint` |
 | UI markup, theme, icons in markup | `crates/game-larper/ui/*.slint` |
 | catalog download, artwork fetch/cache | `crates/game-larper/src/{net,art_cache}.rs` |
 | console/log levels, redaction | `crates/game-larper/src/log.rs` |

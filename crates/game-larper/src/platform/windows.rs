@@ -6,18 +6,19 @@ use std::path::Path;
 use std::process::Command;
 
 use crate::log::Log;
-use crate::platform::WorkArea;
+use crate::platform::{Monitor, Rect, WorkArea};
 use game_larper_core::{AppPaths, format_startup_command};
 use windows_sys::Win32::Foundation::{
-    CloseHandle, ERROR_ALREADY_EXISTS, GetLastError, HANDLE, HWND, LPARAM, WPARAM,
+    CloseHandle, ERROR_ALREADY_EXISTS, GetLastError, HANDLE, HWND, LPARAM, POINT, WPARAM,
 };
 use windows_sys::Win32::Graphics::Dwm::{
-    DWMWA_BORDER_COLOR, DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_ROUNDSMALL, DwmSetWindowAttribute,
+    DWMWA_BORDER_COLOR, DWMWA_WINDOW_CORNER_PREFERENCE, DWMWCP_ROUND, DWMWCP_ROUNDSMALL,
+    DwmSetWindowAttribute,
 };
 use windows_sys::Win32::Graphics::Gdi::{
     BI_RGB, BITMAPINFO, BITMAPINFOHEADER, CreateBitmap, CreateDIBSection, DIB_RGB_COLORS,
-    DeleteObject, GetDC, GetMonitorInfoW, MONITOR_DEFAULTTONEAREST, MONITORINFO, MonitorFromWindow,
-    ReleaseDC,
+    DeleteObject, GetDC, GetMonitorInfoW, MONITOR_DEFAULTTONEAREST, MONITOR_DEFAULTTOPRIMARY,
+    MONITORINFO, MonitorFromPoint, MonitorFromWindow, ReleaseDC,
 };
 use windows_sys::Win32::System::DataExchange::{
     CloseClipboard, EmptyClipboard, OpenClipboard, SetClipboardData,
@@ -31,9 +32,12 @@ use windows_sys::Win32::System::Threading::{
     CreateEventW, CreateMutexW, EVENT_MODIFY_STATE, INFINITE, OpenProcessToken, SetEvent,
     WaitForSingleObject,
 };
+use windows_sys::Win32::UI::HiDpi::{GetDpiForMonitor, MDT_EFFECTIVE_DPI};
 use windows_sys::Win32::UI::WindowsAndMessaging::{
-    CreateIconIndirect, DestroyIcon, GWLP_HWNDPARENT, HICON, ICON_BIG, ICON_SMALL, ICONINFO,
-    SendMessageW, SetWindowLongPtrW, WM_SETICON,
+    CreateIconIndirect, DestroyIcon, GWL_EXSTYLE, GWLP_HWNDPARENT, GetCursorPos, GetWindowLongPtrW,
+    HICON, ICON_BIG, ICON_SMALL, ICONINFO, SWP_FRAMECHANGED, SWP_NOACTIVATE, SWP_NOMOVE,
+    SWP_NOSIZE, SWP_NOZORDER, SendMessageW, SetForegroundWindow, SetWindowLongPtrW, SetWindowPos,
+    WM_SETICON, WS_EX_APPWINDOW, WS_EX_TOOLWINDOW,
 };
 
 /// The Settings label for `set_run_at_startup`.
@@ -175,6 +179,107 @@ pub fn style_frame(window: &slint::Window) {
             &border as *const _ as *const c_void,
             std::mem::size_of_val(&border) as u32,
         );
+    }
+}
+
+/// Where the mouse is now. A tray click reports no position of its own, but the pointer is
+/// still on the icon when Slint's `clicked` fires.
+pub fn cursor_position() -> Option<(i32, i32)> {
+    let mut point = POINT { x: 0, y: 0 };
+    (unsafe { GetCursorPos(&mut point) } != 0).then_some((point.x, point.y))
+}
+
+/// The monitor holding `point` (the nearest one if it is outside every monitor), else the
+/// primary monitor.
+pub fn monitor_at(point: Option<(i32, i32)>) -> Option<Monitor> {
+    let (x, y) = point.unwrap_or((0, 0));
+    let flags = if point.is_some() {
+        MONITOR_DEFAULTTONEAREST
+    } else {
+        MONITOR_DEFAULTTOPRIMARY
+    };
+    let monitor = unsafe { MonitorFromPoint(POINT { x, y }, flags) };
+    if monitor.is_null() {
+        return None;
+    }
+    let mut info: MONITORINFO = unsafe { std::mem::zeroed() };
+    info.cbSize = std::mem::size_of::<MONITORINFO>() as u32;
+    if unsafe { GetMonitorInfoW(monitor, &mut info) } == 0 {
+        return None;
+    }
+    let (mut dpi_x, mut dpi_y) = (0u32, 0u32);
+    let scale = if unsafe { GetDpiForMonitor(monitor, MDT_EFFECTIVE_DPI, &mut dpi_x, &mut dpi_y) }
+        == 0
+        && dpi_x > 0
+    {
+        dpi_x as f32 / 96.0
+    } else {
+        1.0
+    };
+    let rect = |rc: windows_sys::Win32::Foundation::RECT| Rect {
+        left: rc.left,
+        top: rc.top,
+        right: rc.right,
+        bottom: rc.bottom,
+    };
+    Some(Monitor {
+        bounds: rect(info.rcMonitor),
+        work: rect(info.rcWork),
+        scale,
+    })
+}
+
+/// Style a frameless popup that is not a window of the app: Windows 11 corners and outline, a
+/// shadow, and no taskbar button. Safe to repeat.
+pub fn style_popup(window: &slint::Window) {
+    use slint::winit_030::WinitWindowAccessor;
+    use slint::winit_030::winit::platform::windows::WindowExtWindows;
+    // winit rebuilds the whole window style from its own flags whenever one changes, so its
+    // flags go first and the raw style bits go last.
+    window.with_winit_window(|window| {
+        window.set_undecorated_shadow(true);
+        window.set_skip_taskbar(true);
+    });
+    let Some(hwnd) = hwnd_of(window) else {
+        return;
+    };
+    let corners = DWMWCP_ROUND as u32;
+    let border = BORDER_COLOR;
+    unsafe {
+        // A tool window also stays out of Alt+Tab.
+        let style = GetWindowLongPtrW(hwnd, GWL_EXSTYLE);
+        let style = (style | WS_EX_TOOLWINDOW as isize) & !(WS_EX_APPWINDOW as isize);
+        SetWindowLongPtrW(hwnd, GWL_EXSTYLE, style);
+        // The style change only reaches the shell once the frame is recalculated.
+        SetWindowPos(
+            hwnd,
+            std::ptr::null_mut(),
+            0,
+            0,
+            0,
+            0,
+            SWP_NOMOVE | SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_FRAMECHANGED,
+        );
+        DwmSetWindowAttribute(
+            hwnd,
+            DWMWA_WINDOW_CORNER_PREFERENCE as u32,
+            &corners as *const _ as *const c_void,
+            std::mem::size_of_val(&corners) as u32,
+        );
+        DwmSetWindowAttribute(
+            hwnd,
+            DWMWA_BORDER_COLOR as u32,
+            &border as *const _ as *const c_void,
+            std::mem::size_of_val(&border) as u32,
+        );
+    }
+}
+
+/// Make `window` the foreground window so it gets keyboard input and a later click elsewhere
+/// takes focus away from it. Windows lets the process that just handled a tray click do this.
+pub fn focus_window(window: &slint::Window) {
+    if let Some(hwnd) = hwnd_of(window) {
+        unsafe { SetForegroundWindow(hwnd) };
     }
 }
 

@@ -282,6 +282,34 @@ pub fn set_owner(_window: &slint::Window, _owner: &slint::Window) {}
 /// winit only exposes skip-taskbar on Windows.
 pub fn set_skip_taskbar(_window: &slint::Window, _skip: bool) {}
 
+/// The tray icon is Slint's `SystemTrayIcon` here. A StatusNotifierItem reports no click
+/// position, no right click and no double-click, so the tray panel is Windows-only and a click
+/// opens the main window.
+pub struct NativeTray;
+
+impl NativeTray {
+    /// `None` means "use Slint's tray icon".
+    pub fn new() -> Option<Self> {
+        None
+    }
+
+    pub fn on_event(&self, _handler: impl Fn(crate::platform::TrayEvent) + 'static) {}
+
+    pub fn set_tooltip(&self, _text: &str) {}
+}
+
+pub fn cursor_position() -> Option<(i32, i32)> {
+    None
+}
+
+pub fn monitor_at(_point: Option<(i32, i32)>) -> Option<crate::platform::Monitor> {
+    None
+}
+
+pub fn style_popup(_window: &slint::Window) {}
+
+pub fn focus_window(_window: &slint::Window) {}
+
 /// The bounds of the monitor showing `window`. Panels and struts are not subtracted (winit does
 /// not read `_NET_WORKAREA`, Wayland exposes none), and under Wayland the compositor may ignore
 /// window positions entirely, so the docked panel is best effort there.
