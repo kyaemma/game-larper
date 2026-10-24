@@ -6,6 +6,13 @@ export { MainWindow } from "main-window.slint";
 export { SidePanel } from "side-panel.slint";
 export { LogWindow } from "log-window.slint";
 
+// A quick-launch item is identified by Discord application id, never by its menu position.
+export struct TrayFavorite {
+    id: string,
+    name: string,
+    available: bool,
+}
+
 export component TrayIcon inherits SystemTrayIcon {
     in-out property <string> status-tip: "Game Larper";
     in-out property <string> game-name: "No game selected";
@@ -15,11 +22,16 @@ export component TrayIcon inherits SystemTrayIcon {
     in-out property <bool> pause-enabled: false;
     in-out property <bool> stop-enabled: false;
     in-out property <string> queue-line: "Open queue";
+    in property <[TrayFavorite]> favorite-items;
+    in property <int> favorite-count: 0;
+    in property <bool> favorite-loading: true;
+    in property <bool> favorite-play-enabled: false;
     callback open-requested();
     callback play();
     callback pause();
     callback stop();
     callback open-queue();
+    callback play-favorite(string);
     callback open-settings();
     callback quit();
 
@@ -35,6 +47,24 @@ export component TrayIcon inherits SystemTrayIcon {
         MenuItem { title: "Pause"; enabled: root.pause-enabled; activated => { root.pause(); } }
         MenuItem { title: "Stop"; enabled: root.stop-enabled; activated => { root.stop(); } }
         MenuItem { title: root.queue-line; activated => { root.open-queue(); } }
+        MenuSeparator { }
+        Menu {
+            title: "Favorites (" + root.favorite-count + ")";
+            if root.favorite-items.length == 0 : MenuItem {
+                title: root.favorite-loading ? "Loading games…" : "No favorites yet";
+                enabled: false;
+            }
+            for favorite in root.favorite-items : MenuItem {
+                title: favorite.available ? favorite.name : favorite.name + " (unavailable)";
+                enabled: favorite.available && root.favorite-play-enabled;
+                activated => { root.play-favorite(favorite.id); }
+            }
+            if root.favorite-count > root.favorite-items.length : MenuSeparator { }
+            if root.favorite-count > root.favorite-items.length : MenuItem {
+                title: "More in Game Larper…";
+                activated => { root.open-requested(); }
+            }
+        }
         MenuSeparator { }
         MenuItem { title: "Open Game Larper"; activated => { root.open-requested(); } }
         MenuItem { title: "Settings"; activated => { root.open-settings(); } }

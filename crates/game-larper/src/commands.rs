@@ -46,6 +46,59 @@ fn begin_play(
     spawn_launch(host, images, game, log.clone(), tx.clone(), wake.clone());
 }
 
+/// Tray entries remain disabled while a session is running or the queue owns the runner.
+/// Recheck on activation: a native menu can deliver an event from a stale snapshot.
+fn tray_quick_play_allowed(session: &Session) -> bool {
+    !session.busy
+        && !session.quitting
+        && session.loaded
+        && session.clock.state() != SessionState::Playing
+        && !matches!(
+            session.queue.activity(),
+            QueueActivity::Running { .. }
+                | QueueActivity::Paused { .. }
+                | QueueActivity::Transition { .. }
+        )
+}
+
+fn begin_tray_favorite(
+    session: &Arc<Mutex<Session>>,
+    log: &Arc<Log>,
+    tx: &mpsc::Sender<Msg>,
+    wake: &Wake,
+    id: &str,
+) {
+    let Ok(mut guard) = session.lock() else {
+        return;
+    };
+    if !tray_quick_play_allowed(&guard) {
+        log.debug(Area::Favorites, "Tray launch refused: runner is busy or queue is active");
+        return;
+    }
+    // A favorite may have been removed while the native menu was open.
+    if !guard.favorites.contains(id) {
+        log.debug(Area::Favorites, format!("Tray launch refused: {id} is no longer a favorite"));
+        return;
+    }
+    let Some(game) = guard.games.iter().find(|game| game.id == id).cloned() else {
+        log.warn(Area::Favorites, format!("Tray launch refused: {id} is absent from the catalog"));
+        toast_err(&mut guard, "This favorite is no longer available.");
+        return;
+    };
+    // A different paused game is a new session, not a resume of the previous clock.
+    if guard.clock.state() == SessionState::Paused && guard.active.as_deref() != Some(id) {
+        guard.clock.stop();
+    }
+    if guard.selected.as_deref() != Some(id) {
+        guard.selected = Some(id.to_owned());
+        remember_selection(&mut guard, id.to_owned());
+        fetch_art(&mut guard, &[ArtRequest::from(&game)], tx, wake, true);
+    }
+    drop(guard);
+    // Share the exact launch pipeline and its queue/busy checks with the main window.
+    begin_play(session, log, tx, wake);
+}
+
 fn begin_pause(
     session: &Arc<Mutex<Session>>,
     log: &Arc<Log>,

@@ -43,10 +43,14 @@ const LOADING_MIN: Duration = Duration::from_millis(280);
 const CATALOG_STALE: Duration = Duration::from_secs(24 * 60 * 60);
 /// How long a new selection must stay put before it is written to the config.
 const SELECTION_SAVE_DELAY: Duration = Duration::from_secs(1);
+/// Keep the native tray menu compact even when the user has many favorites.
+const TRAY_FAVORITES_LIMIT: usize = 10;
+const TRAY_NAME_CHARS: usize = 60;
 
 struct Models {
     hits: Rc<VecModel<Hit>>,
     rows: Rc<VecModel<QueueRow>>,
+    tray_favorites: Rc<VecModel<TrayFavorite>>,
     logs: Rc<VecModel<LogRow>>,
     /// How far `logs` has caught up with the live history.
     log_cursor: Cell<LogCursor>,
@@ -167,14 +171,17 @@ pub fn run(
     let session = Arc::new(Mutex::new(load_session(&paths, &log)));
     let hits = Rc::new(VecModel::from(Vec::<Hit>::new()));
     let rows = Rc::new(VecModel::from(Vec::<QueueRow>::new()));
+    let tray_favorites = Rc::new(VecModel::from(Vec::<TrayFavorite>::new()));
     let logs = Rc::new(VecModel::from(Vec::<LogRow>::new()));
     ui.set_hits(ModelRc::from(hits.clone()));
     panel.set_queue_rows(ModelRc::from(rows.clone()));
+    tray.set_favorite_items(ModelRc::from(tray_favorites.clone()));
     log_window.set_rows(ModelRc::from(logs.clone()));
     MODELS.with(|slot| {
         *slot.borrow_mut() = Some(Models {
             hits,
             rows,
+            tray_favorites,
             logs,
             log_cursor: Cell::default(),
         })
@@ -671,6 +678,16 @@ fn wire(
     tray.on_play(play);
     tray.on_pause(pause);
     tray.on_stop(stop);
+    tray.on_play_favorite({
+        let session = session.clone();
+        let log = log.clone();
+        let tx = tx.clone();
+        let wake = wake.clone();
+        move |id| {
+            begin_tray_favorite(&session, &log, &tx, &wake, id.as_str());
+            wake();
+        }
+    });
 
     let open_queue = {
         let dock = dock.clone();
@@ -1155,6 +1172,7 @@ fn render(ui: &MainWindow, panel: &SidePanel, tray: &TrayIcon, session: &Arc<Mut
         if let Some(models) = models.borrow().as_ref() {
             sync_model(&models.hits, hit_rows(&session));
             sync_model(&models.rows, queue_rows(&session, now));
+            sync_model(&models.tray_favorites, tray_favorite_rows(&session));
         }
     });
     render_main(ui, &session, now);
@@ -1293,6 +1311,56 @@ fn render_panel(panel: &SidePanel, session: &Session, now: Instant) {
     panel.set_database_detail(database_detail(session).into());
 }
 
+/// Truncate *only* the native menu label. Identity stays in the full Discord id.
+fn tray_name(name: &str) -> String {
+    if name.chars().count() <= TRAY_NAME_CHARS {
+        return name.to_owned();
+    }
+    let short: String = name.chars().take(TRAY_NAME_CHARS - 1).collect();
+    format!("{short}…")
+}
+
+/// The same sorted, resolved favorites as the main window, with unavailable entries at the end.
+fn tray_favorite_rows_from(
+    games: &[GameDefinition],
+    favorites: &Favorites,
+    listed: &[usize],
+    missing: &[usize],
+) -> Vec<TrayFavorite> {
+    let mut rows = Vec::with_capacity(TRAY_FAVORITES_LIMIT);
+    for &index in listed.iter().take(TRAY_FAVORITES_LIMIT) {
+        if let Some(game) = games.get(index) {
+            rows.push(TrayFavorite {
+                id: game.id.clone().into(),
+                name: tray_name(&game.name).into(),
+                available: true,
+            });
+        }
+    }
+    for &index in missing {
+        if rows.len() >= TRAY_FAVORITES_LIMIT {
+            break;
+        }
+        if let Some(favorite) = favorites.items().get(index) {
+            rows.push(TrayFavorite {
+                id: favorite.id.clone().into(),
+                name: tray_name(&favorite.name).into(),
+                available: false,
+            });
+        }
+    }
+    rows
+}
+
+fn tray_favorite_rows(session: &Session) -> Vec<TrayFavorite> {
+    tray_favorite_rows_from(
+        &session.games,
+        &session.favorites,
+        &session.favorite_rows,
+        &session.favorite_missing,
+    )
+}
+
 fn render_tray(tray: &TrayIcon, session: &Session, now: Instant) {
     let selected = session_game(session);
     let label = match session.clock.state() {
@@ -1318,6 +1386,9 @@ fn render_tray(tray: &TrayIcon, session: &Session, now: Instant) {
     tray.set_pause_enabled(controls.pause);
     tray.set_stop_enabled(controls.stop);
     tray.set_queue_line(format!("Queue ({})", session.queue.items().len()).into());
+    tray.set_favorite_count(session.favorites.len() as i32);
+    tray.set_favorite_loading(!session.loaded);
+    tray.set_favorite_play_enabled(tray_quick_play_allowed(session));
 }
 
 fn tick(session: &Arc<Mutex<Session>>, log: &Arc<Log>, tx: &mpsc::Sender<Msg>, wake: &Wake) {
@@ -1665,6 +1736,45 @@ mod tests {
         assert_eq!(format_minutes(Duration::from_secs(45 * 60)), "45 min");
         assert_eq!(format_minutes(Duration::from_secs(59 * 60 + 1)), "1 h");
         assert_eq!(format_minutes(Duration::from_secs(90 * 60)), "1 h 30 min");
+    }
+
+    #[test]
+    fn tray_favorites_are_sorted_and_missing_entries_cannot_launch() {
+        let games = vec![
+            GameDefinition::new("4", "Zelda"),
+            GameDefinition::new("2", "Bastion"),
+        ];
+        let mut favorites = Favorites::default();
+        favorites.add("4", "Zelda").unwrap();
+        favorites.add("9", "Unavailable").unwrap();
+        favorites.add("2", "Bastion").unwrap();
+        let (listed, missing) = resolve_favorites(&games, &favorites);
+        let rows = tray_favorite_rows_from(&games, &favorites, &listed, &missing);
+        assert_eq!(rows.len(), 3);
+        assert_eq!(rows[0].id.as_str(), "2");
+        assert!(rows[0].available);
+        assert_eq!(rows[1].id.as_str(), "4");
+        assert_eq!(rows[2].id.as_str(), "9");
+        assert!(!rows[2].available);
+    }
+
+    #[test]
+    fn tray_menu_bounded_and_unicode_safe() {
+        let games = (0..16)
+            .map(|id| GameDefinition::new(id.to_string(), format!("Game {id:02}")))
+            .collect::<Vec<_>>();
+        let mut favorites = Favorites::default();
+        for game in &games {
+            favorites.add(&game.id, &game.name).unwrap();
+        }
+        let (listed, missing) = resolve_favorites(&games, &favorites);
+        assert_eq!(
+            tray_favorite_rows_from(&games, &favorites, &listed, &missing).len(),
+            TRAY_FAVORITES_LIMIT
+        );
+        let title = "🔮".repeat(TRAY_NAME_CHARS + 5);
+        assert_eq!(tray_name(&title).chars().count(), TRAY_NAME_CHARS);
+        assert!(tray_name(&title).ends_with('…'));
     }
 
     #[test]
