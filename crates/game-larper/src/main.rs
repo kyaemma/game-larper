@@ -8,6 +8,7 @@ mod log;
 mod net;
 mod panel;
 mod platform;
+mod tray_panel;
 
 use std::process::ExitCode;
 use std::sync::Arc;

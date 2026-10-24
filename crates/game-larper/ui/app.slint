@@ -1,10 +1,11 @@
 // Entry point for slint-build. Rust drives the main window, attached side panel,
-// detached log console, and tray icon.
+// detached log console, tray panel, and tray icon.
 
-export { Hit, QueueRow, LogRow } from "models.slint";
+export { Hit, QueueRow, LogRow, TrayGame } from "models.slint";
 export { MainWindow } from "main-window.slint";
 export { SidePanel } from "side-panel.slint";
 export { LogWindow } from "log-window.slint";
+export { TrayPanelWindow } from "tray-panel.slint";
 
 // A quick-launch item is identified by Discord application id, never by its menu position.
 export struct TrayFavorite {
@@ -26,6 +27,8 @@ export component TrayIcon inherits SystemTrayIcon {
     in property <int> favorite-count: 0;
     in property <bool> favorite-loading: true;
     in property <bool> favorite-play-enabled: false;
+    // Left click on the icon. Rust decides what that opens.
+    callback activated();
     callback open-requested();
     callback play();
     callback pause();
@@ -37,7 +40,7 @@ export component TrayIcon inherits SystemTrayIcon {
 
     icon: @image-url("../../../assets/branding/game-larper-icon.png");
     tooltip: root.status-tip;
-    clicked => { root.open-requested(); }
+    clicked => { root.activated(); }
 
     Menu {
         MenuItem { title: root.game-name; enabled: false; }

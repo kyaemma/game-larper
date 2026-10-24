@@ -9,9 +9,9 @@ use std::time::{Duration, Instant, SystemTime};
 use chrono::{Local, NaiveDate, NaiveTime, TimeZone};
 use game_larper_core::{
     AppConfig, AppPaths, CatalogCache, ConfigStore, DEFAULT_SEARCH_LIMIT, DEFAULT_TRANSITION_GAP,
-    Favorites, GameDefinition, QueueAction, QueueActivity, QueueItem, QueueMachine, SessionClock,
-    SessionState, format_hms, load_catalog_with_legacy, load_favorites, load_queue, save_favorites,
-    save_queue, unix_time_ms,
+    Favorites, GameDefinition, QueueAction, QueueActivity, QueueItem, QueueMachine, RecentGames,
+    SessionClock, SessionState, format_hms, load_catalog_with_legacy, load_favorites, load_queue,
+    load_recent, save_favorites, save_queue, save_recent, unix_time_ms,
 };
 use slint::{ComponentHandle, Model, ModelRc, SharedString, Timer, TimerMode, VecModel, Weak};
 
@@ -20,7 +20,8 @@ use crate::host::{self, ExitWatch, LaunchReport, RunnerHost};
 use crate::log::{Area, Log, LogChanges, LogCursor, LogEntry, LogLevel, MAX_HISTORY, redact};
 use crate::net::{self, ArtRequest};
 use crate::panel::{Dock, Mode};
-use crate::platform;
+use crate::platform::{self, TrayEvent};
+use crate::tray_panel::TrayPanel;
 
 slint::include_modules!();
 
@@ -46,11 +47,17 @@ const SELECTION_SAVE_DELAY: Duration = Duration::from_secs(1);
 /// Keep the native tray menu compact even when the user has many favorites.
 const TRAY_FAVORITES_LIMIT: usize = 10;
 const TRAY_NAME_CHARS: usize = 60;
+/// Rows of the tray panel's Favorites tab. It scrolls, but stays far shorter than a catalog.
+const TRAY_PANEL_FAVORITES: usize = 30;
+/// Rows of the tray panel's Recent tab.
+const TRAY_PANEL_RECENT: usize = 8;
 
 struct Models {
     hits: Rc<VecModel<Hit>>,
     rows: Rc<VecModel<QueueRow>>,
     tray_favorites: Rc<VecModel<TrayFavorite>>,
+    panel_favorites: Rc<VecModel<TrayGame>>,
+    panel_recent: Rc<VecModel<TrayGame>>,
     logs: Rc<VecModel<LogRow>>,
     /// How far `logs` has caught up with the live history.
     log_cursor: Cell<LogCursor>,
@@ -137,6 +144,12 @@ struct Session {
     shown_favorites: bool,
     /// favorites.json exists but could not be read. Nothing is written until a later read succeeds.
     favorites_unreadable: bool,
+    /// Games whose runner started, newest first.
+    recent: RecentGames,
+    /// recent.json exists but could not be read. Nothing is written over it.
+    recent_unreadable: bool,
+    /// The tray panel is on screen. Set by `TrayPanel`; read to fetch and keep its artwork.
+    tray_panel_open: Arc<AtomicBool>,
     selected: Option<String>,
     /// When the selection last changed without being written to the config yet.
     selection_unsaved: Option<Instant>,
@@ -164,24 +177,49 @@ pub fn run(
     let ui = MainWindow::new()?;
     let panel = SidePanel::new()?;
     let log_window = LogWindow::new()?;
-    let tray = TrayIcon::new()?;
+    // Windows has its own icon, which reports the clicks the tray panel needs. Slint's tray
+    // stays the icon everywhere else, and the fallback if the native one cannot be created.
+    let native_tray = platform::NativeTray::new().map(Rc::new);
+    let tray = if native_tray.is_some() {
+        None
+    } else {
+        Some(TrayIcon::new()?)
+    };
+    let tray_window = TrayPanelWindow::new()?;
     let dock = Dock::new(&ui, &panel);
     let (tx, rx) = mpsc::channel();
     let rx = Arc::new(Mutex::new(rx));
     let session = Arc::new(Mutex::new(load_session(&paths, &log)));
+    let tray_panel = TrayPanel::new(
+        &tray_window,
+        session
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .tray_panel_open
+            .clone(),
+    );
     let hits = Rc::new(VecModel::from(Vec::<Hit>::new()));
     let rows = Rc::new(VecModel::from(Vec::<QueueRow>::new()));
     let tray_favorites = Rc::new(VecModel::from(Vec::<TrayFavorite>::new()));
+    let panel_favorites = Rc::new(VecModel::from(Vec::<TrayGame>::new()));
+    let panel_recent = Rc::new(VecModel::from(Vec::<TrayGame>::new()));
     let logs = Rc::new(VecModel::from(Vec::<LogRow>::new()));
     ui.set_hits(ModelRc::from(hits.clone()));
     panel.set_queue_rows(ModelRc::from(rows.clone()));
-    tray.set_favorite_items(ModelRc::from(tray_favorites.clone()));
+    if let Some(tray) = &tray {
+        tray.set_favorite_items(ModelRc::from(tray_favorites.clone()));
+    }
+    tray_window.set_favorites(ModelRc::from(panel_favorites.clone()));
+    tray_window.set_recent(ModelRc::from(panel_recent.clone()));
+    tray_window.set_version_label(env!("CARGO_PKG_VERSION").into());
     log_window.set_rows(ModelRc::from(logs.clone()));
     MODELS.with(|slot| {
         *slot.borrow_mut() = Some(Models {
             hits,
             rows,
             tray_favorites,
+            panel_favorites,
+            panel_recent,
             logs,
             log_cursor: Cell::default(),
         })
@@ -204,7 +242,8 @@ pub fn run(
         let session = session.clone();
         let ui_weak = ui.as_weak();
         let panel_weak = panel.as_weak();
-        let tray_weak = tray.as_weak();
+        let tray_weak = tray.as_ref().map(|tray| tray.as_weak());
+        let tray_window_weak = tray_window.as_weak();
         let log = log.clone();
         let tx = tx.clone();
         let wake_slot = wake_slot.clone();
@@ -215,6 +254,7 @@ pub fn run(
             let ui_weak = ui_weak.clone();
             let panel_weak = panel_weak.clone();
             let tray_weak = tray_weak.clone();
+            let tray_window_weak = tray_window_weak.clone();
             let session = session.clone();
             let rx = rx.clone();
             let log = log.clone();
@@ -224,16 +264,19 @@ pub fn run(
             let posted = slint::invoke_from_event_loop(move || {
                 // Cleared before draining: anything sent from here on queues the next pass.
                 queued.store(false, Ordering::Release);
-                let (Some(ui), Some(panel), Some(tray)) =
-                    (ui_weak.upgrade(), panel_weak.upgrade(), tray_weak.upgrade())
-                else {
+                let (Some(ui), Some(panel), Some(tray_window)) = (
+                    ui_weak.upgrade(),
+                    panel_weak.upgrade(),
+                    tray_window_weak.upgrade(),
+                ) else {
                     return;
                 };
+                let tray = tray_weak.as_ref().and_then(|weak| weak.upgrade());
                 let Some(wake) = wake_slot.lock().ok().and_then(|slot| slot.clone()) else {
                     return;
                 };
                 drain(&rx, &session, &log, &tx, &wake);
-                render(&ui, &panel, &tray, &session);
+                render(&ui, &panel, tray.as_ref(), &tray_window, &session);
                 render_logs(&log);
             });
             if posted.is_err() {
@@ -249,7 +292,9 @@ pub fn run(
         &ui,
         &panel,
         &log_window,
-        &tray,
+        tray.as_ref(),
+        &tray_window,
+        &tray_panel,
         &dock,
         &session,
         &log,
@@ -273,7 +318,39 @@ pub fn run(
         }
     });
 
-    render(&ui, &panel, &tray, &session);
+    if let Some(native) = &native_tray {
+        let open_panel = {
+            let window = tray_window.as_weak();
+            let session = session.clone();
+            let tx = tx.clone();
+            let wake = wake.clone();
+            move || {
+                if let Some(window) = window.upgrade() {
+                    open_tray_panel(&window, &session, &tx, &wake);
+                }
+            }
+        };
+        let ui = ui.as_weak();
+        let tray_panel = tray_panel.clone();
+        let dock = dock.clone();
+        let log = log.clone();
+        native.on_event(move |event| match event {
+            TrayEvent::Click { at, anchor } => {
+                tray_panel.toggle_from_click(at, anchor, open_panel.clone());
+            }
+            TrayEvent::RightClick { anchor } => {
+                tray_panel.open(anchor, open_panel.clone());
+            }
+            TrayEvent::DoubleClick => {
+                // The panel was never opened for a double-click, so nothing flashes first.
+                tray_panel.hide();
+                if let Some(ui) = ui.upgrade() {
+                    toggle_main(&ui, &dock, &log);
+                }
+            }
+        });
+    }
+    render(&ui, &panel, tray.as_ref(), &tray_window, &session);
     render_logs(&log);
     let start_minimized_setting = session
         .lock()
@@ -301,20 +378,30 @@ pub fn run(
         let session = session.clone();
         let ui_weak = ui.as_weak();
         let panel_weak = panel.as_weak();
-        let tray_weak = tray.as_weak();
+        let tray_weak = tray.as_ref().map(|tray| tray.as_weak());
+        let native_tray = native_tray.clone();
+        let tray_window_weak = tray_window.as_weak();
         let tx = tx.clone();
         let log = log.clone();
         let wake = wake.clone();
         let rx = rx.clone();
         timer.start(TimerMode::Repeated, Duration::from_secs(1), move || {
-            let (Some(ui), Some(panel), Some(tray)) =
-                (ui_weak.upgrade(), panel_weak.upgrade(), tray_weak.upgrade())
-            else {
+            let (Some(ui), Some(panel), Some(tray_window)) = (
+                ui_weak.upgrade(),
+                panel_weak.upgrade(),
+                tray_window_weak.upgrade(),
+            ) else {
                 return;
             };
+            let tray = tray_weak.as_ref().and_then(|weak| weak.upgrade());
             drain(&rx, &session, &log, &tx, &wake);
             tick(&session, &log, &tx, &wake);
-            render(&ui, &panel, &tray, &session);
+            render(&ui, &panel, tray.as_ref(), &tray_window, &session);
+            if let Some(native) = &native_tray
+                && let Ok(session) = session.lock()
+            {
+                native.set_tooltip(&tray_tooltip(&session));
+            }
             render_logs(&log);
         });
     }
@@ -344,6 +431,13 @@ pub fn run(
             slint::CloseRequestResponse::KeepWindowShown
         }
     });
+    tray_window.window().on_close_requested({
+        let tray_panel = tray_panel.clone();
+        move || {
+            tray_panel.hide();
+            slint::CloseRequestResponse::KeepWindowShown
+        }
+    });
     panel.window().on_close_requested({
         let dock = dock.clone();
         move || {
@@ -364,7 +458,9 @@ pub fn run(
     });
 
     log.debug(Area::App, "Event loop running");
-    slint::run_event_loop()?;
+    // Not `run_event_loop`, which also returns once the last window is hidden. With the main
+    // window in the tray and the tray panel closed no window is visible, and only Quit ends it.
+    slint::run_event_loop_until_quit()?;
     log.info(Area::App, "Event loop ended; releasing the runner");
     let mut session = session.lock().unwrap_or_else(|p| p.into_inner());
     if session.selection_unsaved.is_some() {
@@ -423,6 +519,18 @@ fn load_session(paths: &AppPaths, log: &Arc<Log>) -> Session {
             (Favorites::default(), true)
         }
     };
+    let (recent, recent_unreadable) = match load_recent(&paths.recent()) {
+        Ok((recent, warnings)) => {
+            for warning in warnings {
+                log.warn(Area::Session, warning);
+            }
+            (recent, false)
+        }
+        Err(message) => {
+            log.warn(Area::Session, message);
+            (RecentGames::default(), true)
+        }
+    };
     Session {
         paths: paths.clone(),
         log: log.clone(),
@@ -443,6 +551,9 @@ fn load_session(paths: &AppPaths, log: &Arc<Log>) -> Session {
         favorite_missing: Vec::new(),
         shown_favorites: false,
         favorites_unreadable,
+        recent,
+        recent_unreadable,
+        tray_panel_open: Arc::new(AtomicBool::new(false)),
         selected: None,
         selection_unsaved: None,
         active: None,
@@ -535,7 +646,9 @@ fn wire(
     ui: &MainWindow,
     panel: &SidePanel,
     log_window: &LogWindow,
-    tray: &TrayIcon,
+    tray: Option<&TrayIcon>,
+    tray_window: &TrayPanelWindow,
+    tray_panel: &Rc<TrayPanel>,
     dock: &Rc<Dock>,
     session: &Arc<Mutex<Session>>,
     log: &Arc<Log>,
@@ -675,16 +788,37 @@ fn wire(
     ui.on_pause(pause.clone());
     ui.on_stop(stop.clone());
     ui.on_queue_resume(queue_resume.clone());
-    tray.on_play(play);
-    tray.on_pause(pause);
-    tray.on_stop(stop);
-    tray.on_play_favorite({
+    tray_window.on_play(play.clone());
+    tray_window.on_pause(pause.clone());
+    tray_window.on_stop(stop.clone());
+    if let Some(tray) = tray {
+        tray.on_play(play);
+        tray.on_pause(pause);
+        tray.on_stop(stop);
+        tray.on_play_favorite({
+            let session = session.clone();
+            let log = log.clone();
+            let tx = tx.clone();
+            let wake = wake.clone();
+            move |id| {
+                begin_tray_launch(&session, &log, &tx, &wake, id.as_str());
+                wake();
+            }
+        });
+    }
+    tray_window.on_launch({
         let session = session.clone();
         let log = log.clone();
         let tx = tx.clone();
         let wake = wake.clone();
+        let window = tray_window.as_weak();
         move |id| {
-            begin_tray_favorite(&session, &log, &tx, &wake, id.as_str());
+            // Stay open and go back to Home, where the game shows as starting.
+            if begin_tray_launch(&session, &log, &tx, &wake, id.as_str())
+                && let Some(window) = window.upgrade()
+            {
+                window.set_tab(0);
+            }
             wake();
         }
     });
@@ -1127,42 +1261,107 @@ fn wire(
         }
     });
 
-    tray.on_open_requested({
+    tray_window.on_dismiss({
+        let tray_panel = tray_panel.clone();
+        move || tray_panel.hide()
+    });
+    tray_window.on_open_main({
         let ui = ui.as_weak();
+        let tray_panel = tray_panel.clone();
         move || {
+            tray_panel.hide();
             if let Some(ui) = ui.upgrade() {
                 show_main(&ui);
             }
         }
     });
-    tray.on_open_queue({
+    tray_window.on_open_queue({
         let ui = ui.as_weak();
+        let tray_panel = tray_panel.clone();
+        let open_queue = open_queue.clone();
         move || {
+            tray_panel.hide();
             if let Some(ui) = ui.upgrade() {
                 show_main(&ui);
             }
             open_queue();
         }
     });
-    tray.on_open_settings({
+    tray_window.on_open_settings({
         let ui = ui.as_weak();
+        let tray_panel = tray_panel.clone();
+        let open_settings = open_settings.clone();
         move || {
+            tray_panel.hide();
             if let Some(ui) = ui.upgrade() {
                 show_main(&ui);
             }
             open_settings();
         }
     });
-    tray.on_quit({
+    tray_window.on_quit({
+        let tray_panel = tray_panel.clone();
         let session = session.clone();
         let log = log.clone();
         let tx = tx.clone();
         let wake = wake.clone();
-        move || begin_quit(&session, &log, &tx, &wake)
+        move || {
+            tray_panel.hide();
+            begin_quit(&session, &log, &tx, &wake);
+        }
     });
+    if let Some(tray) = tray {
+        tray.on_activated({
+            let ui = ui.as_weak();
+            move || {
+                if let Some(ui) = ui.upgrade() {
+                    show_main(&ui);
+                }
+            }
+        });
+        tray.on_open_requested({
+            let ui = ui.as_weak();
+            move || {
+                if let Some(ui) = ui.upgrade() {
+                    show_main(&ui);
+                }
+            }
+        });
+        tray.on_open_queue({
+            let ui = ui.as_weak();
+            move || {
+                if let Some(ui) = ui.upgrade() {
+                    show_main(&ui);
+                }
+                open_queue();
+            }
+        });
+        tray.on_open_settings({
+            let ui = ui.as_weak();
+            move || {
+                if let Some(ui) = ui.upgrade() {
+                    show_main(&ui);
+                }
+                open_settings();
+            }
+        });
+        tray.on_quit({
+            let session = session.clone();
+            let log = log.clone();
+            let tx = tx.clone();
+            let wake = wake.clone();
+            move || begin_quit(&session, &log, &tx, &wake)
+        });
+    }
 }
 
-fn render(ui: &MainWindow, panel: &SidePanel, tray: &TrayIcon, session: &Arc<Mutex<Session>>) {
+fn render(
+    ui: &MainWindow,
+    panel: &SidePanel,
+    tray: Option<&TrayIcon>,
+    tray_window: &TrayPanelWindow,
+    session: &Arc<Mutex<Session>>,
+) {
     let Ok(mut session) = session.lock() else {
         return;
     };
@@ -1177,7 +1376,28 @@ fn render(ui: &MainWindow, panel: &SidePanel, tray: &TrayIcon, session: &Arc<Mut
     });
     render_main(ui, &session, now);
     render_panel(panel, &session, now);
-    render_tray(tray, &session, now);
+    if let Some(tray) = tray {
+        render_tray(tray, &session, now);
+    }
+    if session.tray_panel_open.load(Ordering::Acquire) {
+        render_tray_panel(tray_window, &session, now);
+    }
+}
+
+/// Fill the tray panel with current data and start the artwork it still lacks, just before it
+/// opens, so its first frame is not stale.
+fn open_tray_panel(
+    window: &TrayPanelWindow,
+    session: &Arc<Mutex<Session>>,
+    tx: &mpsc::Sender<Msg>,
+    wake: &Wake,
+) {
+    let Ok(mut session) = session.lock() else {
+        return;
+    };
+    render_tray_panel(window, &session, Instant::now());
+    let wanted = missing_art_requests(&session, tray_panel_ids(&session).collect());
+    fetch_art(&mut session, &wanted, tx, wake, false);
 }
 
 fn render_main(ui: &MainWindow, session: &Session, now: Instant) {
@@ -1229,16 +1449,7 @@ fn render_main(ui: &MainWindow, session: &Session, now: Instant) {
     ui.set_db_color(color.into());
 
     let state = session.clock.state();
-    let (label, mode, tone) =
-        if matches!(session.queue.activity(), QueueActivity::Transition { .. }) {
-            ("Switching…", "switching", Tone::Muted)
-        } else {
-            match state {
-                SessionState::Playing => ("Playing", "playing", Tone::Success),
-                SessionState::Paused => ("Paused", "paused", Tone::Warning),
-                SessionState::Stopped => ("Ready", "stopped", Tone::Muted),
-            }
-        };
+    let (label, mode, tone) = session_status(session);
     let current = session_game(session);
     ui.set_session_visible(current.is_some());
     ui.set_session_id(
@@ -1361,6 +1572,19 @@ fn tray_favorite_rows(session: &Session) -> Vec<TrayFavorite> {
     )
 }
 
+/// The hover text of the tray icon: the game and the state of the session.
+fn tray_tooltip(session: &Session) -> String {
+    let label = match session.clock.state() {
+        SessionState::Playing => "Playing",
+        SessionState::Paused => "Paused",
+        SessionState::Stopped => "Stopped",
+    };
+    match session_game(session) {
+        Some(game) => format!("Game Larper · {} · {label}", game.name),
+        None => "Game Larper".into(),
+    }
+}
+
 fn render_tray(tray: &TrayIcon, session: &Session, now: Instant) {
     let selected = session_game(session);
     let label = match session.clock.state() {
@@ -1368,11 +1592,7 @@ fn render_tray(tray: &TrayIcon, session: &Session, now: Instant) {
         SessionState::Paused => "Paused",
         SessionState::Stopped => "Stopped",
     };
-    tray.set_status_tip(if let Some(game) = selected {
-        format!("Game Larper · {} · {label}", game.name).into()
-    } else {
-        "Game Larper".into()
-    });
+    tray.set_status_tip(tray_tooltip(session).into());
     tray.set_game_name(
         selected
             .map(|game| game.name.clone())
@@ -1389,6 +1609,216 @@ fn render_tray(tray: &TrayIcon, session: &Session, now: Instant) {
     tray.set_favorite_count(session.favorites.len() as i32);
     tray.set_favorite_loading(!session.loaded);
     tray.set_favorite_play_enabled(tray_quick_play_allowed(session));
+}
+
+/// The words and tone for the session: label, mode ("stopped" | "playing" | "paused" |
+/// "switching"), and color.
+fn session_status(session: &Session) -> (&'static str, &'static str, Tone) {
+    if matches!(session.queue.activity(), QueueActivity::Transition { .. }) {
+        return ("Switching…", "switching", Tone::Muted);
+    }
+    match session.clock.state() {
+        SessionState::Playing => ("Playing", "playing", Tone::Success),
+        SessionState::Paused => ("Paused", "paused", Tone::Warning),
+        SessionState::Stopped => ("Ready", "stopped", Tone::Muted),
+    }
+}
+
+/// Why the tray cannot start a game right now, or an empty string when it can.
+fn tray_launch_hint(session: &Session) -> &'static str {
+    if tray_quick_play_allowed(session) {
+        ""
+    } else if session.quitting {
+        "Quitting…"
+    } else if !session.loaded {
+        "Loading games…"
+    } else if session.busy {
+        "One moment…"
+    } else if matches!(
+        session.queue.activity(),
+        QueueActivity::Running { .. }
+            | QueueActivity::Paused { .. }
+            | QueueActivity::Transition { .. }
+    ) {
+        "Stop the queue to start a game."
+    } else {
+        "Stop the current game to start another."
+    }
+}
+
+/// "just now", "5 min ago", "3 h ago", "yesterday", "4 days ago".
+fn relative_age(now_ms: i64, then_ms: i64) -> String {
+    let minutes = (now_ms - then_ms).max(0) / 60_000;
+    match minutes {
+        0 => "just now".into(),
+        1..60 => format!("{minutes} min ago"),
+        60..1_440 => format!("{} h ago", minutes / 60),
+        1_440..2_880 => "yesterday".into(),
+        _ => format!("{} days ago", minutes / 1_440),
+    }
+}
+
+/// The panel's Favorites rows: the same order as the main window, unavailable ones last.
+fn panel_favorite_rows(session: &Session) -> Vec<TrayGame> {
+    let state = session.clock.state();
+    let running =
+        |id: &str| state != SessionState::Stopped && session.active.as_deref() == Some(id);
+    let meta = |id: &str, available: bool| -> SharedString {
+        let text = if !available {
+            "Not in catalog"
+        } else if running(id) {
+            if state == SessionState::Paused {
+                "Paused"
+            } else {
+                "Now playing"
+            }
+        } else {
+            ""
+        };
+        text.into()
+    };
+    let listed = session
+        .favorite_rows
+        .iter()
+        .filter_map(|&index| session.games.get(index))
+        .map(|game| TrayGame {
+            id: game.id.clone().into(),
+            name: game.name.clone().into(),
+            meta: meta(&game.id, true),
+            art: cached_art(&game.id),
+            available: true,
+            active: running(&game.id),
+        });
+    let missing = session
+        .favorite_missing
+        .iter()
+        .filter_map(|&position| session.favorites.items().get(position))
+        .map(|favorite| TrayGame {
+            id: favorite.id.clone().into(),
+            name: favorite.name.clone().into(),
+            meta: meta(&favorite.id, false),
+            art: slint::Image::default(),
+            available: false,
+            active: false,
+        });
+    listed.chain(missing).take(TRAY_PANEL_FAVORITES).collect()
+}
+
+/// The panel's Recent rows, newest first.
+fn panel_recent_rows(session: &Session) -> Vec<TrayGame> {
+    let state = session.clock.state();
+    let now_ms = unix_time_ms(SystemTime::now());
+    session
+        .recent
+        .items()
+        .iter()
+        .take(TRAY_PANEL_RECENT)
+        .map(|item| {
+            // Before the catalog loads nothing can be checked, so do not dim anything.
+            let available = !session.loaded || session.games.iter().any(|game| game.id == item.id);
+            let running = state != SessionState::Stopped
+                && session.active.as_deref() == Some(item.id.as_str());
+            let meta = if !available {
+                "Not in catalog".to_string()
+            } else if running {
+                if state == SessionState::Paused {
+                    "Paused".to_string()
+                } else {
+                    "Now playing".to_string()
+                }
+            } else {
+                relative_age(now_ms, item.played_at_ms)
+            };
+            TrayGame {
+                id: item.id.clone().into(),
+                name: item.name.clone().into(),
+                meta: meta.into(),
+                art: cached_art(&item.id),
+                available,
+                active: running,
+            }
+        })
+        .collect()
+}
+
+fn render_tray_panel(window: &TrayPanelWindow, session: &Session, now: Instant) {
+    MODELS.with(|models| {
+        if let Some(models) = models.borrow().as_ref() {
+            sync_model(&models.panel_favorites, panel_favorite_rows(session));
+            sync_model(&models.panel_recent, panel_recent_rows(session));
+        }
+    });
+    let (mut label, mut mode, mut tone) = session_status(session);
+    // A launch is in flight: the runner is not up yet, so the clock has not started.
+    if session.busy && session.clock.state() == SessionState::Stopped && session.active.is_some() {
+        (label, mode, tone) = ("Starting…", "switching", Tone::Muted);
+    }
+    window.set_session_label(label.into());
+    window.set_session_mode(mode.into());
+    window.set_session_color(tone.into());
+    window.set_session_time(
+        if matches!(mode, "playing" | "paused") {
+            displayed_time(session, now)
+        } else {
+            String::new()
+        }
+        .into(),
+    );
+    let current = session_game(session);
+    window.set_has_game(current.is_some());
+    window.set_game_name(
+        current
+            .map(|game| game.name.clone())
+            .unwrap_or_else(|| "No game selected".into())
+            .into(),
+    );
+    window.set_game_art(current.map_or_else(slint::Image::default, |game| cached_art(&game.id)));
+    let note = queue_note(session, now);
+    window.set_game_note(
+        if !note.is_empty() {
+            note
+        } else if current.is_none() {
+            "Pick one from Favorites or Recent.".into()
+        } else {
+            match mode {
+                "playing" => "Running".into(),
+                "paused" => "Paused".into(),
+                _ => "Ready to play".into(),
+            }
+        }
+        .into(),
+    );
+    let controls = controls(session);
+    window.set_play_label(controls.play_label.into());
+    window.set_play_enabled(controls.play);
+    window.set_pause_enabled(controls.pause);
+    window.set_stop_enabled(controls.stop);
+    window.set_queue_count(session.queue.items().len() as i32);
+    window.set_queue_state(queue_state(session).1.into());
+    let shown = session.favorite_rows.len() + session.favorite_missing.len();
+    window.set_favorites_more(
+        if shown > TRAY_PANEL_FAVORITES {
+            format!("{} more in Game Larper", shown - TRAY_PANEL_FAVORITES)
+        } else {
+            String::new()
+        }
+        .into(),
+    );
+    window.set_favorites_loading(!session.loaded);
+    window.set_launch_enabled(tray_quick_play_allowed(session));
+    window.set_launch_hint(tray_launch_hint(session).into());
+    window.set_toast_visible(session.toast_until.is_some_and(|until| now < until));
+    if !session.toast.is_empty() {
+        window.set_toast(session.toast.clone().into());
+        window.set_toast_kind(
+            match session.toast_kind {
+                ToastKind::Info => "info",
+                ToastKind::Success => "success",
+                ToastKind::Error => "error",
+            }
+            .into(),
+        );
+    }
 }
 
 fn tick(session: &Arc<Mutex<Session>>, log: &Arc<Log>, tx: &mpsc::Sender<Msg>, wake: &Wake) {
@@ -1448,13 +1878,11 @@ fn tick(session: &Arc<Mutex<Session>>, log: &Arc<Log>, tx: &mpsc::Sender<Msg>, w
                 .iter()
                 .map(|item| item.application_id.as_str()),
         );
+        if session.tray_panel_open.load(Ordering::Acquire) {
+            ids.extend(tray_panel_ids(session));
+        }
         // Most ticks have nothing to fetch; skip the catalog scan for those.
-        ids.retain(|id| needs_art(session, id) && !session.art_inflight.contains(*id));
-        ids.iter()
-            .filter_map(|id| session.games.iter().find(|game| game.id == *id))
-            .filter(|game| net::has_artwork_source(game))
-            .map(ArtRequest::from)
-            .collect()
+        missing_art_requests(session, ids)
     };
     fetch_art(&mut session_guard, &wanted, tx, wake, false);
     drop(session_guard);
@@ -1495,6 +1923,7 @@ fn apply_message(
                     Some(id).filter(|id| session.games.iter().any(|game| game.id == *id));
             }
             refresh_favorites(&mut session);
+            refresh_recent(&mut session);
             let plan = plan_results(&mut session);
             fetch_art(&mut session, &plan.first, tx, wake, true);
             fetch_art(&mut session, &plan.rest, tx, wake, false);
@@ -1526,6 +1955,7 @@ fn apply_message(
                 Ok(games) => {
                     session.games = supported_only(games);
                     refresh_favorites(&mut session);
+                    refresh_recent(&mut session);
                     let count = session.games.len();
                     session.loaded = true;
                     session.offline = false;
@@ -1630,6 +2060,7 @@ fn apply_message(
             match result {
                 Ok(report) => {
                     session.clock.play(Instant::now());
+                    record_recent(&mut session);
                     log.success(
                         Area::Runner,
                         format!(
@@ -1775,6 +2206,40 @@ mod tests {
         let title = "🔮".repeat(TRAY_NAME_CHARS + 5);
         assert_eq!(tray_name(&title).chars().count(), TRAY_NAME_CHARS);
         assert!(tray_name(&title).ends_with('…'));
+    }
+
+    #[test]
+    fn relative_ages_read_naturally() {
+        let minute = 60_000;
+        assert_eq!(relative_age(1_000 * minute, 1_000 * minute), "just now");
+        assert_eq!(relative_age(1_000 * minute, 1_000 * minute + 5), "just now");
+        assert_eq!(
+            relative_age(1_000 * minute, 1_000 * minute - 59_999),
+            "just now"
+        );
+        assert_eq!(relative_age(1_000 * minute, 999 * minute), "1 min ago");
+        assert_eq!(relative_age(1_000 * minute, 941 * minute), "59 min ago");
+        assert_eq!(relative_age(1_000 * minute, 940 * minute), "1 h ago");
+        assert_eq!(
+            relative_age(1_000 * minute, 1_000 * minute - 23 * 60 * minute),
+            "23 h ago"
+        );
+        assert_eq!(
+            relative_age(100_000 * minute, 100_000 * minute - 24 * 60 * minute),
+            "yesterday"
+        );
+        assert_eq!(
+            relative_age(100_000 * minute, 100_000 * minute - 47 * 60 * minute),
+            "yesterday"
+        );
+        assert_eq!(
+            relative_age(100_000 * minute, 100_000 * minute - 48 * 60 * minute),
+            "2 days ago"
+        );
+        assert_eq!(
+            relative_age(100_000 * minute, 100_000 * minute - 10 * 1_440 * minute),
+            "10 days ago"
+        );
     }
 
     #[test]

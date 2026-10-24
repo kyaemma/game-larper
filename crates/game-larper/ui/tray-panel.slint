@@ -1,0 +1,806 @@
+// The tray panel: a small frameless window that opens from the tray icon. It is a quick
+// launcher, not a second app window: status on top, four tabs below, one action per row.
+// Rust places it near the tray and closes it when it loses focus.
+
+import { Theme, Icons } from "theme.slint";
+import { Icon, LogoMark, Art, Button, Hairline, FocusRing, SectionLabel } from "controls.slint";
+import { TrayGame } from "models.slint";
+import { Toast } from "dock.slint";
+
+component TrayTab inherits Rectangle {
+    in property <string> text;
+    in property <bool> active;
+    callback clicked();
+
+    horizontal-stretch: 1;
+    background: touch.pressed ? Theme.press : touch.has-hover && !root.active ? Theme.hover : transparent;
+    animate background { duration: Theme.quick; easing: ease-out; }
+
+    accessible-role: tab;
+    accessible-label: root.text;
+    accessible-checkable: true;
+    accessible-checked: root.active;
+    accessible-action-default => { root.clicked(); }
+
+    focus := FocusScope {
+        focus-on-click: false;
+        key-pressed(event) => {
+            if (event.text == Key.Return || event.text == Key.Space) {
+                root.clicked();
+                return accept;
+            }
+            reject
+        }
+    }
+    touch := TouchArea {
+        mouse-cursor: pointer;
+        clicked => { root.clicked(); }
+    }
+    Text {
+        text: root.text;
+        color: root.active ? Theme.text : touch.has-hover ? Theme.text : Theme.text-2;
+        font-size: Theme.text-s;
+        font-weight: 600;
+        horizontal-alignment: center;
+        vertical-alignment: center;
+        animate color { duration: Theme.quick; }
+    }
+    Rectangle {
+        y: parent.height - self.height;
+        x: (parent.width - self.width) / 2;
+        width: root.active ? parent.width - 24px : 0px;
+        height: 2px;
+        border-radius: 1px;
+        background: Theme.accent;
+        animate width { duration: Theme.normal; easing: ease-out; }
+    }
+    FocusRing {
+        active: focus.has-focus;
+        radius: 2px;
+        x: 2px;
+        y: 2px;
+        width: root.width - 4px;
+        height: root.height - 4px;
+    }
+}
+
+// One game in Favorites or Recent. Clicking it starts it.
+component GameRow inherits Rectangle {
+    in property <TrayGame> game;
+    // False while a session or the queue owns the runner.
+    in property <bool> enabled;
+    callback clicked();
+
+    property <bool> usable: root.enabled && root.game.available;
+
+    height: 46px;
+    border-radius: Theme.radius;
+    background: root.usable && touch.pressed ? Theme.press
+        : root.usable && touch.has-hover ? Theme.hover
+        : root.game.active ? Theme.accent-tint : transparent;
+    animate background { duration: Theme.quick; easing: ease-out; }
+
+    accessible-role: button;
+    accessible-label: root.game.name + (root.game.meta != "" ? ", " + root.game.meta : "");
+    accessible-enabled: root.usable;
+    accessible-action-default => { if (root.usable) { root.clicked(); } }
+
+    focus := FocusScope {
+        enabled: root.usable;
+        focus-on-click: false;
+        key-pressed(event) => {
+            if (event.text == Key.Return || event.text == Key.Space) {
+                root.clicked();
+                return accept;
+            }
+            reject
+        }
+    }
+    touch := TouchArea {
+        mouse-cursor: root.usable ? pointer : default;
+        clicked => { if (root.usable) { root.clicked(); } }
+        Rectangle {
+          opacity: root.game.available ? 1 : 0.5;
+          HorizontalLayout {
+            padding-left: 8px;
+            padding-right: 10px;
+            spacing: 10px;
+            VerticalLayout {
+                alignment: center;
+                Art {
+                    source: root.game.art;
+                    width: 30px;
+                    height: 30px;
+                    border-radius: Theme.radius-s;
+                }
+            }
+            VerticalLayout {
+                alignment: center;
+                spacing: 1px;
+                horizontal-stretch: 1;
+                Text {
+                    text: root.game.name;
+                    color: Theme.text;
+                    font-size: Theme.text-m;
+                    font-weight: 600;
+                    overflow: elide;
+                }
+                if root.game.meta != "": Text {
+                    text: root.game.meta;
+                    color: root.game.active ? Theme.accent-soft : Theme.text-3;
+                    font-size: Theme.text-xs;
+                    overflow: elide;
+                }
+            }
+            if root.usable && touch.has-hover: VerticalLayout {
+                alignment: center;
+                Icon {
+                    source: Icons.play;
+                    tint: Theme.accent-soft;
+                    width: 14px;
+                    height: 14px;
+                }
+            }
+          }
+        }
+    }
+    FocusRing {
+        active: focus.has-focus;
+        width: root.width + 6px;
+        height: root.height + 6px;
+    }
+}
+
+// A scrolling list of GameRow, or a short message when there is nothing to show.
+component GameList inherits Rectangle {
+    in property <[TrayGame]> games;
+    in property <bool> enabled;
+    // Why launching is off right now. Empty when it is on.
+    in property <string> hint;
+    in property <image> empty-icon;
+    in property <string> empty-title;
+    in property <string> empty-detail;
+    // "3 more in Game Larper", or empty when the whole list is shown.
+    in property <string> more-label;
+    callback launch(string);
+    callback more();
+
+    property <length> row-height: 46px;
+
+    VerticalLayout {
+        if root.hint != "": Rectangle {
+            height: 30px;
+            Text {
+                x: 14px;
+                width: parent.width - 28px;
+                text: root.hint;
+                color: Theme.text-3;
+                font-size: Theme.text-xs;
+                vertical-alignment: center;
+                overflow: elide;
+            }
+        }
+
+        if root.games.length == 0: VerticalLayout {
+            vertical-stretch: 1;
+            alignment: center;
+            spacing: 6px;
+            padding-bottom: 24px;
+            Icon {
+                source: root.empty-icon;
+                tint: Theme.text-3;
+                width: 22px;
+                height: 22px;
+            }
+            Text {
+                text: root.empty-title;
+                color: Theme.text-2;
+                font-size: Theme.text-m;
+                font-weight: 600;
+                horizontal-alignment: center;
+            }
+            Text {
+                text: root.empty-detail;
+                color: Theme.text-3;
+                font-size: Theme.text-s;
+                horizontal-alignment: center;
+                wrap: word-wrap;
+            }
+        }
+
+        if root.games.length > 0: Rectangle {
+            vertical-stretch: 1;
+            clip: true;
+            flick := Flickable {
+                content-height: root.games.length * root.row-height + 12px;
+                for game[index] in root.games: GameRow {
+                    x: 8px;
+                    y: 6px + index * root.row-height;
+                    width: flick.width - 16px;
+                    game: game;
+                    enabled: root.enabled;
+                    clicked => { root.launch(game.id); }
+                }
+            }
+            if flick.content-height > flick.height: Rectangle {
+                property <length> track: flick.height;
+                property <float> ratio: flick.height / flick.content-height;
+                x: parent.width - self.width - 1px;
+                width: thumb-touch.has-hover || thumb-touch.pressed ? 6px : 4px;
+                height: max(28px, self.track * self.ratio);
+                y: (-flick.content-y) / (flick.content-height - flick.height) * (self.track - self.height);
+                border-radius: self.width / 2;
+                background: thumb-touch.pressed ? #FFFFFF40 : thumb-touch.has-hover ? #FFFFFF2E : #FFFFFF1C;
+                animate width, background { duration: Theme.quick; }
+                thumb-touch := TouchArea {
+                    property <length> start;
+                    pointer-event(event) => {
+                        if (event.kind == PointerEventKind.down) {
+                            self.start = flick.content-y;
+                        }
+                    }
+                    moved => {
+                        if (self.pressed) {
+                            flick.content-y = max(flick.height - flick.content-height, min(0px,
+                                self.start - (self.mouse-y - self.pressed-y) * flick.content-height / flick.height));
+                        }
+                    }
+                }
+            }
+        }
+
+        if root.more-label != "": Rectangle {
+            height: 38px;
+            Hairline { y: 0px; }
+            more-touch := TouchArea {
+                mouse-cursor: pointer;
+                clicked => { root.more(); }
+            }
+            Text {
+                text: root.more-label;
+                color: more-touch.has-hover ? Theme.text : Theme.text-2;
+                font-size: Theme.text-s;
+                font-weight: 600;
+                horizontal-alignment: center;
+                vertical-alignment: center;
+                animate color { duration: Theme.quick; }
+            }
+        }
+    }
+}
+
+// A full-width action of the More tab.
+component ActionRow inherits Rectangle {
+    in property <image> icon;
+    in property <string> text;
+    in property <bool> danger;
+    callback clicked();
+
+    height: 40px;
+    border-radius: Theme.radius;
+    background: touch.pressed ? Theme.press : touch.has-hover ? Theme.hover : transparent;
+    animate background { duration: Theme.quick; easing: ease-out; }
+
+    accessible-role: button;
+    accessible-label: root.text;
+    accessible-action-default => { root.clicked(); }
+
+    focus := FocusScope {
+        focus-on-click: false;
+        key-pressed(event) => {
+            if (event.text == Key.Return || event.text == Key.Space) {
+                root.clicked();
+                return accept;
+            }
+            reject
+        }
+    }
+    touch := TouchArea {
+        mouse-cursor: pointer;
+        clicked => { root.clicked(); }
+    }
+    HorizontalLayout {
+        padding-left: 12px;
+        padding-right: 12px;
+        spacing: 12px;
+        VerticalLayout {
+            alignment: center;
+            Icon {
+                source: root.icon;
+                tint: root.danger ? (touch.has-hover ? Theme.danger : Theme.danger.with-alpha(0.8))
+                    : touch.has-hover ? Theme.text : Theme.text-2;
+                animate colorize { duration: Theme.quick; }
+            }
+        }
+        Text {
+            text: root.text;
+            color: root.danger ? (touch.has-hover ? Theme.danger : Theme.danger.with-alpha(0.85))
+                : Theme.text;
+            font-size: Theme.text-m;
+            vertical-alignment: center;
+        }
+    }
+    FocusRing {
+        active: focus.has-focus;
+        width: root.width + 6px;
+        height: root.height + 6px;
+    }
+}
+
+// A small permanent action in the footer: an icon and a short label. `danger` adds a red
+// accent on hover.
+component FooterAction inherits Rectangle {
+    in property <image> icon;
+    in property <string> text;
+    in property <bool> danger;
+    callback clicked();
+
+    property <color> accent: root.danger ? Theme.danger : Theme.text;
+
+    height: 28px;
+    width: row.preferred-width;
+    border-radius: Theme.radius;
+    background: touch.pressed ? (root.danger ? Theme.danger.with-alpha(0.2) : Theme.press)
+        : touch.has-hover ? (root.danger ? Theme.danger.with-alpha(0.12) : Theme.hover) : transparent;
+    animate background { duration: Theme.quick; easing: ease-out; }
+
+    accessible-role: button;
+    accessible-label: root.text;
+    accessible-action-default => { root.clicked(); }
+
+    focus := FocusScope {
+        focus-on-click: false;
+        key-pressed(event) => {
+            if (event.text == Key.Return || event.text == Key.Space) {
+                root.clicked();
+                return accept;
+            }
+            reject
+        }
+    }
+    touch := TouchArea {
+        mouse-cursor: pointer;
+        clicked => { root.clicked(); }
+    }
+    row := HorizontalLayout {
+        padding-left: 10px;
+        padding-right: 12px;
+        spacing: 7px;
+        VerticalLayout {
+            alignment: center;
+            Icon {
+                source: root.icon;
+                width: 14px;
+                height: 14px;
+                tint: touch.has-hover ? root.accent : Theme.text-3;
+                animate colorize { duration: Theme.quick; }
+            }
+        }
+        Text {
+            text: root.text;
+            color: touch.has-hover ? root.accent : Theme.text-2;
+            font-size: Theme.text-s;
+            font-weight: 600;
+            vertical-alignment: center;
+            animate color { duration: Theme.quick; }
+        }
+    }
+    FocusRing {
+        active: focus.has-focus;
+        width: root.width + 6px;
+        height: root.height + 6px;
+    }
+}
+
+export component TrayPanelWindow inherits Window {
+    title: "Game Larper";
+    icon: @image-url("../../../assets/branding/game-larper-icon.png");
+    no-frame: true;
+    always-on-top: true;
+    min-width: 308px;
+    max-width: 308px;
+    preferred-width: 308px;
+    min-height: 404px;
+    max-height: 404px;
+    preferred-height: 404px;
+    background: Theme.bg-alt;
+    default-font-family: Theme.font;
+    default-font-size: Theme.text-m;
+
+    // Drives the fade-in.
+    in-out property <bool> shown;
+    // 0 Home, 1 Favorites, 2 Recent, 3 More. Rust resets it to Home each time the panel opens.
+    in-out property <int> tab: 0;
+
+    // Session.
+    in property <string> session-label: "Ready";
+    in property <string> session-time;
+    // "stopped" | "playing" | "paused" | "switching"
+    in property <string> session-mode: "stopped";
+    in property <color> session-color: Theme.text-3;
+    in property <bool> has-game;
+    in property <string> game-name: "No game selected";
+    in property <image> game-art;
+    in property <string> game-note;
+    in property <string> play-label: "Play";
+    in property <bool> play-enabled;
+    in property <bool> pause-enabled;
+    in property <bool> stop-enabled;
+    in property <int> queue-count;
+    in property <string> queue-state;
+
+    // Lists.
+    in property <[TrayGame]> favorites;
+    in property <string> favorites-more;
+    in property <bool> favorites-loading;
+    in property <[TrayGame]> recent;
+    in property <bool> launch-enabled;
+    in property <string> launch-hint;
+
+    in property <string> toast;
+    in property <string> toast-kind: "info";
+    in property <bool> toast-visible;
+    in property <string> version-label;
+
+    callback play();
+    callback pause();
+    callback stop();
+    callback launch(string);
+    callback open-main();
+    callback open-queue();
+    callback open-settings();
+    callback quit();
+    // Esc, or a request to go away without doing anything.
+    callback dismiss();
+
+    function step(delta: int) {
+        root.tab = root.tab + delta < 0 ? 0 : root.tab + delta > 3 ? 3 : root.tab + delta;
+    }
+
+    forward-focus: keys;
+    keys := FocusScope {
+        capture-key-pressed(event) => {
+            if (event.text == Key.Escape) {
+                root.dismiss();
+                return accept;
+            }
+            if (event.text == Key.LeftArrow) {
+                root.step(-1);
+                return accept;
+            }
+            if (event.text == Key.RightArrow) {
+                root.step(1);
+                return accept;
+            }
+            reject
+        }
+
+        Rectangle {
+            y: root.shown ? 0px : 8px;
+            opacity: root.shown ? 1 : 0;
+            animate y { duration: Theme.normal; easing: ease-out; }
+            animate opacity { duration: Theme.normal; easing: ease-out; }
+
+            VerticalLayout {
+                // Brand and session status. Visible on every tab.
+                HorizontalLayout {
+                    height: 46px;
+                    padding-left: 14px;
+                    padding-right: 12px;
+                    spacing: 8px;
+                    VerticalLayout {
+                        alignment: center;
+                        LogoMark { }
+                    }
+                    Text {
+                        text: "Game Larper";
+                        color: Theme.text;
+                        font-size: Theme.text-m;
+                        font-weight: 600;
+                        vertical-alignment: center;
+                        horizontal-stretch: 1;
+                    }
+                    VerticalLayout {
+                        alignment: center;
+                        Rectangle {
+                            height: 24px;
+                            width: chip.preferred-width;
+                            border-radius: 12px;
+                            background: root.session-mode == "stopped" ? Theme.fill : root.session-color.with-alpha(0.14);
+                            animate background { duration: Theme.normal; }
+                            accessible-role: AccessibleRole.text;
+                            accessible-label: root.session-label + " " + root.session-time;
+                            chip := HorizontalLayout {
+                                padding-left: 10px;
+                                padding-right: 10px;
+                                spacing: 6px;
+                                VerticalLayout {
+                                    alignment: center;
+                                    Rectangle {
+                                        width: 6px;
+                                        height: 6px;
+                                        border-radius: 3px;
+                                        background: root.session-color;
+                                        animate background { duration: Theme.normal; }
+                                    }
+                                }
+                                Text {
+                                    text: root.session-label;
+                                    color: root.session-mode == "stopped" ? Theme.text-2 : root.session-color;
+                                    font-size: Theme.text-xs;
+                                    font-weight: 600;
+                                    vertical-alignment: center;
+                                }
+                                if root.session-time != "": Text {
+                                    text: root.session-time;
+                                    color: Theme.text-2;
+                                    font-size: Theme.text-xs;
+                                    vertical-alignment: center;
+                                }
+                            }
+                        }
+                    }
+                }
+
+                // Tabs.
+                HorizontalLayout {
+                    height: 34px;
+                    padding-left: 8px;
+                    padding-right: 8px;
+                    spacing: 2px;
+                    TrayTab { text: "Home"; active: root.tab == 0; clicked => { root.tab = 0; } }
+                    TrayTab { text: "Favorites"; active: root.tab == 1; clicked => { root.tab = 1; } }
+                    TrayTab { text: "Recent"; active: root.tab == 2; clicked => { root.tab = 2; } }
+                    TrayTab { text: "More"; active: root.tab == 3; clicked => { root.tab = 3; } }
+                }
+                Hairline { }
+
+                // Content.
+                if root.tab == 0: VerticalLayout {
+                    vertical-stretch: 1;
+                    padding: 12px;
+                    spacing: 10px;
+                    alignment: start;
+                    Rectangle {
+                        height: card.preferred-height;
+                        border-radius: Theme.radius-m;
+                        background: Theme.surface;
+                        card := VerticalLayout {
+                            padding: 12px;
+                            spacing: 12px;
+                            HorizontalLayout {
+                                spacing: 12px;
+                                Art {
+                                    source: root.game-art;
+                                    width: 56px;
+                                    height: 56px;
+                                }
+                                VerticalLayout {
+                                    alignment: center;
+                                    spacing: 3px;
+                                    horizontal-stretch: 1;
+                                    Text {
+                                        text: root.game-name;
+                                        color: root.has-game ? Theme.text : Theme.text-2;
+                                        font-size: Theme.text-l;
+                                        font-weight: 600;
+                                        overflow: elide;
+                                    }
+                                    Text {
+                                        text: root.game-note;
+                                        color: Theme.text-3;
+                                        font-size: Theme.text-s;
+                                        overflow: elide;
+                                    }
+                                }
+                            }
+                            HorizontalLayout {
+                                spacing: 8px;
+                                if root.session-mode != "playing": Button {
+                                    kind: "primary";
+                                    icon: Icons.play;
+                                    text: root.play-label;
+                                    enabled: root.play-enabled;
+                                    horizontal-stretch: 1;
+                                    clicked => { root.play(); }
+                                }
+                                if root.session-mode == "playing": Button {
+                                    icon: Icons.pause;
+                                    text: "Pause";
+                                    enabled: root.pause-enabled;
+                                    horizontal-stretch: 1;
+                                    clicked => { root.pause(); }
+                                }
+                                Button {
+                                    icon: Icons.stop;
+                                    text: "Stop";
+                                    enabled: root.stop-enabled;
+                                    min-width: 84px;
+                                    clicked => { root.stop(); }
+                                }
+                            }
+                        }
+                    }
+                    Rectangle {
+                        height: 40px;
+                        border-radius: Theme.radius;
+                        background: queue-touch.pressed ? Theme.press : queue-touch.has-hover ? Theme.fill-hover : Theme.fill;
+                        animate background { duration: Theme.quick; easing: ease-out; }
+                        accessible-role: button;
+                        accessible-label: "Queue, " + root.queue-count + " items. " + root.queue-state;
+                        accessible-action-default => { root.open-queue(); }
+                        queue-focus := FocusScope {
+                            focus-on-click: false;
+                            key-pressed(event) => {
+                                if (event.text == Key.Return || event.text == Key.Space) {
+                                    root.open-queue();
+                                    return accept;
+                                }
+                                reject
+                            }
+                        }
+                        queue-touch := TouchArea {
+                            mouse-cursor: pointer;
+                            clicked => { root.open-queue(); }
+                        }
+                        HorizontalLayout {
+                            padding-left: 12px;
+                            padding-right: 12px;
+                            spacing: 8px;
+                            VerticalLayout {
+                                alignment: center;
+                                Icon {
+                                    source: Icons.queue;
+                                    tint: queue-touch.has-hover ? Theme.text : Theme.text-2;
+                                }
+                            }
+                            Text {
+                                text: "Queue";
+                                color: Theme.text;
+                                font-size: Theme.text-m;
+                                font-weight: 600;
+                                vertical-alignment: center;
+                            }
+                            if root.queue-count > 0: VerticalLayout {
+                                alignment: center;
+                                Rectangle {
+                                    height: 17px;
+                                    width: max(17px, count-text.preferred-width + 10px);
+                                    border-radius: 8.5px;
+                                    background: Theme.fill-hover;
+                                    count-text := Text {
+                                        text: root.queue-count;
+                                        color: Theme.text;
+                                        font-size: Theme.text-xs;
+                                        font-weight: 700;
+                                        horizontal-alignment: center;
+                                        vertical-alignment: center;
+                                    }
+                                }
+                            }
+                            Text {
+                                text: root.queue-state;
+                                color: Theme.text-3;
+                                font-size: Theme.text-s;
+                                horizontal-alignment: right;
+                                vertical-alignment: center;
+                                overflow: elide;
+                                horizontal-stretch: 1;
+                            }
+                        }
+                        FocusRing {
+                            active: queue-focus.has-focus;
+                            width: parent.width + 6px;
+                            height: parent.height + 6px;
+                        }
+                    }
+                    if root.recent.length > 0: VerticalLayout {
+                        spacing: 2px;
+                        padding-top: 6px;
+                        SectionLabel {
+                            text: "RECENT";
+                            height: 20px;
+                            vertical-alignment: center;
+                        }
+                        for game[index] in root.recent: Rectangle {
+                            height: index < 1 ? 46px : 0px;
+                            if index < 1: GameRow {
+                                game: game;
+                                enabled: root.launch-enabled;
+                                clicked => { root.launch(game.id); }
+                            }
+                        }
+                    }
+                }
+
+                if root.tab == 1: GameList {
+                    vertical-stretch: 1;
+                    games: root.favorites;
+                    enabled: root.launch-enabled;
+                    hint: root.launch-hint;
+                    more-label: root.favorites-more;
+                    empty-icon: Icons.star;
+                    empty-title: root.favorites-loading ? "Loading games…" : "No favorites yet";
+                    empty-detail: root.favorites-loading ? "" : "Star games in Game Larper\nand they show up here.";
+                    launch(id) => { root.launch(id); }
+                    more => { root.open-main(); }
+                }
+
+                if root.tab == 2: GameList {
+                    vertical-stretch: 1;
+                    games: root.recent;
+                    enabled: root.launch-enabled;
+                    hint: root.launch-hint;
+                    empty-icon: Icons.clock;
+                    empty-title: "Nothing played yet";
+                    empty-detail: "Games you start show up here.";
+                    launch(id) => { root.launch(id); }
+                }
+
+                if root.tab == 3: VerticalLayout {
+                    vertical-stretch: 1;
+                    padding: 8px;
+                    spacing: 2px;
+                    alignment: start;
+                    ActionRow {
+                        icon: Icons.external;
+                        text: "Open Game Larper";
+                        clicked => { root.open-main(); }
+                    }
+                    ActionRow {
+                        icon: Icons.settings;
+                        text: "Settings";
+                        clicked => { root.open-settings(); }
+                    }
+                    Rectangle {
+                        height: 9px;
+                        Hairline { y: 4px; }
+                    }
+                    ActionRow {
+                        icon: Icons.close;
+                        text: "Quit";
+                        danger: true;
+                        clicked => { root.quit(); }
+                    }
+                }
+                if root.tab == 3: Text {
+                    text: "Game Larper " + root.version-label;
+                    color: Theme.text-3;
+                    font-size: Theme.text-xs;
+                    horizontal-alignment: center;
+                    height: 28px;
+                    vertical-alignment: center;
+                }
+
+                // Footer: always last, on every tab.
+                Hairline { }
+                HorizontalLayout {
+                    height: 36px;
+                    padding-left: 8px;
+                    padding-right: 8px;
+                    FooterAction {
+                        icon: Icons.external;
+                        text: "Open App";
+                        clicked => { root.open-main(); }
+                    }
+                    Rectangle { horizontal-stretch: 1; }
+                    FooterAction {
+                        icon: Icons.close;
+                        text: "Quit";
+                        danger: true;
+                        clicked => { root.quit(); }
+                    }
+                }
+            }
+
+            Toast {
+                x: 12px;
+                y: parent.height - self.height - 12px - 37px;
+                width: parent.width - 24px;
+                text: root.toast;
+                kind: root.toast-kind;
+                shown: root.toast-visible;
+            }
+        }
+    }
+}
