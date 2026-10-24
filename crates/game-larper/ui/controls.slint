@@ -20,6 +20,10 @@ export component LogoMark inherits Image {
 
 export component Tip inherits Rectangle {
     in property <string> text;
+    // Its own size, so the bubble fits its text wherever it is placed. Without it a Tip placed
+    // by hand takes the size of its parent, which is a button, and the text runs out of it.
+    width: tip-layout.preferred-width;
+    height: tip-layout.preferred-height;
     background: Theme.raised;
     border-radius: Theme.radius;
     border-width: 1px;
@@ -27,7 +31,7 @@ export component Tip inherits Rectangle {
     drop-shadow-blur: 12px;
     drop-shadow-offset-y: 2px;
     drop-shadow-color: #00000059;
-    HorizontalLayout {
+    tip-layout := HorizontalLayout {
         padding-left: 8px;
         padding-right: 8px;
         padding-top: 4px;
@@ -208,8 +212,11 @@ export component IconButton inherits Rectangle {
         triggered => { root.tip-ready = true; }
     }
     if root.show-tip && root.tip-above && root.tip-ready && touch.has-hover: Tip {
+        // Right-aligned with the button, so it grows to the left. If that would cross the left
+        // edge of the window it lines up with the button's left edge and grows to the right.
+        property <length> aligned-right: root.width - self.width;
         text: root.tip;
-        x: root.width - self.width;
+        x: root.absolute-position.x + self.aligned-right < 8px ? 0px : self.aligned-right;
         y: -self.height - 6px;
     }
 }
