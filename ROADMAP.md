@@ -5,8 +5,8 @@
 <h1 align="center">ROADMAP</h1>
 
 <p align="center">
-  <strong>La suite du larp, sans boule de cristal. ✨</strong><br>
-  <sub>Les idées, les améliorations et les questions que nous voulons explorer pour Game Larper.</sub>
+  <strong>La suite du larp 👹</strong><br>
+  <sub>Les idées, les améliorations et les questions que nous voulons explorer pour Game Larper !</sub>
 </p>
 
 <p align="center">
@@ -112,5 +112,5 @@ La roadmap est **vivante**. Elle évoluera avec les retours des utilisateurs et 
 
 <p align="center">
   <img src="assets/branding/game-larper-mark.png" width="48" alt="Emblème Game Larper"><br>
-  <sub>Pick a game. Press play. La suite, on l'imagine ensemble. 💜</sub>
+  <sub>Pick a game. Press play !</sub>
 </p>
