@@ -20,6 +20,9 @@ pub use tray_windows::NativeTray;
 pub use windows::*;
 
 /// What the user did to the tray icon, after the double-click time has been taken into account.
+/// Only the Windows tray builds these; on Linux `NativeTray` never emits, so the variants are
+/// matched in `app.rs` but never constructed there.
+#[cfg_attr(not(windows), allow(dead_code))]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum TrayEvent {
     /// A single left click. `at` is when the button was released and `anchor` where the
