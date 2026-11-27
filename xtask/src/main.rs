@@ -102,7 +102,7 @@ Exec={exec}
 Icon=game-larper
 Terminal=false
 Categories=Utility;Game;
-Keywords=Discord;Game;Activity;
+Keywords=Larper;Game;Activity;
 StartupNotify=true
 "
     );
